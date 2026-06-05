@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Training/data artifacts
+output/
+outputs/
+outputs_*/
+Dataset/
+*.pt
+*.pth
+*.npz
+*.npy
+*.joblib
+*.pkl
+*.csv
+
+# Local archives and papers
+repo_code.zip
+*.pdf
+
+# Frontend artifacts
+node_modules/
+dist/
+build/
+.env
+.env.local
+
+# Nested/local git metadata
+samudra-aya-data/.git/
