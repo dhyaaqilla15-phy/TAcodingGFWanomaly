@@ -1,4 +1,4 @@
-# Flowchart Project AIS/GFW Gear + Spoofing + Go-Dark
+# Flowchart Project AIS/GFW Gear + Spoofing + Go-Dark + Transshipment
 
 Versi ini sudah menghapus command `predict`. Tahap akhir untuk laporan skripsi adalah `eval`, karena confusion matrix, metrics, dan tabel prediksi evaluasi sudah dibuat di sana.
 
@@ -41,6 +41,16 @@ flowchart LR
     D1 --> D2 --> D3 --> D4 --> D5 --> D6
   end
 
+  subgraph T[Transshipment Candidate Pipeline]
+    T1[make_transshipment<br/>real rule candidates + synthetic encounter positives]:::process
+    T2[plot_transshipment / heatmap_transshipment]:::process
+    T3[preprocess --task transshipment<br/>target + fair feature mode]:::process
+    T4[train LSTM + tabular baseline]:::process
+    T5[eval LSTM + tabular + hybrid rule-ML]:::process
+    T6[/transshipment_all.csv<br/>events/*.csv<br/>per_event_predictions.csv<br/>per_event_predictions_hybrid.csv<br/>eval_summary.json/]:::io
+    T1 --> T2 --> T3 --> T4 --> T5 --> T6
+  end
+
   subgraph U[Utility]
     U1[plot / plot_all]:::process
     U2[heatmap]:::process
@@ -52,6 +62,7 @@ flowchart LR
   B -->|gear| G1
   B -->|spoofing| S1
   B -->|go-dark| D1
+  B -->|transshipment| T1
   B -->|visualisasi| U1
   B -->|visualisasi| U2
 
@@ -59,5 +70,6 @@ flowchart LR
   G4 --> Z
   S6 --> Z
   D6 --> Z
+  T6 --> Z
   U3 --> Z
 ```

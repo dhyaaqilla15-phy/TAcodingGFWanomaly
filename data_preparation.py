@@ -11,6 +11,36 @@ from tqdm import tqdm
 from dataload import read_ais_csv, infer_label_from_filename
 
 
+SEQ_FEATURE_COLS = [
+    "speed",
+    "vx",
+    "vy",
+    "dspeed",
+    "accel",
+    "dcourse",
+    "turn_rate",
+    "abs_dcourse",
+    "step_km",
+    "step_km_raw",
+    "dt",
+    "dt_raw_seconds",
+    "dt_log",
+    "implied_speed_knots_raw",
+    "distance_from_shore",
+    "distance_from_port",
+    "pos_speed_knots",
+    "dpos_speed",
+    "pos_bearing_sin",
+    "pos_bearing_cos",
+    "bearing_error",
+    "curvature",
+    "pos_speed_ma5",
+    "pos_speed_std5",
+    "abs_turn_ma5",
+    "curvature_ma5",
+]
+
+
 @dataclass
 class PreprocessCfg:
     task: str = "gear"
@@ -43,6 +73,54 @@ class PreprocessCfg:
 
     # khusus task=spoofing
     spoofing_window_threshold: float = 0.20
+
+    # khusus task=transshipment
+    transshipment_target: str = "multiclass"
+    transshipment_feature_mode: str = "fair"
+
+
+TRANS_FEATURE_COLS = [
+    "event_mode_id",
+    "distance_between_km",
+    "speed_a",
+    "speed_b",
+    "speed_pair_mean",
+    "relative_speed_knots",
+    "course_diff_deg",
+    "same_direction_score",
+    "lat_mid",
+    "lon_mid",
+    "shore_km_min",
+    "port_km_min",
+    "duration_nearby_minutes",
+    "event_duration_minutes",
+    "both_slow",
+    "is_offshore",
+    "is_port_far",
+    "is_fishing_a",
+    "is_fishing_b",
+    "gear_a_id",
+    "gear_b_id",
+    "loitering_spatial_range_km",
+    "loitering_start_end_km",
+    "loitering_compactness",
+    "loitering_turn_rate_abs",
+    "loitering_duration_minutes",
+    "encounter_rule_score",
+    "loitering_rule_score",
+    "risk_score",
+    "valid_point",
+]
+
+TRANS_RULE_SCORE_COLS = ["encounter_rule_score", "loitering_rule_score", "risk_score"]
+TRANS_MODEL_FEATURE_COLS_FAIR = [c for c in TRANS_FEATURE_COLS if c not in TRANS_RULE_SCORE_COLS]
+
+
+def _transshipment_feature_cols(mode: str) -> List[str]:
+    mode = str(mode or "fair").strip().lower()
+    if mode in {"full", "with_rule", "with_rules"}:
+        return list(TRANS_FEATURE_COLS)
+    return list(TRANS_MODEL_FEATURE_COLS_FAIR)
 
 
 def haversine_km_np(lat1, lon1, lat2, lon2) -> np.ndarray:
@@ -317,10 +395,430 @@ def filter_jumps(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     return df[keep].copy()
 
 
+def _transshipment_class_id(row: pd.Series) -> int:
+    if "class_id" in row.index:
+        v = pd.to_numeric(pd.Series([row.get("class_id")]), errors="coerce").fillna(0).iloc[0]
+        return int(np.clip(int(v), 0, 2))
+
+    label = str(row.get("label", "")).strip().lower()
+    kind = str(row.get("event_kind", "")).strip().lower()
+    is_tx = int(pd.to_numeric(pd.Series([row.get("is_transshipment", 0)]), errors="coerce").fillna(0).iloc[0])
+    if not is_tx:
+        return 0
+    if "loiter" in label or "loiter" in kind:
+        return 2
+    if "encounter" in label or "encounter" in kind:
+        return 1
+    return 1
+
+
+def _transshipment_target_from_cfg(df: pd.DataFrame, cfg: PreprocessCfg) -> str:
+    target = str(cfg.transshipment_target or "multiclass").strip().lower()
+    if target == "auto":
+        cls = set(pd.to_numeric(df["class_id"], errors="coerce").fillna(0).astype(int).unique().tolist())
+        positives = sorted(c for c in cls if c > 0)
+        if positives == [1]:
+            return "encounter"
+        if positives == [2]:
+            return "loitering"
+        if positives:
+            return "multiclass"
+        return "any"
+    return target
+
+
+def _map_transshipment_y(class_ids: np.ndarray, target: str) -> np.ndarray:
+    y = np.asarray(class_ids, dtype=np.int64)
+    if target == "encounter":
+        return (y == 1).astype(np.int64)
+    if target == "loitering":
+        return (y == 2).astype(np.int64)
+    if target == "any":
+        return (y > 0).astype(np.int64)
+    return y.astype(np.int64)
+
+
+def _transshipment_label_map_for_target(target: str) -> Dict[int, str]:
+    if target == "encounter":
+        return {0: "normal", 1: "encounter"}
+    if target == "loitering":
+        return {0: "normal", 1: "loitering"}
+    if target == "any":
+        return {0: "normal", 1: "potential_transshipment"}
+    return {0: "normal", 1: "encounter", 2: "loitering"}
+
+
+def _clip_log1p_series(s: pd.Series, upper: float) -> pd.Series:
+    x = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return np.log1p(x.clip(lower=0.0, upper=float(upper)))
+
+
+def _stabilize_transshipment_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in ["duration_nearby_minutes", "event_duration_minutes", "loitering_duration_minutes"]:
+        if col in df.columns:
+            # 7 hari sudah lebih dari cukup sebagai sinyal durasi event, sisanya jadi outlier numerik.
+            df[col] = _clip_log1p_series(df[col], upper=7 * 24 * 60)
+
+    for col in ["shore_km_min", "port_km_min"]:
+        if col in df.columns:
+            df[col] = _clip_log1p_series(df[col], upper=500.0)
+
+    for col in ["loitering_spatial_range_km", "loitering_start_end_km"]:
+        if col in df.columns:
+            df[col] = _clip_log1p_series(df[col], upper=200.0)
+
+    for col in ["distance_between_km"]:
+        if col in df.columns:
+            df[col] = _clip_log1p_series(df[col], upper=20.0)
+
+    for col in ["speed_a", "speed_b", "speed_pair_mean", "relative_speed_knots"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).clip(lower=0.0, upper=50.0)
+
+    return df
+
+
+def _target_from_present_transshipment_classes(classes: set[int]) -> str:
+    positives = sorted(c for c in classes if c > 0)
+    if positives == [1]:
+        return "encounter"
+    if positives == [2]:
+        return "loitering"
+    if positives:
+        return "multiclass"
+    return "any"
+
+
+def _infer_transshipment_auto_target(csvs: List[Path], limit_rows: int = 0, chunksize: int = 0) -> str:
+    classes: set[int] = set()
+    for p in csvs:
+        df = read_ais_csv(p, limit_rows=limit_rows, chunksize=chunksize)
+        if df.empty:
+            continue
+        if "class_id" in df.columns:
+            cls = (
+                pd.to_numeric(df["class_id"], errors="coerce")
+                .fillna(0)
+                .astype(int)
+                .clip(lower=0, upper=2)
+            )
+        else:
+            cls = df.apply(_transshipment_class_id, axis=1).astype(int)
+        classes.update(int(x) for x in cls.unique().tolist())
+    return _target_from_present_transshipment_classes(classes)
+
+
+def _mode_text(values: np.ndarray, default: str = "normal") -> str:
+    vals = [str(v) for v in values.tolist() if str(v) and str(v).lower() not in {"normal", "nan", "none"}]
+    if not vals:
+        return default
+    uniq, cnt = np.unique(np.asarray(vals, dtype=object), return_counts=True)
+    return str(uniq[int(np.argmax(cnt))])
+
+
+def _stable_random_state(key: str, seed: int = 42) -> np.random.RandomState:
+    h = 2166136261
+    for ch in str(key):
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return np.random.RandomState((h + int(seed)) & 0xFFFFFFFF)
+
+
+def _is_godark_hard_negative(window: np.ndarray, feat_cols: List[str], cfg: PreprocessCfg) -> bool:
+    if window.size == 0:
+        return False
+    col = {name: i for i, name in enumerate(feat_cols)}
+    gap_thr = max(1800.0, min(float(cfg.gap_seconds), 24.0 * 3600.0))
+
+    dt_idx = col.get("dt_raw_seconds")
+    if dt_idx is not None and float(np.nanmax(window[:, dt_idx])) >= gap_thr:
+        return True
+
+    step_idx = col.get("step_km_raw")
+    if step_idx is not None and float(np.nanmax(window[:, step_idx])) >= 5.0:
+        return True
+
+    implied_idx = col.get("implied_speed_knots_raw")
+    if implied_idx is not None and float(np.nanmax(window[:, implied_idx])) >= 20.0:
+        return True
+
+    return False
+
+
+def _select_godark_windows(
+    candidates: List[dict],
+    max_windows: int,
+    rng: np.random.RandomState,
+) -> List[dict]:
+    if max_windows <= 0 or len(candidates) <= int(max_windows):
+        return candidates
+
+    positives = [c for c in candidates if int(c["y"]) == 1]
+    hard_feature = [c for c in candidates if int(c["y"]) == 0 and str(c.get("kind", "")).startswith("hard_negative_feature")]
+    hard_gap = [c for c in candidates if int(c["y"]) == 0 and str(c.get("kind", "")).startswith("hard_negative_gap")]
+    hard_other = [
+        c for c in candidates
+        if int(c["y"]) == 0
+        and str(c.get("kind", "")).startswith("hard_negative")
+        and not str(c.get("kind", "")).startswith(("hard_negative_feature", "hard_negative_gap"))
+    ]
+    normal = [c for c in candidates if int(c["y"]) == 0 and not str(c.get("kind", "")).startswith("hard_negative")]
+
+    keep: List[dict] = []
+    keep.extend(positives)
+
+    remaining = int(max_windows) - len(keep)
+    if remaining <= 0:
+        idx = rng.choice(len(positives), size=int(max_windows), replace=False)
+        return [positives[int(i)] for i in sorted(idx.tolist(), key=lambda j: positives[j]["order"])]
+
+    hard_limit = max(remaining // 2, min(remaining, len(positives) * 3 if positives else remaining // 2))
+    hard_limit = min(remaining, hard_limit)
+    if hard_limit > 0:
+        feature_limit = min(len(hard_feature), max(1, int(round(hard_limit * 0.70))))
+        if feature_limit > 0:
+            idx = (
+                rng.choice(len(hard_feature), size=feature_limit, replace=False)
+                if len(hard_feature) > feature_limit else np.arange(len(hard_feature))
+            )
+            keep.extend([hard_feature[int(i)] for i in idx.tolist()])
+
+        hard_remaining = int(max(0, hard_limit - feature_limit))
+        gap_pool = hard_gap + hard_other
+        if hard_remaining > 0 and gap_pool:
+            idx = (
+                rng.choice(len(gap_pool), size=min(hard_remaining, len(gap_pool)), replace=False)
+                if len(gap_pool) > hard_remaining else np.arange(len(gap_pool))
+            )
+            keep.extend([gap_pool[int(i)] for i in idx.tolist()])
+
+    remaining = int(max_windows) - len(keep)
+    if remaining > 0 and normal:
+        idx = rng.choice(len(normal), size=min(remaining, len(normal)), replace=False)
+        keep.extend([normal[int(i)] for i in idx.tolist()])
+
+    return sorted(keep, key=lambda c: int(c["order"]))
+
+
+def _select_godark_indices(y: np.ndarray, kinds: np.ndarray, max_windows: int, rng: np.random.RandomState) -> np.ndarray:
+    y = np.asarray(y, dtype=np.int64)
+    kinds = np.asarray(kinds).astype(str)
+    if max_windows <= 0 or len(y) <= int(max_windows):
+        return np.arange(len(y), dtype=np.int64)
+
+    pos = np.where(y == 1)[0]
+    hard_feature = np.where((y == 0) & np.char.startswith(kinds.astype(str), "hard_negative_feature"))[0]
+    hard_gap = np.where((y == 0) & np.char.startswith(kinds.astype(str), "hard_negative_gap"))[0]
+    hard_other = np.where(
+        (y == 0)
+        & np.char.startswith(kinds.astype(str), "hard_negative")
+        & ~np.char.startswith(kinds.astype(str), "hard_negative_feature")
+        & ~np.char.startswith(kinds.astype(str), "hard_negative_gap")
+    )[0]
+    normal = np.where((y == 0) & ~np.char.startswith(kinds.astype(str), "hard_negative"))[0]
+
+    keep = pos.tolist()
+    remaining = int(max_windows) - len(keep)
+    if remaining <= 0:
+        return np.sort(rng.choice(pos, size=int(max_windows), replace=False)).astype(np.int64)
+
+    hard_take = min(remaining, max(remaining // 2, min(remaining, len(pos) * 3 if len(pos) else remaining // 2)))
+    if hard_take > 0:
+        feature_take = min(len(hard_feature), max(1, int(round(hard_take * 0.70))))
+        if feature_take > 0:
+            feature_pick = (
+                rng.choice(hard_feature, size=feature_take, replace=False)
+                if len(hard_feature) > feature_take else hard_feature
+            )
+            keep.extend([int(i) for i in feature_pick.tolist()])
+
+        gap_pool = np.concatenate([hard_gap, hard_other], axis=0) if len(hard_gap) or len(hard_other) else np.array([], dtype=np.int64)
+        gap_take = int(max(0, hard_take - feature_take))
+        if gap_take > 0 and len(gap_pool):
+            gap_pick = rng.choice(gap_pool, size=min(gap_take, len(gap_pool)), replace=False) if len(gap_pool) > gap_take else gap_pool
+            keep.extend([int(i) for i in gap_pick.tolist()])
+
+    remaining = int(max_windows) - len(keep)
+    if remaining > 0 and len(normal):
+        normal_pick = rng.choice(normal, size=min(remaining, len(normal)), replace=False)
+        keep.extend([int(i) for i in normal_pick.tolist()])
+
+    return np.sort(np.asarray(keep, dtype=np.int64))
+
+
+def _append_godark_candidate(
+    out: List[dict],
+    *,
+    order: int,
+    feat: np.ndarray,
+    coords: np.ndarray,
+    y_vals: np.ndarray,
+    event_ids: np.ndarray,
+    kind: str,
+    vessel_id: str,
+) -> None:
+    y_win = int(np.max(y_vals) >= 1)
+    if y_win:
+        event_id = _mode_text(event_ids[y_vals > 0], default=f"normal::{vessel_id}")
+    elif str(kind).startswith("hard_negative"):
+        event_id = f"{kind}::{vessel_id}"
+    else:
+        event_id = f"normal::{vessel_id}"
+    if y_win:
+        kind = "positive_event"
+    out.append(
+        {
+            "order": int(order),
+            "X": feat.astype(np.float32, copy=False),
+            "coords": coords.astype(np.float64, copy=False),
+            "y": int(y_win),
+            "event_id": str(event_id),
+            "kind": str(kind),
+        }
+    )
+
+
+def build_transshipment_sequences_from_df(
+    df: pd.DataFrame,
+    cfg: PreprocessCfg,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    feat_cols = _transshipment_feature_cols(cfg.transshipment_feature_mode)
+    need = ["event_id", "timestamp", "lat_mid", "lon_mid"]
+    for c in need:
+        if c not in df.columns:
+            raise ValueError(f"task=transshipment but required column '{c}' not found")
+
+    df = df.copy()
+    df["event_id"] = df["event_id"].astype(str)
+    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df["lat_mid"] = pd.to_numeric(df["lat_mid"], errors="coerce")
+    df["lon_mid"] = pd.to_numeric(df["lon_mid"], errors="coerce")
+    df = df.dropna(subset=["event_id", "timestamp", "lat_mid", "lon_mid"]).copy()
+    if df.empty:
+        return (
+            np.zeros((0, cfg.seq_len, len(feat_cols)), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=object),
+            np.zeros((0, cfg.seq_len, 4), dtype=np.float64),
+            np.zeros((0, cfg.seq_len, len(TRANS_RULE_SCORE_COLS)), dtype=np.float32),
+        )
+
+    if "class_id" not in df.columns:
+        df["class_id"] = df.apply(_transshipment_class_id, axis=1)
+    else:
+        df["class_id"] = (
+            pd.to_numeric(df["class_id"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+            .clip(lower=0, upper=2)
+        )
+    target = _transshipment_target_from_cfg(df, cfg)
+
+    for c in TRANS_FEATURE_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    df["valid_point"] = pd.to_numeric(df["valid_point"], errors="coerce").fillna(1.0)
+    df[TRANS_FEATURE_COLS] = df[TRANS_FEATURE_COLS].fillna(0.0)
+    rule_df = df[TRANS_RULE_SCORE_COLS].copy()
+    df = _stabilize_transshipment_features(df)
+    df = df.sort_values(["event_id", "timestamp"])
+    rule_df = rule_df.loc[df.index].fillna(0.0)
+
+    X_list: List[np.ndarray] = []
+    y_list: List[int] = []
+    g_list: List[str] = []
+    coord_list: List[np.ndarray] = []
+    rule_list: List[np.ndarray] = []
+
+    min_points = max(1, int(cfg.min_points_per_vessel))
+    seq_len = int(cfg.seq_len)
+    stride = max(1, int(cfg.stride))
+
+    for event_id, g in df.groupby("event_id", sort=False):
+        g = g.sort_values("timestamp").reset_index(drop=True)
+        if len(g) < min_points:
+            continue
+
+        rule_g = rule_df.loc[g.index, TRANS_RULE_SCORE_COLS].to_numpy(dtype=np.float32)
+        feat = g[feat_cols].to_numpy(dtype=np.float32)
+        class_ids = g["class_id"].to_numpy(dtype=np.int64)
+        y_mapped = _map_transshipment_y(class_ids, target)
+        y_point = (y_mapped > 0).astype(np.int64)
+        coords = np.column_stack(
+            [
+                g["timestamp"].to_numpy(dtype=np.float64),
+                g["lat_mid"].to_numpy(dtype=np.float64),
+                g["lon_mid"].to_numpy(dtype=np.float64),
+                y_point.astype(np.float64),
+            ]
+        )
+        y_event = int(np.bincount(y_mapped, minlength=3).argmax())
+
+        windows_made = 0
+        if len(g) < seq_len:
+            pad = seq_len - len(g)
+            feat_pad = np.zeros((pad, len(feat_cols)), dtype=np.float32)
+            valid_idx = feat_cols.index("valid_point")
+            feat_pad[:, valid_idx] = 0.0
+            rule_pad = np.zeros((pad, len(TRANS_RULE_SCORE_COLS)), dtype=np.float32)
+            coord_pad = np.zeros((pad, 4), dtype=np.float64)
+            if len(coords) > 0:
+                coord_pad[:, 0] = coords[-1, 0]
+                coord_pad[:, 1] = coords[-1, 1]
+                coord_pad[:, 2] = coords[-1, 2]
+                coord_pad[:, 3] = 0.0
+            X_list.append(np.concatenate([feat, feat_pad], axis=0))
+            rule_list.append(np.concatenate([rule_g, rule_pad], axis=0))
+            coord_list.append(np.concatenate([coords, coord_pad], axis=0))
+            y_list.append(y_event)
+            g_list.append(str(event_id))
+            continue
+
+        for i in range(0, len(g) - seq_len + 1, stride):
+            window = feat[i:i + seq_len]
+            rule_window = rule_g[i:i + seq_len]
+            coord_window = coords[i:i + seq_len]
+            y_win_vals = y_mapped[i:i + seq_len]
+            y_win = int(np.bincount(y_win_vals, minlength=3).argmax())
+            if np.any(y_win_vals > 0):
+                positives = y_win_vals[y_win_vals > 0]
+                if positives.size:
+                    y_win = int(np.bincount(positives, minlength=3).argmax())
+
+            X_list.append(window)
+            rule_list.append(rule_window)
+            coord_list.append(coord_window)
+            y_list.append(y_win)
+            g_list.append(str(event_id))
+            windows_made += 1
+            if cfg.max_windows_per_vessel > 0 and windows_made >= int(cfg.max_windows_per_vessel):
+                break
+
+    if not X_list:
+        return (
+            np.zeros((0, seq_len, len(feat_cols)), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=object),
+            np.zeros((0, seq_len, 4), dtype=np.float64),
+            np.zeros((0, seq_len, len(TRANS_RULE_SCORE_COLS)), dtype=np.float32),
+        )
+
+    return (
+        np.stack(X_list).astype(np.float32),
+        np.array(y_list, dtype=np.int64),
+        np.array(g_list, dtype=object),
+        np.stack(coord_list).astype(np.float64),
+        np.stack(rule_list).astype(np.float32),
+    )
+
+
 def build_sequences_from_df(
     df: pd.DataFrame,
     cfg: PreprocessCfg,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     df = clean_and_derive(df, cfg)
 
     if cfg.apply_jump_filter:
@@ -383,34 +881,7 @@ def build_sequences_from_df(
     else:
         df["y_point"] = 0
 
-    feat_cols = [
-        "speed",
-        "vx",
-        "vy",
-        "dspeed",
-        "accel",
-        "dcourse",
-        "turn_rate",
-        "abs_dcourse",
-        "step_km",
-        "step_km_raw",
-        "dt",
-        "dt_raw_seconds",
-        "dt_log",
-        "implied_speed_knots_raw",
-        "distance_from_shore",
-        "distance_from_port",
-        "pos_speed_knots",
-        "dpos_speed",
-        "pos_bearing_sin",
-        "pos_bearing_cos",
-        "bearing_error",
-        "curvature",
-        "pos_speed_ma5",
-        "pos_speed_std5",
-        "abs_turn_ma5",
-        "curvature_ma5",
-    ]
+    feat_cols = list(SEQ_FEATURE_COLS)
 
     df = df.dropna(subset=feat_cols).copy()
 
@@ -418,6 +889,8 @@ def build_sequences_from_df(
     y_list: List[int] = []
     g_list: List[str] = []
     coord_list: List[np.ndarray] = []
+    event_id_list: List[str] = []
+    kind_list: List[str] = []
 
     for vessel_id, g in df.groupby("mmsi", sort=False):
         g = g.sort_values("timestamp")
@@ -466,6 +939,93 @@ def build_sequences_from_df(
 
         feat = g[feat_cols].to_numpy(dtype=np.float32)
         coords = g[["timestamp", "lat", "lon", "y_point"]].to_numpy(dtype=np.float64)
+        event_ids = (
+            g.get("go_dark_event_id", pd.Series("normal", index=g.index))
+            .astype(str)
+            .to_numpy()
+        )
+
+        if cfg.task == "godark":
+            keep_gap = []
+            for x in raw_gaps:
+                left_is_event = y_point[x] == 1
+                right_is_event = y_point[x + 1] == 1
+                same_event = (
+                    (event_ids[x] != "normal")
+                    and (event_ids[x] == event_ids[x + 1])
+                )
+                keep_gap.append(bool(left_is_event or right_is_event or same_event))
+
+            gaps = np.array(
+                [x for x, keep in zip(raw_gaps, keep_gap) if not keep],
+                dtype=int,
+            )
+            starts = [0] + [int(x + 1) for x in gaps]
+            ends = [int(x + 1) for x in gaps] + [len(g)]
+
+            candidates: List[dict] = []
+            order = 0
+            for s, e in zip(starts, ends):
+                if e - s < cfg.seq_len:
+                    continue
+                for i in range(s, e - cfg.seq_len + 1, cfg.stride):
+                    window = feat[i:i + cfg.seq_len]
+                    coord_window = coords[i:i + cfg.seq_len]
+                    y_vals = y_point[i:i + cfg.seq_len]
+                    event_vals = event_ids[i:i + cfg.seq_len]
+                    kind = "hard_negative_feature" if (
+                        int(np.max(y_vals) >= 1) == 0 and _is_godark_hard_negative(window, feat_cols, cfg)
+                    ) else "normal_random"
+                    _append_godark_candidate(
+                        candidates,
+                        order=order,
+                        feat=window,
+                        coords=coord_window,
+                        y_vals=y_vals,
+                        event_ids=event_vals,
+                        kind=kind,
+                        vessel_id=str(vessel_id),
+                    )
+                    order += 1
+
+            non_event_gap_idx = [int(x) for x, keep in zip(raw_gaps, keep_gap) if not keep]
+            for gap_no, x in enumerate(non_event_gap_idx):
+                lo = max(0, int(x) - cfg.seq_len + 2)
+                hi = min(int(x) + 1, len(g) - cfg.seq_len)
+                if hi < lo:
+                    continue
+                starts_gap = list(range(lo, hi + 1, max(1, cfg.stride)))
+                if hi not in starts_gap:
+                    starts_gap.append(hi)
+                for i in starts_gap:
+                    window = feat[i:i + cfg.seq_len]
+                    coord_window = coords[i:i + cfg.seq_len]
+                    y_vals = y_point[i:i + cfg.seq_len]
+                    if int(np.max(y_vals) >= 1) == 1:
+                        continue
+                    event_vals = event_ids[i:i + cfg.seq_len]
+                    _append_godark_candidate(
+                        candidates,
+                        order=order,
+                        feat=window,
+                        coords=coord_window,
+                        y_vals=y_vals,
+                        event_ids=event_vals,
+                        kind=f"hard_negative_gap::{gap_no}",
+                        vessel_id=str(vessel_id),
+                    )
+                    order += 1
+
+            rng = _stable_random_state(str(vessel_id))
+            selected = _select_godark_windows(candidates, int(cfg.max_windows_per_vessel), rng)
+            for item in selected:
+                X_list.append(item["X"])
+                y_list.append(int(item["y"]))
+                g_list.append(vessel_id)
+                coord_list.append(item["coords"])
+                event_id_list.append(str(item["event_id"]))
+                kind_list.append(str(item["kind"]))
+            continue
 
         win_count = 0
 
@@ -501,6 +1061,8 @@ def build_sequences_from_df(
                 y_list.append(y_win)
                 g_list.append(vessel_id)
                 coord_list.append(coord_window)
+                event_id_list.append(str(vessel_id))
+                kind_list.append("positive_event" if y_win else "normal_random")
                 win_count += 1
 
                 if (
@@ -523,6 +1085,8 @@ def build_sequences_from_df(
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=object),
             np.zeros((0, cfg.seq_len, 4), dtype=np.float64),
+            np.zeros((0,), dtype=object),
+            np.zeros((0,), dtype=object),
         )
 
     return (
@@ -530,6 +1094,8 @@ def build_sequences_from_df(
         np.array(y_list, dtype=np.int64),
         np.array(g_list, dtype=object),
         np.stack(coord_list).astype(np.float64),
+        np.array(event_id_list, dtype=object),
+        np.array(kind_list, dtype=object),
     )
 
 
@@ -550,13 +1116,18 @@ def build_sequences_to_npz(
     max_windows_per_file: int = 20000,
     balance_gear_classes: bool = False,
     spoofing_window_threshold: float = 0.20,
+    transshipment_target: str = "multiclass",
+    transshipment_feature_mode: str = "fair",
     apply_jump_filter: Optional[bool] = None,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if apply_jump_filter is None:
-        apply_jump_filter = task not in ["spoofing", "godark"]
+        apply_jump_filter = task not in ["spoofing", "godark", "transshipment"]
+
+    if task == "transshipment" and int(min_points_per_vessel) == 80:
+        min_points_per_vessel = 3
 
     cfg = PreprocessCfg(
         task=task,
@@ -570,6 +1141,8 @@ def build_sequences_to_npz(
         max_windows_per_file=int(max_windows_per_file),
         balance_gear_classes=bool(balance_gear_classes),
         spoofing_window_threshold=float(spoofing_window_threshold),
+        transshipment_target=str(transshipment_target),
+        transshipment_feature_mode=str(transshipment_feature_mode),
         apply_jump_filter=bool(apply_jump_filter),
     )
 
@@ -591,10 +1164,27 @@ def build_sequences_to_npz(
         else:
             csvs = [p for p in csvs if p.name.startswith("godark_")]
 
+    if task == "transshipment":
+        combined = Path(data_dir) / "transshipment_all.csv"
+        if combined.exists():
+            csvs = [combined]
+        else:
+            csvs = [p for p in csvs if p.name.startswith("transshipment_")]
+
     if not csvs:
         raise FileNotFoundError(f"No CSV found in {data_dir}")
 
+    if task == "transshipment" and str(cfg.transshipment_target).strip().lower() == "auto":
+        cfg.transshipment_target = _infer_transshipment_auto_target(
+            csvs=csvs,
+            limit_rows=int(limit_rows),
+            chunksize=int(chunksize),
+        )
+        print(f"[preprocess] transshipment_target auto -> {cfg.transshipment_target}")
+
     all_X, all_y, all_groups, all_coords = [], [], [], []
+    all_window_event_ids, all_window_kinds = [], []
+    all_rule_features = []
     gear_to_id: Dict[str, int] = {}
     next_id = 0
 
@@ -620,9 +1210,15 @@ def build_sequences_to_npz(
         df = read_ais_csv(p, limit_rows=limit_rows, chunksize=chunksize)
 
         try:
-            X, y, groups, coords = build_sequences_from_df(df, cfg)
+            if task == "transshipment":
+                X, y, groups, coords, rule_features = build_transshipment_sequences_from_df(df, cfg)
+                window_event_ids = groups.astype(object)
+                window_kinds = np.array(["positive_event" if int(v) > 0 else "normal_random" for v in y], dtype=object)
+            else:
+                X, y, groups, coords, window_event_ids, window_kinds = build_sequences_from_df(df, cfg)
+                rule_features = None
         except ValueError as exc:
-            if task in ["spoofing", "godark"]:
+            if task in ["spoofing", "godark", "transshipment"]:
                 print(f"[preprocess] skip {p.name}: {exc}")
                 continue
             raise
@@ -642,17 +1238,28 @@ def build_sequences_to_npz(
 
         if cfg.max_windows_per_file and len(X) > cfg.max_windows_per_file:
             rng = np.random.RandomState(42)
-            idx = rng.choice(len(X), size=cfg.max_windows_per_file, replace=False)
+            if task == "godark":
+                idx = _select_godark_indices(y, window_kinds, int(cfg.max_windows_per_file), rng)
+            else:
+                idx = rng.choice(len(X), size=cfg.max_windows_per_file, replace=False)
 
             X = X[idx]
             y = y[idx]
             groups = groups[idx]
             coords = coords[idx]
+            window_event_ids = window_event_ids[idx]
+            window_kinds = window_kinds[idx]
+            if rule_features is not None:
+                rule_features = rule_features[idx]
 
         all_X.append(X)
         all_y.append(y)
         all_groups.append(groups)
         all_coords.append(coords)
+        all_window_event_ids.append(window_event_ids)
+        all_window_kinds.append(window_kinds)
+        if rule_features is not None:
+            all_rule_features.append(rule_features)
 
     if not all_X:
         raise RuntimeError("No sequences created. Coba kecilin seq_len atau cek file.")
@@ -661,6 +1268,13 @@ def build_sequences_to_npz(
     y = np.concatenate(all_y, axis=0)
     groups = np.concatenate(all_groups, axis=0)
     coords = np.concatenate(all_coords, axis=0)
+    window_event_ids = np.concatenate(all_window_event_ids, axis=0) if all_window_event_ids else np.array([], dtype=object)
+    window_kinds = np.concatenate(all_window_kinds, axis=0) if all_window_kinds else np.array([], dtype=object)
+    rule_features = (
+        np.concatenate(all_rule_features, axis=0)
+        if all_rule_features
+        else np.zeros((len(X), X.shape[1], 0), dtype=np.float32)
+    )
 
     if cfg.min_windows_per_vessel > 0:
         groups_str = groups.astype(str)
@@ -678,6 +1292,10 @@ def build_sequences_to_npz(
             y = y[keep_mask]
             groups = groups[keep_mask]
             coords = coords[keep_mask]
+            window_event_ids = window_event_ids[keep_mask]
+            window_kinds = window_kinds[keep_mask]
+            if rule_features.shape[-1] > 0:
+                rule_features = rule_features[keep_mask]
 
     if task == "gear":
         counts = np.bincount(y.astype(np.int64), minlength=len(gear_to_id))
@@ -702,6 +1320,10 @@ def build_sequences_to_npz(
                 y = y[keep_idx]
                 groups = groups[keep_idx]
                 coords = coords[keep_idx]
+                window_event_ids = window_event_ids[keep_idx]
+                window_kinds = window_kinds[keep_idx]
+                if rule_features.shape[-1] > 0:
+                    rule_features = rule_features[keep_idx]
 
                 counts = np.bincount(y.astype(np.int64), minlength=len(gear_to_id))
                 print("[preprocess] gear class windows after balance:", {label: int(counts[idx]) for label, idx in gear_to_id.items()})
@@ -711,6 +1333,17 @@ def build_sequences_to_npz(
         label_map = {0: "normal", 1: "spoofing"}
     elif task == "godark":
         label_map = {0: "normal", 1: "go_dark"}
+    elif task == "transshipment":
+        target_for_map = str(cfg.transshipment_target or "multiclass").strip().lower()
+        if target_for_map == "auto":
+            present = set(np.unique(y.astype(np.int64)).tolist())
+            if present <= {0, 1} and 1 in present:
+                # In auto mode the builder has already collapsed a single
+                # positive source class to binary. Use a neutral label.
+                target_for_map = "any"
+            else:
+                target_for_map = "multiclass"
+        label_map = _transshipment_label_map_for_target(target_for_map)
     else:
         label_map = {0: "not_fishing", 1: "fishing"}
 
@@ -723,6 +1356,13 @@ def build_sequences_to_npz(
         groups=groups,
         coords=coords,
         coord_cols=np.array(["timestamp", "lat", "lon", "y_point"], dtype=object),
+        window_event_ids=window_event_ids.astype(object),
+        window_kinds=window_kinds.astype(object),
+        feature_cols=np.array(_transshipment_feature_cols(cfg.transshipment_feature_mode) if task == "transshipment" else [], dtype=object),
+        rule_features=rule_features.astype(np.float32),
+        rule_cols=np.array(TRANS_RULE_SCORE_COLS if task == "transshipment" else [], dtype=object),
+        transshipment_target=np.array(str(cfg.transshipment_target), dtype=object),
+        transshipment_feature_mode=np.array(str(cfg.transshipment_feature_mode), dtype=object),
         label_map=np.array(list(label_map.items()), dtype=object),
         scaled=np.array(False),
     )

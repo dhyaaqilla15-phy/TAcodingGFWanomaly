@@ -1,10 +1,11 @@
-# AIS/GFW Gear Classification, Spoofing, and Go-Dark
+# AIS/GFW Gear Classification, Spoofing, Go-Dark, and Transshipment Candidates
 
-Project ini untuk skripsi: membaca dataset AIS/GFW, membuat sequence trajectory, lalu menjalankan tiga pipeline terpisah:
+Project ini untuk skripsi: membaca dataset AIS/GFW, membuat sequence trajectory, lalu menjalankan empat pipeline terpisah:
 
 1. **Gear classification**: deteksi jenis fishing gear kapal.
 2. **Spoofing detection**: generate dan deteksi trajectory GPS/AIS yang dimanipulasi.
 3. **Go-dark detection**: generate dan deteksi kapal yang menghilang dari AIS/GPS.
+4. **Transshipment candidate detection**: deteksi kandidat encounter dua kapal dan loitering offshore berbasis AIS.
 
 Versi ini sudah **menghapus command `predict`**. Untuk kebutuhan skripsi, alur berhenti di `eval`, karena confusion matrix, metrics, dan tabel prediksi evaluasi sudah keluar dari `eval`.
 
@@ -20,6 +21,8 @@ spoofing_simulator.py
 plot_spoofing.py
 go_dark_simulator.py
 plot_go_dark.py
+transshipment_detector.py
+plot_transshipment.py
 plot_trajectory.py
 model.py
 metrics.py
@@ -41,7 +44,7 @@ Scaler di-fit hanya dari train split, lalu dipakai untuk validation/test. Ini me
 Untuk metric validasi:
 
 - `gear` tetap memakai metric utama vessel-level.
-- `spoofing` dan `go-dark` memakai metric utama sequence-level saat training/eval, karena satu vessel bisa mengandung sangat banyak window normal dan hanya sedikit window anomali.
+- `spoofing`, `go-dark`, dan `transshipment` memakai metric utama sequence-level/event-level saat training/eval, karena satu vessel/pair/event bisa mengandung banyak window normal dan sedikit window anomali.
 
 ---
 
@@ -330,7 +333,116 @@ Output penting:
 outputs_godark/model_godark/confusion_matrix.png
 outputs_godark/model_godark/confusion_matrix_normalized.png
 outputs_godark/model_godark/per_vessel_predictions.csv
+outputs_godark/model_godark/per_godark_event_predictions.csv
+outputs_godark/model_godark/godark_event_error_breakdown.csv
 outputs_godark/model_godark/eval_summary.json
+```
+
+Untuk Go-Dark, metrik utama yang perlu dibaca adalah `macro_f1`, `balanced_acc`, dan `metrics_godark_event` di `eval_summary.json`. Accuracy bisa sangat tinggi saat window normal jauh lebih banyak daripada window go-dark.
+
+Evaluasi Go-Dark sekarang memakai decision rule event-level yang disimpan dari validation set:
+
+```text
+event positif jika:
+max_go_dark_probability >= godark_event_prob_threshold
+DAN windows_over_threshold >= godark_event_min_positive_windows
+DAN positive_window_ratio >= godark_event_min_positive_ratio
+```
+
+Saat training Go-Dark, pipeline menyapu beberapa threshold validation dan menyimpan kombinasi terbaik ke checkpoint berdasarkan `godark_score` selama recall event melewati batas minimum. Grid yang disapu mencakup `godark_event_prob_thresholds`, `godark_event_min_windows_grid`, dan `godark_event_min_positive_ratio_grid`. Event pendek juga punya rescue rule melalui `godark_event_short_min_positive_ratio`, sehingga event dengan window sedikit tetap bisa positif jika rasio window kuat sangat tinggi. Saat eval test, threshold tersebut dipakai apa adanya agar tidak ada tuning di test set. Untuk diagnosis, baca `per_godark_event_predictions.csv` dan `godark_event_error_breakdown.csv`, terutama false positive dari `hard_negative_feature` dan `normal_random`.
+
+---
+
+# 4. Transshipment candidate pipeline
+
+Transshipment di AIS tidak bisa membuktikan transfer ikan/barang secara langsung. Modul ini membuat **weak-label candidate events** berdasarkan pola literatur:
+
+- **Encounter**: dua kapal dalam jarak <= 0.5 km, durasi >= 2 jam, median speed < 2 knot, dan jauh dari port/anchorage proxy.
+- **Loitering**: satu kapal bergerak lambat < 2 knot selama >= 8 jam, minimal 20 nautical miles dari shore.
+- Untuk akurasi yang lebih stabil, pipeline juga menyimpan `encounter_rule_score`, `loitering_rule_score`, dan `risk_score`, lalu evaluasi transshipment memakai pembanding LSTM, tabular Random Forest, dan hybrid rule+ML.
+- Target default yang disarankan untuk eksperimen awal adalah binary `--transshipment_target any` = `normal` vs `potential_transshipment`. Gunakan `encounter`, `loitering`, atau `multiclass` kalau data positifnya sudah cukup.
+
+## Generate transshipment candidates
+
+```bash
+python3 main.py make_transshipment \
+  --input_path "Dataset" \
+  --out_dir outputs_transshipment \
+  --mode both \
+  --limit_rows 300000 \
+  --max_vessels_per_file 60 \
+  --grid_minutes 10 \
+  --encounter_distance_km 0.5 \
+  --encounter_min_hours 2 \
+  --encounter_max_speed_knots 2 \
+  --loitering_min_hours 8 \
+  --loitering_max_speed_knots 2 \
+  --loitering_min_shore_nm 20 \
+  --synthetic_encounters_per_file 250 \
+  --combine_outputs \
+  --seed 42
+```
+
+Output:
+
+```text
+outputs_transshipment/transshipment_all.csv
+outputs_transshipment/events/events_transshipment_all.csv
+outputs_transshipment/summaries/summary_transshipment.csv
+```
+
+## Plot transshipment candidates
+
+```bash
+python3 main.py plot_transshipment_examples \
+  --csv_path outputs_transshipment/transshipment_all.csv \
+  --out_dir outputs_transshipment/plots/events
+```
+
+## Preprocess transshipment
+
+```bash
+python3 main.py preprocess \
+  --data_dir outputs_transshipment \
+  --out_dir outputs_transshipment \
+  --task transshipment \
+  --transshipment_target any \
+  --transshipment_feature_mode fair \
+  --seq_len 24 \
+  --stride 3 \
+  --min_points_per_vessel 3
+```
+
+## Train transshipment
+
+```bash
+python3 main.py train \
+  --data_npz outputs_transshipment/processed_transshipment.npz \
+  --out_dir outputs_transshipment/model_transshipment \
+  --device auto \
+  --random_state 42 \
+  --geo_aux_weight 0
+```
+
+## Evaluate transshipment
+
+```bash
+python3 main.py eval \
+  --data_npz outputs_transshipment/processed_transshipment.npz \
+  --model_path outputs_transshipment/model_transshipment/model.pt \
+  --out_dir outputs_transshipment/model_transshipment \
+  --device auto
+```
+
+Output penting:
+
+```text
+outputs_transshipment/model_transshipment/confusion_matrix.png
+outputs_transshipment/model_transshipment/confusion_matrix_normalized.png
+outputs_transshipment/model_transshipment/per_event_predictions.csv
+outputs_transshipment/model_transshipment/per_event_predictions_hybrid.csv
+outputs_transshipment/model_transshipment/transshipment_tabular.joblib
+outputs_transshipment/model_transshipment/eval_summary.json
 ```
 
 ---
@@ -361,13 +473,21 @@ Preprocess go-dark
 Train go-dark
         ↓
 Eval go-dark
+        ↓
+Generate transshipment candidates
+        ↓
+Preprocess transshipment
+        ↓
+Train transshipment
+        ↓
+Eval transshipment
 ```
 
 Jadi tidak ada lagi tahap `predict`. Semua hasil laporan utama diambil dari `eval`.
 
 ---
 
-# 4. One-command pipeline
+# 5. One-command pipeline
 
 Kalau mau jalanin semua pipeline sekaligus dalam satu command, pakai script:
 
@@ -379,7 +499,7 @@ Default script ini akan:
 
 - membaca data dari `Dataset`
 - menyimpan hasil ke `output/run01`
-- menjalankan `gear`, `spoofing`, dan `go-dark` sampai `eval`
+- menjalankan `gear`, `spoofing`, `go-dark`, dan `transshipment` sampai `eval`
 
 Kalau mau ganti folder data dan output:
 
@@ -395,7 +515,7 @@ DEVICE=cuda SEED=43 bash run_all_pipeline.sh
 
 ---
 
-# 5. Hyperparameter tuning
+# 6. Hyperparameter tuning
 
 Kalau mau tuning hyperparameter tanpa edit kode berulang, command `train` sekarang sudah menerima argumen:
 
@@ -454,3 +574,4 @@ Di `summary.csv` akan ada:
 - macro F1
 - balanced accuracy
 - accuracy
+- Go-Dark event precision/recall/F1 jika task yang dievaluasi adalah Go-Dark

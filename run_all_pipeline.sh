@@ -12,6 +12,20 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 VAL_SIZE="${VAL_SIZE:-0.15}"
 GEAR_VAL_SIZE="${GEAR_VAL_SIZE:-0.20}"
 GEAR_MIN_WINDOWS_PER_VESSEL="${GEAR_MIN_WINDOWS_PER_VESSEL:-0}"
+PREPROCESS_MAX_WINDOWS_PER_FILE="${PREPROCESS_MAX_WINDOWS_PER_FILE:-20000}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-320}"
+TRAIN_HIDDEN_SIZE="${TRAIN_HIDDEN_SIZE:-384}"
+TRAIN_NUM_LAYERS="${TRAIN_NUM_LAYERS:-2}"
+TRAIN_INPUT_PROJ_DIM="${TRAIN_INPUT_PROJ_DIM:-256}"
+TRAIN_EMBED_DIM="${TRAIN_EMBED_DIM:-512}"
+TRAIN_ATTENTION_HEADS="${TRAIN_ATTENTION_HEADS:-4}"
+TRAIN_ATTENTION_LAYERS="${TRAIN_ATTENTION_LAYERS:-1}"
+TRAIN_EARLY_STOP_PATIENCE="${TRAIN_EARLY_STOP_PATIENCE:-90}"
+TRAIN_GEO_AUX_WEIGHT="${TRAIN_GEO_AUX_WEIGHT:-0.03}"
+TRANS_TARGET="${TRANS_TARGET:-any}"
+TRANS_FEATURE_MODE="${TRANS_FEATURE_MODE:-fair}"
+TRANS_GEO_AUX_WEIGHT="${TRANS_GEO_AUX_WEIGHT:-0}"
+TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE="${TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE:-250}"
 
 usage() {
   cat <<EOF
@@ -30,6 +44,20 @@ Optional environment variables:
   VAL_SIZE=0.15
   GEAR_VAL_SIZE=0.20
   GEAR_MIN_WINDOWS_PER_VESSEL=0
+  PREPROCESS_MAX_WINDOWS_PER_FILE=20000
+  TRAIN_EPOCHS=320
+  TRAIN_HIDDEN_SIZE=384
+  TRAIN_NUM_LAYERS=2
+  TRAIN_INPUT_PROJ_DIM=256
+  TRAIN_EMBED_DIM=512
+  TRAIN_ATTENTION_HEADS=4
+  TRAIN_ATTENTION_LAYERS=1
+  TRAIN_EARLY_STOP_PATIENCE=90
+  TRAIN_GEO_AUX_WEIGHT=0.03
+  TRANS_TARGET=any|encounter|loitering|multiclass|auto
+  TRANS_FEATURE_MODE=fair|full
+  TRANS_GEO_AUX_WEIGHT=0
+  TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE=250
 
 Example:
   bash run_all_pipeline.sh
@@ -52,8 +80,9 @@ MAIN_PY="$ROOT_DIR/main.py"
 OUT_GEAR="$RUN_DIR/gear"
 OUT_SPOOF="$RUN_DIR/spoofing"
 OUT_GODARK="$RUN_DIR/godark"
+OUT_TRANS="$RUN_DIR/transshipment"
 
-mkdir -p "$OUT_GEAR" "$OUT_SPOOF" "$OUT_GODARK"
+mkdir -p "$OUT_GEAR" "$OUT_SPOOF" "$OUT_GODARK" "$OUT_TRANS"
 
 run_step() {
   echo
@@ -75,25 +104,47 @@ echo "[pipeline] limit    = $LIMIT_ROWS"
 echo "[pipeline] val_size = $VAL_SIZE"
 echo "[pipeline] gear_val_size = $GEAR_VAL_SIZE"
 echo "[pipeline] gear_min_windows_per_vessel = $GEAR_MIN_WINDOWS_PER_VESSEL"
+echo "[pipeline] preprocess_max_windows_per_file = $PREPROCESS_MAX_WINDOWS_PER_FILE"
+echo "[pipeline] train_epochs = $TRAIN_EPOCHS"
+echo "[pipeline] train_hidden_size = $TRAIN_HIDDEN_SIZE"
+echo "[pipeline] train_num_layers = $TRAIN_NUM_LAYERS"
+echo "[pipeline] train_attention_heads = $TRAIN_ATTENTION_HEADS"
+echo "[pipeline] train_attention_layers = $TRAIN_ATTENTION_LAYERS"
+echo "[pipeline] train_geo_aux_weight = $TRAIN_GEO_AUX_WEIGHT"
+echo "[pipeline] trans_target = $TRANS_TARGET"
+echo "[pipeline] trans_feature_mode = $TRANS_FEATURE_MODE"
+echo "[pipeline] trans_geo_aux_weight = $TRANS_GEO_AUX_WEIGHT"
+echo "[pipeline] trans_synthetic_encounters_per_file = $TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE"
 
-run_step "[1/15] Gear preprocess" \
+run_step "[1/20] Gear preprocess" \
   python3 "$MAIN_PY" preprocess \
   --data_dir "$DATA_DIR" \
   --out_dir "$OUT_GEAR" \
   --task gear \
+  --limit_rows "$LIMIT_ROWS" \
+  --max_windows_per_file "$PREPROCESS_MAX_WINDOWS_PER_FILE" \
   --exclude_labels unknown \
   --min_windows_per_vessel "$GEAR_MIN_WINDOWS_PER_VESSEL"
 
-run_step "[2/15] Gear train" \
+run_step "[2/20] Gear train" \
   python3 "$MAIN_PY" train \
   --data_npz "$OUT_GEAR/processed_gear.npz" \
   --out_dir "$OUT_GEAR/model_gear" \
   --batch_size "$BATCH_SIZE" \
   --device "$DEVICE" \
   --random_state "$SEED" \
-  --val_size "$GEAR_VAL_SIZE"
+  --val_size "$GEAR_VAL_SIZE" \
+  --epochs "$TRAIN_EPOCHS" \
+  --hidden_size "$TRAIN_HIDDEN_SIZE" \
+  --num_layers "$TRAIN_NUM_LAYERS" \
+  --input_proj_dim "$TRAIN_INPUT_PROJ_DIM" \
+  --embed_dim "$TRAIN_EMBED_DIM" \
+  --attention_heads "$TRAIN_ATTENTION_HEADS" \
+  --attention_layers "$TRAIN_ATTENTION_LAYERS" \
+  --early_stop_patience "$TRAIN_EARLY_STOP_PATIENCE" \
+  --geo_aux_weight "$TRAIN_GEO_AUX_WEIGHT"
 
-run_step "[3/15] Gear eval" \
+run_step "[3/20] Gear eval" \
   python3 "$MAIN_PY" eval \
   --data_npz "$OUT_GEAR/processed_gear.npz" \
   --model_path "$OUT_GEAR/model_gear/model.pt" \
@@ -101,7 +152,7 @@ run_step "[3/15] Gear eval" \
   --device "$DEVICE" \
   --random_state "$SEED"
 
-run_step "[4/15] Spoofing generate" \
+run_step "[4/20] Spoofing generate" \
   python3 "$MAIN_PY" make_spoofing \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_SPOOF" \
@@ -113,35 +164,45 @@ run_step "[4/15] Spoofing generate" \
   --combine_outputs \
   --seed "$SEED"
 
-run_step "[5/15] Spoofing preprocess" \
+run_step "[5/20] Spoofing preprocess" \
   python3 "$MAIN_PY" preprocess \
   --data_dir "$OUT_SPOOF" \
   --out_dir "$OUT_SPOOF" \
-  --task spoofing
+  --task spoofing \
+  --max_windows_per_file "$PREPROCESS_MAX_WINDOWS_PER_FILE"
 
-run_step "[6/15] Spoofing plot preprocessed trajectory" \
+run_step "[6/20] Spoofing plot preprocessed trajectory" \
   python3 "$MAIN_PY" plot_preprocessed \
   --npz_path "$OUT_SPOOF/processed_spoofing.npz" \
   --out_dir "$OUT_SPOOF/plots/preprocessed" \
   --task spoofing \
   --max_windows 12
 
-run_step "[7/15] Spoofing plot attack examples (6 types)" \
+run_step "[7/20] Spoofing plot attack examples (6 types)" \
   python3 "$MAIN_PY" plot_spoofing_examples \
   --csv_path "$OUT_SPOOF/spoofed_all.csv" \
   --out_dir "$OUT_SPOOF/plots/attacks" \
   --attacks gradual_drift location_jump replay meaconing ghost mirroring
 
-run_step "[8/15] Spoofing train" \
+run_step "[8/20] Spoofing train" \
   python3 "$MAIN_PY" train \
   --data_npz "$OUT_SPOOF/processed_spoofing.npz" \
   --out_dir "$OUT_SPOOF/model_spoofing" \
   --batch_size "$BATCH_SIZE" \
   --device "$DEVICE" \
   --random_state "$SEED" \
-  --val_size "$VAL_SIZE"
+  --val_size "$VAL_SIZE" \
+  --epochs "$TRAIN_EPOCHS" \
+  --hidden_size "$TRAIN_HIDDEN_SIZE" \
+  --num_layers "$TRAIN_NUM_LAYERS" \
+  --input_proj_dim "$TRAIN_INPUT_PROJ_DIM" \
+  --embed_dim "$TRAIN_EMBED_DIM" \
+  --attention_heads "$TRAIN_ATTENTION_HEADS" \
+  --attention_layers "$TRAIN_ATTENTION_LAYERS" \
+  --early_stop_patience "$TRAIN_EARLY_STOP_PATIENCE" \
+  --geo_aux_weight "$TRAIN_GEO_AUX_WEIGHT"
 
-run_step "[9/15] Spoofing eval" \
+run_step "[9/20] Spoofing eval" \
   python3 "$MAIN_PY" eval \
   --data_npz "$OUT_SPOOF/processed_spoofing.npz" \
   --model_path "$OUT_SPOOF/model_spoofing/model.pt" \
@@ -149,7 +210,7 @@ run_step "[9/15] Spoofing eval" \
   --device "$DEVICE" \
   --random_state "$SEED"
 
-run_step "[10/15] Go-dark generate" \
+run_step "[10/20] Go-dark generate" \
   python3 "$MAIN_PY" make_godark \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_GODARK" \
@@ -167,7 +228,7 @@ run_step "[10/15] Go-dark generate" \
   --combine_outputs \
   --seed "$SEED"
 
-run_step "[11/15] Go-dark preprocess" \
+run_step "[11/20] Go-dark preprocess" \
   python3 "$MAIN_PY" preprocess \
   --data_dir "$OUT_GODARK" \
   --out_dir "$OUT_GODARK" \
@@ -177,31 +238,41 @@ run_step "[11/15] Go-dark preprocess" \
   --gap_seconds 86400 \
   --max_implied_knots 1000 \
   --min_points_per_vessel 80 \
-  --spoofing_window_threshold 0.05
+  --spoofing_window_threshold 0.05 \
+  --max_windows_per_file "$PREPROCESS_MAX_WINDOWS_PER_FILE"
 
-run_step "[12/15] Go-dark plot preprocessed trajectory" \
+run_step "[12/20] Go-dark plot preprocessed trajectory" \
   python3 "$MAIN_PY" plot_preprocessed \
   --npz_path "$OUT_GODARK/processed_godark.npz" \
   --out_dir "$OUT_GODARK/plots/preprocessed" \
   --task godark \
   --max_windows 12
 
-run_step "[13/15] Go-dark plot event examples (6 events)" \
+run_step "[13/20] Go-dark plot event examples (6 events)" \
   python3 "$MAIN_PY" plot_go_dark_examples \
   --csv_path "$OUT_GODARK/godark_all.csv" \
   --out_dir "$OUT_GODARK/plots/events" \
   --num_examples 6
 
-run_step "[14/15] Go-dark train" \
+run_step "[14/20] Go-dark train" \
   python3 "$MAIN_PY" train \
   --data_npz "$OUT_GODARK/processed_godark.npz" \
   --out_dir "$OUT_GODARK/model_godark" \
   --batch_size "$BATCH_SIZE" \
   --device "$DEVICE" \
   --random_state "$SEED" \
-  --val_size "$VAL_SIZE"
+  --val_size "$VAL_SIZE" \
+  --epochs "$TRAIN_EPOCHS" \
+  --hidden_size "$TRAIN_HIDDEN_SIZE" \
+  --num_layers "$TRAIN_NUM_LAYERS" \
+  --input_proj_dim "$TRAIN_INPUT_PROJ_DIM" \
+  --embed_dim "$TRAIN_EMBED_DIM" \
+  --attention_heads "$TRAIN_ATTENTION_HEADS" \
+  --attention_layers "$TRAIN_ATTENTION_LAYERS" \
+  --early_stop_patience "$TRAIN_EARLY_STOP_PATIENCE" \
+  --geo_aux_weight "$TRAIN_GEO_AUX_WEIGHT"
 
-run_step "[15/15] Go-dark eval" \
+run_step "[15/20] Go-dark eval" \
   python3 "$MAIN_PY" eval \
   --data_npz "$OUT_GODARK/processed_godark.npz" \
   --model_path "$OUT_GODARK/model_godark/model.pt" \
@@ -209,9 +280,75 @@ run_step "[15/15] Go-dark eval" \
   --device "$DEVICE" \
   --random_state "$SEED"
 
+run_step "[16/20] Transshipment candidate generate" \
+  python3 "$MAIN_PY" make_transshipment \
+  --input_path "$DATA_DIR" \
+  --out_dir "$OUT_TRANS" \
+  --mode both \
+  --limit_rows "$LIMIT_ROWS" \
+  --max_vessels_per_file 60 \
+  --min_points_per_vessel 40 \
+  --grid_minutes 10 \
+  --encounter_distance_km 0.5 \
+  --encounter_min_hours 2 \
+  --encounter_max_speed_knots 2 \
+  --loitering_min_hours 8 \
+  --loitering_max_speed_knots 2 \
+  --loitering_min_shore_nm 20 \
+  --synthetic_encounters_per_file "$TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE" \
+  --max_normal_events_per_file 500 \
+  --combine_outputs \
+  --seed "$SEED"
+
+run_step "[17/20] Transshipment preprocess" \
+  python3 "$MAIN_PY" preprocess \
+  --data_dir "$OUT_TRANS" \
+  --out_dir "$OUT_TRANS" \
+  --task transshipment \
+  --transshipment_target "$TRANS_TARGET" \
+  --transshipment_feature_mode "$TRANS_FEATURE_MODE" \
+  --seq_len 24 \
+  --stride 3 \
+  --min_points_per_vessel 3 \
+  --max_windows_per_vessel 2000 \
+  --max_windows_per_file "$PREPROCESS_MAX_WINDOWS_PER_FILE"
+
+run_step "[18/20] Transshipment plot examples" \
+  python3 "$MAIN_PY" plot_transshipment_examples \
+  --csv_path "$OUT_TRANS/transshipment_all.csv" \
+  --out_dir "$OUT_TRANS/plots/events" \
+  --num_examples 6
+
+run_step "[19/20] Transshipment train" \
+  python3 "$MAIN_PY" train \
+  --data_npz "$OUT_TRANS/processed_transshipment.npz" \
+  --out_dir "$OUT_TRANS/model_transshipment" \
+  --batch_size "$BATCH_SIZE" \
+  --device "$DEVICE" \
+  --random_state "$SEED" \
+  --val_size "$VAL_SIZE" \
+  --epochs "$TRAIN_EPOCHS" \
+  --hidden_size "$TRAIN_HIDDEN_SIZE" \
+  --num_layers "$TRAIN_NUM_LAYERS" \
+  --input_proj_dim "$TRAIN_INPUT_PROJ_DIM" \
+  --embed_dim "$TRAIN_EMBED_DIM" \
+  --attention_heads "$TRAIN_ATTENTION_HEADS" \
+  --attention_layers "$TRAIN_ATTENTION_LAYERS" \
+  --early_stop_patience "$TRAIN_EARLY_STOP_PATIENCE" \
+  --geo_aux_weight "$TRANS_GEO_AUX_WEIGHT"
+
+run_step "[20/20] Transshipment eval" \
+  python3 "$MAIN_PY" eval \
+  --data_npz "$OUT_TRANS/processed_transshipment.npz" \
+  --model_path "$OUT_TRANS/model_transshipment/model.pt" \
+  --out_dir "$OUT_TRANS/model_transshipment" \
+  --device "$DEVICE" \
+  --random_state "$SEED"
+
 echo
 echo "============================================================"
-echo "[15/15] Pipeline selesai"
+echo "[20/20] Pipeline selesai"
 echo "Gear output     : $OUT_GEAR"
 echo "Spoofing output : $OUT_SPOOF"
 echo "Go-dark output  : $OUT_GODARK"
+echo "Transshipment output : $OUT_TRANS"

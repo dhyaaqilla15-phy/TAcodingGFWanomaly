@@ -26,6 +26,14 @@ def _mode_int(a: np.ndarray) -> int:
     return int(vals[int(np.argmax(cnt))])
 
 
+def _group_label_int(a: np.ndarray) -> int:
+    a = np.asarray(a, dtype=np.int64)
+    pos = a[a > 0]
+    if pos.size:
+        return _mode_int(pos)
+    return _mode_int(a)
+
+
 def _validate_class_distribution(
     train_idx: np.ndarray,
     test_idx: np.ndarray,
@@ -49,11 +57,13 @@ def _validate_class_distribution(
         for group in unique_groups:
             group_mask = groups[idx_set] == group
             group_labels = y[idx_set][group_mask]
-            group_class = _mode_int(group_labels)
+            group_class = _group_label_int(group_labels)
             class_set.add(int(group_class))
     
-    # Check all classes present in both train and test
-    all_classes = set(range(num_classes))
+    # Check all classes that are actually present in this dataset. Some
+    # event-level tasks keep a stable label map even when a small run has no
+    # samples for one class, e.g. transshipment loitering without encounter.
+    all_classes = set(np.unique(y).astype(int).tolist())
     if not (classes_in_train == all_classes and classes_in_test == all_classes):
         return False
     
@@ -67,7 +77,7 @@ def _validate_window_distribution(
     num_classes: int,
 ) -> bool:
     y = np.asarray(y).astype(np.int64)
-    all_classes = set(range(num_classes))
+    all_classes = set(np.unique(y).astype(int).tolist())
     return set(np.unique(y[left_idx]).astype(int).tolist()) == all_classes and set(
         np.unique(y[right_idx]).astype(int).tolist()
     ) == all_classes
@@ -91,7 +101,7 @@ def _split_once_strat_groups(
     group_labels = np.zeros(uniq.shape[0], dtype=np.int64)
     for i, g in enumerate(uniq):
         idx = np.where(groups == g)[0]
-        group_labels[i] = _mode_int(y[idx])
+        group_labels[i] = _group_label_int(y[idx])
 
     vals, cnt = np.unique(group_labels, return_counts=True)
     # kalau ada kelas yg cuma 1 vessel → stratify bisa error
@@ -122,7 +132,7 @@ def _group_labels(y: np.ndarray, groups: np.ndarray) -> tuple[np.ndarray, np.nda
     labels = np.zeros(uniq.shape[0], dtype=np.int64)
     for i, g in enumerate(uniq):
         idx = np.where(groups_str == str(g))[0]
-        labels[i] = _mode_int(y[idx])
+        labels[i] = _group_label_int(y[idx])
 
     return uniq.astype(str), labels, groups_str
 
@@ -370,7 +380,7 @@ def group_train_val_test_split(
     group_labels = np.zeros(uniq.shape[0], dtype=np.int64)
     for i, g in enumerate(uniq):
         idx = np.where(groups == g)[0]
-        group_labels[i] = _mode_int(y[idx])
+        group_labels[i] = _group_label_int(y[idx])
 
     vals, cnt = np.unique(group_labels, return_counts=True)
     can_stratify = vals.size >= 2 and not np.any(cnt < 3)

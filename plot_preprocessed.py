@@ -25,12 +25,16 @@ def _infer_task(npz_path: Path, label_map: Dict[int, str], task: str = "auto") -
         return "spoofing"
     if vals in [{"normal", "go_dark"}, {"normal", "godark"}]:
         return "godark"
+    if vals in [{"normal", "encounter", "loitering"}, {"normal", "transshipment"}, {"normal", "potential_transshipment"}]:
+        return "transshipment"
 
     name = npz_path.name.lower()
     if "spoof" in name:
         return "spoofing"
     if "godark" in name or "go_dark" in name:
         return "godark"
+    if "transshipment" in name:
+        return "transshipment"
     return "trajectory"
 
 
@@ -95,9 +99,15 @@ def plot_preprocessed_trajectory_from_npz(
 
     idx = idx[: max(1, int(max_windows))]
 
-    anomaly_color = "#f85149" if task_name == "spoofing" else "#e3901a"
-    anomaly_label = "Spoofing point" if task_name == "spoofing" else "Go-dark point"
-    title_task = "Spoofing" if task_name == "spoofing" else "Go-Dark" if task_name == "godark" else task_name.title()
+    anomaly_color = "#f85149" if task_name == "spoofing" else "#e3901a" if task_name == "godark" else "#6f42c1"
+    anomaly_label = (
+        "Spoofing point"
+        if task_name == "spoofing"
+        else "Go-dark point"
+        if task_name == "godark"
+        else "Transshipment candidate point"
+    )
+    title_task = "Spoofing" if task_name == "spoofing" else "Go-Dark" if task_name == "godark" else "Transshipment" if task_name == "transshipment" else task_name.title()
 
     fig = plt.figure(figsize=(10, 7))
     used_labels = set()

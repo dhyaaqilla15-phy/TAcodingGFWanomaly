@@ -22,6 +22,16 @@ from agg_utils import (
     confusion_matrix_np,
     metrics_from_cm,
 )
+from transshipment_ml import predict_transshipment_tabular_and_hybrid
+from godark_event import (
+    DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
+    DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
+    DEFAULT_GODARK_EVENT_PROB_THRESHOLD,
+    DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    godark_event_breakdown,
+    godark_event_report,
+    godark_score,
+)
 
 
 def pick_device(device: str) -> torch.device:
@@ -49,6 +59,25 @@ def load_npz(npz_path: Path):
     if "scaled" not in data.files:
         print("[eval] WARNING: NPZ has no 'scaled' metadata. Prefer rerunning preprocess with the train-only scaler pipeline.")
     return X, y, groups, label_map
+
+
+def _load_rule_features(npz_path: Path):
+    data = np.load(npz_path, allow_pickle=True)
+    if "rule_features" not in data.files:
+        return None, []
+    rule_features = data["rule_features"].astype(np.float32, copy=False)
+    rule_cols = [str(x) for x in data["rule_cols"].tolist()] if "rule_cols" in data.files else []
+    if rule_features.ndim != 3 or rule_features.shape[-1] == 0:
+        return None, rule_cols
+    return rule_features, rule_cols
+
+
+def _load_window_metadata(npz_path: Path):
+    data = np.load(npz_path, allow_pickle=True)
+    n = int(data["y"].shape[0])
+    event_ids = data["window_event_ids"] if "window_event_ids" in data.files else np.array([""] * n, dtype=object)
+    kinds = data["window_kinds"] if "window_kinds" in data.files else np.array(["unknown"] * n, dtype=object)
+    return event_ids.astype(object), kinds.astype(object)
 
 
 class AisSeqDataset(Dataset):
@@ -163,13 +192,21 @@ def _task_name_from_label_map(label_map: Dict[int, str]) -> str:
         return "spoofing"
     if vals in [{"normal", "go_dark"}, {"normal", "godark"}]:
         return "godark"
+    if vals in [
+        {"normal", "encounter", "loitering"},
+        {"normal", "encounter"},
+        {"normal", "loitering"},
+        {"normal", "potential_transshipment"},
+        {"normal", "transshipment"},
+    ]:
+        return "transshipment"
     if vals == {"fishing", "not_fishing"}:
         return "fishing"
     return "gear"
 
 
 def _primary_metric_scope(task_name: str) -> str:
-    return "sequence" if task_name in {"spoofing", "godark"} else "vessel"
+    return "sequence" if task_name in {"spoofing", "godark", "transshipment"} else "vessel"
 
 
 def evaluate(
@@ -180,12 +217,18 @@ def evaluate(
     batch_size: int = 64,
     test_size: float = 0.2,
     random_state: int = 42,
+    godark_event_prob_threshold: float | None = None,
+    godark_event_min_positive_windows: int | None = None,
+    godark_event_min_positive_ratio: float | None = None,
+    godark_event_short_min_positive_ratio: float | None = None,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = Path(model_path)
 
     X, y, groups, label_map = load_npz(Path(data_npz))
+    rule_features, rule_cols = _load_rule_features(Path(data_npz))
+    window_event_ids, window_kinds = _load_window_metadata(Path(data_npz))
     num_classes = int(len(label_map))
     labels = [label_map.get(i, str(i)) for i in range(num_classes)]
     task_name = _task_name_from_label_map(label_map)
@@ -206,6 +249,8 @@ def evaluate(
 
     y_test = y[test_idx]
     g_test = groups[test_idx]
+    event_ids_test = window_event_ids[test_idx] if len(window_event_ids) == len(y) else np.array([""] * len(test_idx), dtype=object)
+    kinds_test = window_kinds[test_idx] if len(window_kinds) == len(y) else np.array(["unknown"] * len(test_idx), dtype=object)
 
     ckpt = _torch_load_compat(model_path, map_location="cpu")
     scaler, scaler_path = _load_eval_scaler(model_path, out_dir, ckpt)
@@ -300,6 +345,48 @@ def evaluate(
     best_tau = float(ckpt.get("tau", 0.0))
     best_agg = ck_best
 
+    godark_prob_threshold = float(
+        DEFAULT_GODARK_EVENT_PROB_THRESHOLD
+        if godark_event_prob_threshold is None
+        else godark_event_prob_threshold
+    )
+    godark_min_windows = int(
+        DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS
+        if godark_event_min_positive_windows is None
+        else godark_event_min_positive_windows
+    )
+    godark_min_ratio = float(
+        DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO
+        if godark_event_min_positive_ratio is None
+        else godark_event_min_positive_ratio
+    )
+    godark_short_min_ratio = float(
+        DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO
+        if godark_event_short_min_positive_ratio is None
+        else godark_event_short_min_positive_ratio
+    )
+    if task_name == "godark":
+        godark_prob_threshold = float(
+            ckpt.get("godark_event_prob_threshold", godark_prob_threshold)
+            if godark_event_prob_threshold is None
+            else godark_event_prob_threshold
+        )
+        godark_min_windows = int(
+            ckpt.get("godark_event_min_positive_windows", godark_min_windows)
+            if godark_event_min_positive_windows is None
+            else godark_event_min_positive_windows
+        )
+        godark_min_ratio = float(
+            ckpt.get("godark_event_min_positive_ratio", godark_min_ratio)
+            if godark_event_min_positive_ratio is None
+            else godark_event_min_positive_ratio
+        )
+        godark_short_min_ratio = float(
+            ckpt.get("godark_event_short_min_positive_ratio", godark_short_min_ratio)
+            if godark_event_short_min_positive_ratio is None
+            else godark_event_short_min_positive_ratio
+        )
+
     adj_logits = logits_np - (float(best_tau) * log_pi.reshape(1, -1))
     probs = softmax_np(adj_logits)
     confs = conf_score_from_probs(probs, mode=best_agg.conf_mode)
@@ -318,6 +405,7 @@ def evaluate(
     vessel_details = []
     y_true_v = []
     y_pred_v = []
+    group_id_col = "event_id" if task_name == "transshipment" else "mmsi"
 
     for vid, idxs in v2idx.items():
         yt = int(np.bincount(y_np[idxs], minlength=num_classes).argmax())
@@ -330,7 +418,7 @@ def evaluate(
 
         pv_rows.append(
             {
-                "mmsi": str(vid),
+                group_id_col: str(vid),
                 "true_id": yt,
                 "true_label": label_map.get(yt, str(yt)),
                 "pred_id": yp,
@@ -365,12 +453,88 @@ def evaluate(
     save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
     save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
 
-    pv_path = out_dir / "per_vessel_predictions.csv"
+    pv_name = "per_event_predictions.csv" if task_name == "transshipment" else "per_vessel_predictions.csv"
+    pv_path = out_dir / pv_name
     pd.DataFrame(pv_rows).sort_values(["true_label", "confidence"], ascending=[True, False]).to_csv(pv_path, index=False)
 
-    sus_df = build_suspected_df(vessel_details, SuspectedCfg())
-    sus_path = out_dir / "suspected_model.csv"
-    sus_df.to_csv(sus_path, index=False)
+    godark_event_metrics = None
+    godark_event_path = None
+    godark_event_breakdown_path = None
+    if task_name == "godark":
+        godark_event_metrics, godark_rows = godark_event_report(
+            event_ids=event_ids_test,
+            kinds=kinds_test,
+            y_true=y_np,
+            y_pred=pred_seq,
+            probs=probs,
+            label_map=label_map,
+            prob_threshold=godark_prob_threshold,
+            min_positive_windows=godark_min_windows,
+            min_positive_ratio=godark_min_ratio,
+            short_min_positive_ratio=godark_short_min_ratio,
+        )
+        godark_event_metrics = dict(godark_event_metrics)
+        godark_event_metrics["godark_score"] = godark_score(m_seq, godark_event_metrics)
+        godark_event_path = out_dir / "per_godark_event_predictions.csv"
+        godark_df = pd.DataFrame(godark_rows)
+        if not godark_df.empty:
+            godark_df = godark_df.sort_values(
+                ["error_type", "max_go_dark_probability", "windows_over_threshold"],
+                ascending=[True, False, False],
+            )
+        godark_df.to_csv(godark_event_path, index=False)
+        godark_event_breakdown_path = out_dir / "godark_event_error_breakdown.csv"
+        godark_breakdown_df = pd.DataFrame(godark_event_breakdown(godark_rows))
+        if not godark_breakdown_df.empty:
+            godark_breakdown_df = godark_breakdown_df.sort_values(
+                ["fp", "fn", "event_kind_family"],
+                ascending=[False, False, True],
+            )
+        godark_breakdown_df.to_csv(godark_event_breakdown_path, index=False)
+
+    tx_extra = None
+    tx_extra_path = None
+    if task_name == "transshipment":
+        tx_extra = predict_transshipment_tabular_and_hybrid(
+            model_path=model_path.parent / "transshipment_tabular.joblib",
+            X=X[test_idx],
+            y=y_test,
+            groups=g_test,
+            label_map=label_map,
+            rule_features=(rule_features[test_idx] if rule_features is not None else None),
+            rule_cols=rule_cols,
+        )
+        if tx_extra is not None:
+            tx_rows = []
+            for i, gid in enumerate(tx_extra["groups"].astype(str).tolist()):
+                yt = int(tx_extra["y_true"][i])
+                pt = int(tx_extra["pred_tabular"][i])
+                ph = int(tx_extra["pred_hybrid"][i])
+                tx_rows.append(
+                    {
+                        "event_id": gid,
+                        "true_id": yt,
+                        "true_label": label_map.get(yt, str(yt)),
+                        "tabular_pred_id": pt,
+                        "tabular_pred_label": label_map.get(pt, str(pt)),
+                        "hybrid_pred_id": ph,
+                        "hybrid_pred_label": label_map.get(ph, str(ph)),
+                        "tabular_confidence": float(tx_extra["tabular_confidence"][i]),
+                        "rule_used": int(tx_extra["rule_used"][i]),
+                        "rule_risk": float(tx_extra["rule_risk"][i]),
+                        "rule_encounter": float(tx_extra["rule_encounter"][i]),
+                        "rule_loitering": float(tx_extra["rule_loitering"][i]),
+                    }
+                )
+            tx_extra_path = out_dir / "per_event_predictions_hybrid.csv"
+            pd.DataFrame(tx_rows).sort_values(["true_label", "rule_risk"], ascending=[True, False]).to_csv(tx_extra_path, index=False)
+
+    if task_name == "transshipment":
+        sus_path = None
+    else:
+        sus_df = build_suspected_df(vessel_details, SuspectedCfg())
+        sus_path = out_dir / "suspected_model.csv"
+        sus_df.to_csv(sus_path, index=False)
 
     summary = {
         "task": task_name,
@@ -379,9 +543,39 @@ def evaluate(
         "labels": labels,
         "metrics_seq": m_seq,
         "metrics_vessel": m_v,
+        "metrics_godark_event": godark_event_metrics,
+        "metrics_tabular": (tx_extra.get("metrics_tabular") if tx_extra is not None else None),
+        "metrics_hybrid": (tx_extra.get("metrics_hybrid") if tx_extra is not None else None),
         "metrics": (m_seq if metric_scope == "sequence" else m_v),
         "test_sequences": int(len(y_np)),
         "test_vessels": int(len(v2idx)),
+        "test_events": int(len(v2idx)) if task_name == "transshipment" else None,
+        "prediction_table": str(pv_path),
+        "godark_event_prediction_table": (str(godark_event_path) if godark_event_path is not None else None),
+        "godark_event_error_breakdown_table": (
+            str(godark_event_breakdown_path) if godark_event_breakdown_path is not None else None
+        ),
+        "godark_event_decision": (
+            {
+                "prob_threshold": float(godark_prob_threshold),
+                "min_positive_windows": int(godark_min_windows),
+                "min_positive_ratio": float(godark_min_ratio),
+                "short_min_positive_ratio": float(godark_short_min_ratio),
+                "source": (
+                    "cli_override"
+                    if (
+                        godark_event_prob_threshold is not None
+                        or godark_event_min_positive_windows is not None
+                        or godark_event_min_positive_ratio is not None
+                        or godark_event_short_min_positive_ratio is not None
+                    )
+                    else "checkpoint_or_default"
+                ),
+            }
+            if task_name == "godark"
+            else None
+        ),
+        "hybrid_prediction_table": (str(tx_extra_path) if tx_extra_path is not None else None),
         "batch_size": int(batch_size),
         "device_used": str(dev),
         "logit_adjust_used": True,
@@ -398,6 +592,14 @@ def evaluate(
     if metric_scope == "sequence":
         print(f"[eval][SEQ] acc={m_seq['accuracy']:.4f} macro_f1={m_seq['macro_f1']:.4f} bal_acc={m_seq['balanced_acc']:.4f}")
         print(f"[eval][VESSEL-AUX] acc={m_v['accuracy']:.4f} macro_f1={m_v['macro_f1']:.4f} bal_acc={m_v['balanced_acc']:.4f}")
+        if godark_event_metrics is not None:
+            print(
+                f"[eval][GODARK-EVENT] precision={godark_event_metrics['event_precision']:.4f} "
+                f"recall={godark_event_metrics['event_recall']:.4f} "
+                f"f1={godark_event_metrics['event_f1']:.4f} "
+                f"score={godark_event_metrics['godark_score']:.4f} "
+                f"thr={godark_prob_threshold:.2f} min_win={godark_min_windows}"
+            )
     else:
         print(f"[eval][VESSEL] acc={m_v['accuracy']:.4f} macro_f1={m_v['macro_f1']:.4f} bal_acc={m_v['balanced_acc']:.4f}")
         print(f"[eval][SEQ-AUX] acc={m_seq['accuracy']:.4f} macro_f1={m_seq['macro_f1']:.4f} bal_acc={m_seq['balanced_acc']:.4f}")

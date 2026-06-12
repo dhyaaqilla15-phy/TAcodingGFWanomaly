@@ -26,8 +26,10 @@ def load_scaler(path: Path) -> RobustScaler:
     return joblib.load(Path(path))
 
 
-def apply_scaler(X: np.ndarray, scaler: RobustScaler) -> np.ndarray:
+def apply_scaler(X: np.ndarray, scaler: RobustScaler, clip_value: float = 50.0) -> np.ndarray:
     N, T, F = X.shape
     X2 = X.reshape(N * T, F)
     Xs = scaler.transform(X2).reshape(N, T, F).astype(np.float32)
+    if clip_value and float(clip_value) > 0.0:
+        Xs = np.clip(Xs, -float(clip_value), float(clip_value)).astype(np.float32)
     return Xs

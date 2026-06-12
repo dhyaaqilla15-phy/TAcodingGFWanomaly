@@ -22,7 +22,21 @@ from agg_utils import (
     confusion_matrix_np,
     metrics_from_cm,
     pick_best_tau_and_agg_by_vessel,
+    softmax_np,
 )
+from godark_event import (
+    DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
+    DEFAULT_GODARK_EVENT_MIN_RATIO_GRID,
+    DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
+    DEFAULT_GODARK_EVENT_MIN_RECALL,
+    DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID,
+    DEFAULT_GODARK_EVENT_PROB_THRESHOLD,
+    DEFAULT_GODARK_EVENT_PROB_THRESHOLDS,
+    DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    godark_selection_key,
+    pick_best_godark_event_setting,
+)
+from transshipment_ml import train_transshipment_tabular_baseline
 
 
 class AisSeqDataset(Dataset):
@@ -63,6 +77,37 @@ def load_npz(npz_path: Path):
     elif bool(np.asarray(data["scaled"]).item()):
         print("[train] WARNING: NPZ is already scaled. Train-only scaler will be applied on top of it.")
     return X, y, groups, label_map, coords
+
+
+def _load_feature_cols(npz_path: Path) -> List[str]:
+    data = np.load(npz_path, allow_pickle=True)
+    if "feature_cols" not in data.files:
+        return []
+    return [str(x) for x in data["feature_cols"].tolist()]
+
+
+def _load_rule_features(npz_path: Path) -> Tuple[np.ndarray | None, List[str]]:
+    data = np.load(npz_path, allow_pickle=True)
+    if "rule_features" not in data.files:
+        return None, []
+    rule_features = data["rule_features"].astype(np.float32, copy=False)
+    rule_cols = [str(x) for x in data["rule_cols"].tolist()] if "rule_cols" in data.files else []
+    if rule_features.ndim != 3 or rule_features.shape[-1] == 0:
+        return None, rule_cols
+    return rule_features, rule_cols
+
+
+def _load_window_metadata(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, bool]:
+    data = np.load(npz_path, allow_pickle=True)
+    n = int(data["y"].shape[0])
+    has_meta = "window_event_ids" in data.files and "window_kinds" in data.files
+    if not has_meta:
+        return np.array([""] * n, dtype=object), np.array(["unknown"] * n, dtype=object), False
+    event_ids = data["window_event_ids"].astype(object)
+    kinds = data["window_kinds"].astype(object)
+    if int(event_ids.shape[0]) != n or int(kinds.shape[0]) != n:
+        return np.array([""] * n, dtype=object), np.array(["unknown"] * n, dtype=object), False
+    return event_ids, kinds, True
 
 
 def pick_device(device: str) -> torch.device:
@@ -139,13 +184,21 @@ def _task_name_from_label_map(label_map: Dict[int, str]) -> str:
         return "spoofing"
     if vals in [{"normal", "go_dark"}, {"normal", "godark"}]:
         return "godark"
+    if vals in [
+        {"normal", "encounter", "loitering"},
+        {"normal", "encounter"},
+        {"normal", "loitering"},
+        {"normal", "potential_transshipment"},
+        {"normal", "transshipment"},
+    ]:
+        return "transshipment"
     if vals == {"fishing", "not_fishing"}:
         return "fishing"
     return "gear"
 
 
 def _primary_metric_scope(task_name: str) -> str:
-    return "sequence" if task_name in {"spoofing", "godark"} else "vessel"
+    return "sequence" if task_name in {"spoofing", "godark", "transshipment"} else "vessel"
 
 
 def _pick_best_tau_by_sequence(
@@ -173,6 +226,75 @@ def _pick_best_tau_by_sequence(
                 best_tau, best_m = float(tau), m
 
     return float(best_tau), dict(best_m)
+
+
+def _pick_best_godark_by_validation(
+    logits_np: np.ndarray,
+    y_np: np.ndarray,
+    event_ids: np.ndarray,
+    kinds: np.ndarray,
+    label_map: Dict[int, str],
+    log_pi: np.ndarray,
+    tau_list: List[float],
+    num_classes: int,
+    prob_thresholds: List[float],
+    min_windows_grid: List[int],
+    min_positive_ratios: List[float],
+    short_min_positive_ratio: float,
+    min_event_recall: float,
+) -> Tuple[float, Dict[str, float], Dict[str, float], Tuple[float, ...]]:
+    best_tau = 0.0
+    best_seq_m: Dict[str, float] | None = None
+    best_event_m: Dict[str, float] | None = None
+    best_key: Tuple[float, ...] | None = None
+
+    for tau in tau_list:
+        adj = logits_np - (float(tau) * log_pi.reshape(1, -1))
+        probs = softmax_np(adj).astype(np.float64)
+        pred = np.argmax(probs, axis=1).astype(np.int64)
+        cm = confusion_matrix_np(y_np, pred, num_classes)
+        seq_m = metrics_from_cm(cm)
+        event_m, _, event_key = pick_best_godark_event_setting(
+            event_ids=event_ids,
+            kinds=kinds,
+            y_true=y_np,
+            y_pred=pred,
+            probs=probs,
+            label_map=label_map,
+            seq_metrics=seq_m,
+            prob_thresholds=prob_thresholds,
+            min_windows_grid=min_windows_grid,
+            min_positive_ratios=min_positive_ratios,
+            short_min_positive_ratio=short_min_positive_ratio,
+            min_event_recall=min_event_recall,
+        )
+        key = tuple(event_key)
+        if best_key is None or key > best_key:
+            best_tau = float(tau)
+            best_seq_m = dict(seq_m)
+            best_event_m = dict(event_m)
+            best_key = key
+
+    if best_seq_m is None or best_event_m is None:
+        tau, seq_m = _pick_best_tau_by_sequence(logits_np, y_np, log_pi, tau_list, num_classes)
+        fallback_event = {
+            "event_precision": 0.0,
+            "event_recall": 0.0,
+            "event_f1": 0.0,
+            "event_tp": 0,
+            "event_fp": 0,
+            "event_fn": 0,
+            "event_tn": 0,
+            "godark_event_prob_threshold": float(DEFAULT_GODARK_EVENT_PROB_THRESHOLD),
+            "godark_event_min_positive_windows": int(DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS),
+            "godark_event_min_positive_ratio": float(DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO),
+            "godark_score": 0.0,
+            "event_recall_floor": float(min_event_recall),
+            "event_recall_floor_met": 0,
+        }
+        return float(tau), dict(seq_m), fallback_event, godark_selection_key(seq_m, fallback_event, min_event_recall)
+
+    return float(best_tau), dict(best_seq_m), dict(best_event_m), tuple(best_key or ())
 
 
 class VesselBalancedBatchSampler:
@@ -417,6 +539,12 @@ def train_from_npz(
     aug_cfg: AugCfg = AugCfg(),
     use_focal: bool = True,
     focal_gamma: float = 1.2,
+    godark_event_prob_thresholds: List[float] | None = None,
+    godark_event_min_windows_grid: List[int] | None = None,
+    godark_event_min_positive_ratio: float | None = None,
+    godark_event_min_positive_ratio_grid: List[float] | None = None,
+    godark_event_short_min_positive_ratio: float = DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    godark_event_min_recall: float = DEFAULT_GODARK_EVENT_MIN_RECALL,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -431,15 +559,35 @@ def train_from_npz(
             pass
 
     X, y, groups, label_map, coords = load_npz(Path(data_npz))
+    feature_cols = _load_feature_cols(Path(data_npz))
+    rule_features, rule_cols = _load_rule_features(Path(data_npz))
+    window_event_ids, window_kinds, has_window_metadata = _load_window_metadata(Path(data_npz))
     y = y.astype(np.int64)
     coords = None if coords is None else coords.astype(np.float32, copy=False)
     if coords is not None and int(coords.shape[0]) != int(X.shape[0]):
         print("[train] WARNING: coords length does not match X; Haversine auxiliary loss is disabled.")
         coords = None
-    num_classes = int(len(set(y.tolist())))
+    num_classes = int(len(label_map))
     input_size = int(X.shape[-1])
     task_name = _task_name_from_label_map(label_map)
     metric_scope = _primary_metric_scope(task_name)
+    godark_event_prob_thresholds = [
+        float(v) for v in (godark_event_prob_thresholds or list(DEFAULT_GODARK_EVENT_PROB_THRESHOLDS))
+    ]
+    godark_event_min_windows_grid = [
+        int(max(1, v)) for v in (godark_event_min_windows_grid or list(DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID))
+    ]
+    if godark_event_min_positive_ratio is not None:
+        godark_event_min_positive_ratios = [float(max(0.0, godark_event_min_positive_ratio))]
+    else:
+        godark_event_min_positive_ratios = [
+            float(max(0.0, v))
+            for v in (godark_event_min_positive_ratio_grid or list(DEFAULT_GODARK_EVENT_MIN_RATIO_GRID))
+        ]
+    if not godark_event_min_positive_ratios:
+        godark_event_min_positive_ratios = [float(DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO)]
+    if task_name == "godark" and not has_window_metadata:
+        print("[train] WARNING: NPZ has no Go-Dark window_event_ids/window_kinds; event-level model selection is disabled.")
     use_geo_aux = bool(float(geo_aux_weight) > 0.0 and coords is not None)
     if float(geo_aux_weight) > 0.0 and coords is None:
         print("[train] WARNING: NPZ has no coords; Haversine auxiliary loss is disabled.")
@@ -475,6 +623,19 @@ def train_from_npz(
     X_val = apply_scaler(X[split.val_idx], scaler)
     y_train, g_train = y[split.train_idx], groups[split.train_idx]
     y_val, g_val = y[split.val_idx], groups[split.val_idx]
+    event_ids_val = window_event_ids[split.val_idx] if has_window_metadata else np.array([""] * len(split.val_idx), dtype=object)
+    kinds_val = window_kinds[split.val_idx] if has_window_metadata else np.array(["unknown"] * len(split.val_idx), dtype=object)
+    use_godark_event_selection = bool(task_name == "godark" and has_window_metadata and np.unique(event_ids_val.astype(str)).size > 1)
+    if task_name == "godark":
+        print(
+            "[train] godark event selection "
+            f"{'enabled' if use_godark_event_selection else 'disabled'} "
+            f"prob_thresholds={godark_event_prob_thresholds} "
+            f"min_windows_grid={godark_event_min_windows_grid} "
+            f"min_positive_ratio_grid={godark_event_min_positive_ratios} "
+            f"short_min_ratio={float(godark_event_short_min_positive_ratio):.3f} "
+            f"min_event_recall={float(godark_event_min_recall):.3f}"
+        )
 
     print(
         f"[train] split windows train={len(split.train_idx)} val={len(split.val_idx)} test={len(split.test_idx)}"
@@ -484,6 +645,24 @@ def train_from_npz(
         f"val={np.unique(groups[split.val_idx]).size} test={np.unique(groups[split.test_idx]).size}"
     )
     print(f"[train] scaler fit on train split only -> {scaler_path}")
+
+    if task_name == "transshipment":
+        tabular_path = out_dir / "transshipment_tabular.joblib"
+        ok_tabular = train_transshipment_tabular_baseline(
+            X=X[split.train_idx],
+            y=y_train,
+            groups=g_train,
+            label_map=label_map,
+            feature_cols=feature_cols,
+            out_path=tabular_path,
+            rule_features=(rule_features[split.train_idx] if rule_features is not None else None),
+            rule_cols=rule_cols,
+            random_state=random_state,
+        )
+        if ok_tabular:
+            print(f"[train] transshipment tabular baseline saved -> {tabular_path}")
+        else:
+            print("[train] transshipment tabular baseline skipped: not enough event/classes.")
 
     vlab = _vessel_labels(y_train, np.asarray(g_train).astype(str))
     use_vessel_balancing = _has_all_classes_in_vessel_modes(vlab, num_classes)
@@ -620,6 +799,12 @@ def train_from_npz(
     no_improve = 0
     best_balanced_acc = 0.0
     best_accuracy = 0.0
+    best_selection_key: Tuple[float, ...] | None = None
+    best_godark_event_metrics: Dict[str, float] | None = None
+    best_godark_event_prob_threshold = float(DEFAULT_GODARK_EVENT_PROB_THRESHOLD)
+    best_godark_event_min_positive_windows = int(DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS)
+    best_godark_event_min_positive_ratio = float(godark_event_min_positive_ratios[0])
+    best_godark_event_short_min_positive_ratio = float(godark_event_short_min_positive_ratio)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -663,6 +848,9 @@ def train_from_npz(
                                     scale_km=float(geo_aux_scale_km),
                                 )
                         loss = loss_cls + (float(geo_aux_weight) * loss_geo)
+                        if not bool(torch.isfinite(loss).detach().cpu().item()):
+                            print("[train] WARNING: non-finite loss skipped.")
+                            break
 
                         scaler.scale(loss).backward()
                         scaler.unscale_(optim)
@@ -690,6 +878,9 @@ def train_from_npz(
                                 scale_km=float(geo_aux_scale_km),
                             )
                         loss = loss_cls + (float(geo_aux_weight) * loss_geo)
+                        if not bool(torch.isfinite(loss).detach().cpu().item()):
+                            print("[train] WARNING: non-finite loss skipped.")
+                            break
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         optim.step()
@@ -753,7 +944,26 @@ def train_from_npz(
         y_np = np.concatenate(y_chunks, axis=0)
         g_np = np.concatenate(g_chunks, axis=0)
 
-        if metric_scope == "sequence":
+        godark_event_metrics_ep = None
+        godark_selection_key_ep = None
+        if use_godark_event_selection:
+            tau_ep, m_ep, godark_event_metrics_ep, godark_selection_key_ep = _pick_best_godark_by_validation(
+                logits_np=logits_np,
+                y_np=y_np,
+                event_ids=event_ids_val,
+                kinds=kinds_val,
+                label_map=label_map,
+                log_pi=log_pi_np,
+                tau_list=tau_candidates,
+                num_classes=num_classes,
+                prob_thresholds=godark_event_prob_thresholds,
+                min_windows_grid=godark_event_min_windows_grid,
+                min_positive_ratios=godark_event_min_positive_ratios,
+                short_min_positive_ratio=float(godark_event_short_min_positive_ratio),
+                min_event_recall=float(godark_event_min_recall),
+            )
+            agg_ep = agg_grid[0]
+        elif metric_scope == "sequence":
             tau_ep, m_ep = _pick_best_tau_by_sequence(
                 logits_np=logits_np,
                 y_np=y_np,
@@ -777,7 +987,18 @@ def train_from_npz(
             ema.restore(model)
 
         lr_now = float(optim.param_groups[0]["lr"])
-        if metric_scope == "sequence":
+        if use_godark_event_selection and godark_event_metrics_ep is not None:
+            print(
+                f"[epoch {epoch}] train_loss={train_loss:.4f} cls={train_cls_loss:.4f} geo={train_geo_loss:.4f} "
+                f"VAL(seq) macro_f1={m_ep['macro_f1']:.4f} bal_acc={m_ep['balanced_acc']:.4f} acc={m_ep['accuracy']:.4f} "
+                f"VAL(event) p={godark_event_metrics_ep['event_precision']:.4f} r={godark_event_metrics_ep['event_recall']:.4f} "
+                f"f1={godark_event_metrics_ep['event_f1']:.4f} fp={int(godark_event_metrics_ep['event_fp'])} "
+                f"fn={int(godark_event_metrics_ep['event_fn'])} score={godark_event_metrics_ep['godark_score']:.4f} "
+                f"thr={godark_event_metrics_ep['godark_event_prob_threshold']:.2f} "
+                f"min_win={int(godark_event_metrics_ep['godark_event_min_positive_windows'])} "
+                f"tau={tau_ep:.2f} lr={lr_now:.2e}"
+            )
+        elif metric_scope == "sequence":
             print(
                 f"[epoch {epoch}] train_loss={train_loss:.4f} cls={train_cls_loss:.4f} geo={train_geo_loss:.4f} "
                 f"VAL(seq) macro_f1={m_ep['macro_f1']:.4f} bal_acc={m_ep['balanced_acc']:.4f} acc={m_ep['accuracy']:.4f} "
@@ -802,6 +1023,29 @@ def train_from_npz(
                 "val_macro_f1": m_ep["macro_f1"],
                 "val_balanced_acc": m_ep["balanced_acc"],
                 "val_acc": m_ep["accuracy"],
+                "val_godark_score": (
+                    None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("godark_score", 0.0))
+                ),
+                "val_event_precision": (
+                    None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("event_precision", 0.0))
+                ),
+                "val_event_recall": (
+                    None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("event_recall", 0.0))
+                ),
+                "val_event_f1": (
+                    None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("event_f1", 0.0))
+                ),
+                "val_event_fp": (
+                    None if godark_event_metrics_ep is None else int(godark_event_metrics_ep.get("event_fp", 0))
+                ),
+                "val_event_fn": (
+                    None if godark_event_metrics_ep is None else int(godark_event_metrics_ep.get("event_fn", 0))
+                ),
+                "val_event_recall_floor_met": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else int(godark_event_metrics_ep.get("event_recall_floor_met", 0))
+                ),
                 "val_macro_f1_seq": (m_ep["macro_f1"] if metric_scope == "sequence" else None),
                 "val_balanced_acc_seq": (m_ep["balanced_acc"] if metric_scope == "sequence" else None),
                 "val_acc_seq": (m_ep["accuracy"] if metric_scope == "sequence" else None),
@@ -815,10 +1059,48 @@ def train_from_npz(
                 "agg_weight_power": float(agg_ep.weight_power),
                 "agg_conf_mode": str(agg_ep.conf_mode),
                 "agg_method": str(agg_ep.agg_method),
+                "godark_event_prob_threshold": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else float(godark_event_metrics_ep.get("godark_event_prob_threshold", DEFAULT_GODARK_EVENT_PROB_THRESHOLD))
+                ),
+                "godark_event_min_positive_windows": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else int(
+                        godark_event_metrics_ep.get(
+                            "godark_event_min_positive_windows",
+                            DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
+                        )
+                    )
+                ),
+                "godark_event_min_positive_ratio": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else float(
+                        godark_event_metrics_ep.get(
+                            "godark_event_min_positive_ratio",
+                            DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
+                        )
+                    )
+                ),
+                "godark_event_short_min_positive_ratio": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else float(
+                        godark_event_metrics_ep.get(
+                            "godark_event_short_min_positive_ratio",
+                            DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+                        )
+                    )
+                ),
             }
         )
 
-        improved = (m_ep["macro_f1"] > best_macro + 1e-6)
+        if use_godark_event_selection and godark_event_metrics_ep is not None:
+            improved = best_selection_key is None or tuple(godark_selection_key_ep or ()) > best_selection_key
+        else:
+            improved = (m_ep["macro_f1"] > best_macro + 1e-6)
         if improved:
             best_macro = float(m_ep["macro_f1"])
             best_epoch = int(epoch)
@@ -826,6 +1108,30 @@ def train_from_npz(
             best_agg = agg_ep
             best_balanced_acc = float(m_ep["balanced_acc"])
             best_accuracy = float(m_ep["accuracy"])
+            if use_godark_event_selection and godark_event_metrics_ep is not None:
+                best_selection_key = tuple(godark_selection_key_ep or ())
+                best_godark_event_metrics = dict(godark_event_metrics_ep)
+                best_godark_event_prob_threshold = float(
+                    godark_event_metrics_ep.get("godark_event_prob_threshold", DEFAULT_GODARK_EVENT_PROB_THRESHOLD)
+                )
+                best_godark_event_min_positive_windows = int(
+                    godark_event_metrics_ep.get(
+                        "godark_event_min_positive_windows",
+                        DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
+                    )
+                )
+                best_godark_event_min_positive_ratio = float(
+                    godark_event_metrics_ep.get(
+                        "godark_event_min_positive_ratio",
+                        DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
+                    )
+                )
+                best_godark_event_short_min_positive_ratio = float(
+                    godark_event_metrics_ep.get(
+                        "godark_event_short_min_positive_ratio",
+                        DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+                    )
+                )
             no_improve = 0
 
             logit_adjust = (best_tau * log_pi).detach().cpu().numpy().astype(np.float32)
@@ -861,6 +1167,40 @@ def train_from_npz(
                     "best_val_macro_f1": float(best_macro),
                     "best_val_balanced_acc": float(best_balanced_acc),
                     "best_val_accuracy": float(best_accuracy),
+                    "best_val_godark_score": (
+                        None
+                        if best_godark_event_metrics is None
+                        else float(best_godark_event_metrics.get("godark_score", 0.0))
+                    ),
+                    "best_val_event_precision": (
+                        None
+                        if best_godark_event_metrics is None
+                        else float(best_godark_event_metrics.get("event_precision", 0.0))
+                    ),
+                    "best_val_event_recall": (
+                        None
+                        if best_godark_event_metrics is None
+                        else float(best_godark_event_metrics.get("event_recall", 0.0))
+                    ),
+                    "best_val_event_f1": (
+                        None
+                        if best_godark_event_metrics is None
+                        else float(best_godark_event_metrics.get("event_f1", 0.0))
+                    ),
+                    "best_val_event_fp": (
+                        None if best_godark_event_metrics is None else int(best_godark_event_metrics.get("event_fp", 0))
+                    ),
+                    "best_val_event_fn": (
+                        None if best_godark_event_metrics is None else int(best_godark_event_metrics.get("event_fn", 0))
+                    ),
+                    "godark_event_prob_threshold": float(best_godark_event_prob_threshold),
+                    "godark_event_min_positive_windows": int(best_godark_event_min_positive_windows),
+                    "godark_event_min_positive_ratio": float(best_godark_event_min_positive_ratio),
+                    "godark_event_short_min_positive_ratio": float(best_godark_event_short_min_positive_ratio),
+                    "godark_event_min_recall": float(godark_event_min_recall),
+                    "godark_event_model_selection": (
+                        "godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
+                    ),
                     "tau": float(best_tau),
                     "priors": pri.detach().cpu().numpy().astype(np.float32),
                     "logit_adjust": logit_adjust,
@@ -874,7 +1214,16 @@ def train_from_npz(
             )
             if ema is not None:
                 ema.restore(model)
-            print(f"[train] new BEST epoch={epoch} macro_f1({metric_scope})={best_macro:.4f} saved -> {best_path}")
+            if use_godark_event_selection and best_godark_event_metrics is not None:
+                print(
+                    f"[train] new BEST epoch={epoch} godark_score={best_godark_event_metrics.get('godark_score', 0.0):.4f} "
+                    f"event_f1={best_godark_event_metrics.get('event_f1', 0.0):.4f} "
+                    f"event_p={best_godark_event_metrics.get('event_precision', 0.0):.4f} "
+                    f"event_r={best_godark_event_metrics.get('event_recall', 0.0):.4f} "
+                    f"macro_f1(seq)={best_macro:.4f} saved -> {best_path}"
+                )
+            else:
+                print(f"[train] new BEST epoch={epoch} macro_f1({metric_scope})={best_macro:.4f} saved -> {best_path}")
         else:
             no_improve += 1
 
@@ -899,6 +1248,40 @@ def train_from_npz(
                 "best_val_macro_f1": best_macro,
                 "best_val_balanced_acc": best_balanced_acc,
                 "best_val_accuracy": best_accuracy,
+                "best_val_godark_score": (
+                    None
+                    if best_godark_event_metrics is None
+                    else float(best_godark_event_metrics.get("godark_score", 0.0))
+                ),
+                "best_val_event_precision": (
+                    None
+                    if best_godark_event_metrics is None
+                    else float(best_godark_event_metrics.get("event_precision", 0.0))
+                ),
+                "best_val_event_recall": (
+                    None
+                    if best_godark_event_metrics is None
+                    else float(best_godark_event_metrics.get("event_recall", 0.0))
+                ),
+                "best_val_event_f1": (
+                    None
+                    if best_godark_event_metrics is None
+                    else float(best_godark_event_metrics.get("event_f1", 0.0))
+                ),
+                "best_val_event_fp": (
+                    None if best_godark_event_metrics is None else int(best_godark_event_metrics.get("event_fp", 0))
+                ),
+                "best_val_event_fn": (
+                    None if best_godark_event_metrics is None else int(best_godark_event_metrics.get("event_fn", 0))
+                ),
+                "godark_event_prob_threshold": float(best_godark_event_prob_threshold),
+                "godark_event_min_positive_windows": int(best_godark_event_min_positive_windows),
+                "godark_event_min_positive_ratio": float(best_godark_event_min_positive_ratio),
+                "godark_event_short_min_positive_ratio": float(best_godark_event_short_min_positive_ratio),
+                "godark_event_min_recall": float(godark_event_min_recall),
+                "godark_event_model_selection": (
+                    "godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
+                ),
                 "tau": best_tau,
                 "agg_keep_frac": float(best_agg.keep_frac),
                 "agg_min_keep": int(best_agg.min_keep),
@@ -942,6 +1325,12 @@ def train_from_npz(
                 "ema_decay": float(ema_decay),
                 "use_focal": bool(use_focal),
                 "focal_gamma": float(focal_gamma),
+                "godark_event_prob_thresholds": [float(v) for v in godark_event_prob_thresholds],
+                "godark_event_min_windows_grid": [int(v) for v in godark_event_min_windows_grid],
+                "godark_event_min_positive_ratio_grid": [float(v) for v in godark_event_min_positive_ratios],
+                "godark_event_short_min_positive_ratio": float(godark_event_short_min_positive_ratio),
+                "godark_event_min_recall": float(godark_event_min_recall),
+                "godark_event_selection_enabled": bool(use_godark_event_selection),
                 "train_duration_seconds": train_duration_seconds,
             },
             indent=2,

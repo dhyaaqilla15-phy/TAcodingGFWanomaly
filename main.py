@@ -20,6 +20,12 @@ from plot_spoofing import (
 from plot_preprocessed import plot_preprocessed_trajectory_from_npz
 from go_dark_simulator import GoDarkSimCfg, generate_go_dark_dataset
 from plot_go_dark import plot_go_dark_overlay_from_csv, heatmap_go_dark_from_csv, plot_go_dark_examples_from_csv
+from transshipment_detector import TransshipmentCfg, generate_transshipment_dataset
+from plot_transshipment import (
+    plot_transshipment_event_from_csv,
+    plot_transshipment_examples_from_csv,
+    heatmap_transshipment_from_csv,
+)
 
 
 def main():
@@ -30,7 +36,7 @@ def main():
     p = sub.add_parser("preprocess")
     p.add_argument("--data_dir", required=True)
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--task", default="gear", choices=["gear", "fishing", "spoofing", "godark"])
+    p.add_argument("--task", default="gear", choices=["gear", "fishing", "spoofing", "godark", "transshipment"])
     p.add_argument("--exclude_labels", nargs="*", default=[])
     p.add_argument("--limit_rows", type=int, default=0)
     p.add_argument("--chunksize", type=int, default=0)
@@ -54,9 +60,21 @@ def main():
     )
     p.add_argument("--spoofing_window_threshold", type=float, default=0.20)
     p.add_argument(
+        "--transshipment_target",
+        default="multiclass",
+        choices=["multiclass", "any", "encounter", "loitering", "auto"],
+        help="Khusus task=transshipment: multiclass normal/encounter/loitering, atau binary target.",
+    )
+    p.add_argument(
+        "--transshipment_feature_mode",
+        default="fair",
+        choices=["fair", "full"],
+        help="Khusus task=transshipment: fair memisahkan rule-score dari fitur LSTM; full memakai semua fitur seperti mode lama.",
+    )
+    p.add_argument(
         "--apply_jump_filter",
         action="store_true",
-        help="Default task=spoofing dan task=godark tidak membuang jump. Flag ini memaksa jump filter aktif.",
+        help="Default task=spoofing, task=godark, dan task=transshipment tidak membuang jump. Flag ini memaksa jump filter aktif.",
     )
 
     # ===== train =====
@@ -93,6 +111,45 @@ def main():
     t.add_argument("--weight_decay", type=float, default=1.3e-3)
     t.add_argument("--sgd_momentum", type=float, default=0.9)
     t.add_argument("--early_stop_patience", type=int, default=90)
+    t.add_argument(
+        "--godark_event_prob_thresholds",
+        nargs="*",
+        type=float,
+        default=[0.50, 0.60, 0.70, 0.80, 0.90, 0.95],
+        help="Khusus task=godark: grid threshold probabilitas event yang dipilih di validation set.",
+    )
+    t.add_argument(
+        "--godark_event_min_windows_grid",
+        nargs="*",
+        type=int,
+        default=[1, 2, 3, 5, 8, 10],
+        help="Khusus task=godark: grid jumlah minimal window di atas threshold untuk event positif.",
+    )
+    t.add_argument(
+        "--godark_event_min_positive_ratio",
+        type=float,
+        default=None,
+        help="Khusus task=godark: override rasio minimal window sebagai satu nilai. Jika kosong, pakai grid rasio.",
+    )
+    t.add_argument(
+        "--godark_event_min_positive_ratio_grid",
+        nargs="*",
+        type=float,
+        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        help="Khusus task=godark: grid rasio minimal window di atas threshold untuk event positif.",
+    )
+    t.add_argument(
+        "--godark_event_min_recall",
+        type=float,
+        default=0.70,
+        help="Khusus task=godark: batas recall event validation sebelum precision/F1 diprioritaskan.",
+    )
+    t.add_argument(
+        "--godark_event_short_min_positive_ratio",
+        type=float,
+        default=0.85,
+        help="Khusus task=godark: rescue event pendek jika rasio window di atas threshold melewati nilai ini.",
+    )
 
     # ===== eval =====
     e = sub.add_parser("eval")
@@ -103,6 +160,30 @@ def main():
     e.add_argument("--random_state", type=int, default=42)
     e.add_argument("--test_size", type=float, default=0.2)
     e.add_argument("--batch_size", type=int, default=64)
+    e.add_argument(
+        "--godark_event_prob_threshold",
+        type=float,
+        default=-1.0,
+        help="Override threshold event Go-Dark saat eval. Default -1 memakai nilai checkpoint.",
+    )
+    e.add_argument(
+        "--godark_event_min_positive_windows",
+        type=int,
+        default=0,
+        help="Override jumlah minimal positive window event Go-Dark saat eval. Default 0 memakai checkpoint.",
+    )
+    e.add_argument(
+        "--godark_event_min_positive_ratio",
+        type=float,
+        default=-1.0,
+        help="Override rasio minimal positive window Go-Dark saat eval. Default -1 memakai checkpoint.",
+    )
+    e.add_argument(
+        "--godark_event_short_min_positive_ratio",
+        type=float,
+        default=-1.0,
+        help="Override rasio rescue event pendek Go-Dark saat eval. Default -1 memakai checkpoint.",
+    )
 
     # ===== plot =====
     pl = sub.add_parser("plot")
@@ -255,11 +336,63 @@ def main():
     pgde.add_argument("--num_examples", type=int, default=6)
     pgde.add_argument("--max_points", type=int, default=9000)
 
+    # ===== make_transshipment =====
+    tx = sub.add_parser("make_transshipment")
+    tx.add_argument("--input_path", required=True, help="CSV file atau folder Dataset berisi CSV")
+    tx.add_argument("--out_dir", required=True)
+    tx.add_argument("--mode", default="both", choices=["both", "encounter", "loitering"])
+    tx.add_argument("--seed", type=int, default=42)
+    tx.add_argument("--limit_rows", type=int, default=0)
+    tx.add_argument("--chunksize", type=int, default=0)
+    tx.add_argument("--sample_frac", type=float, default=0.0)
+    tx.add_argument("--max_vessels_per_file", type=int, default=60)
+    tx.add_argument("--min_points_per_vessel", type=int, default=40)
+    tx.add_argument("--grid_minutes", type=int, default=10)
+    tx.add_argument("--max_interp_gap_minutes", type=int, default=90)
+    tx.add_argument("--encounter_distance_km", type=float, default=0.5)
+    tx.add_argument("--encounter_candidate_distance_km", type=float, default=2.0)
+    tx.add_argument("--encounter_min_hours", type=float, default=2.0)
+    tx.add_argument("--encounter_max_speed_knots", type=float, default=2.0)
+    tx.add_argument("--encounter_min_port_km", type=float, default=10.0)
+    tx.add_argument("--encounter_merge_gap_minutes", type=int, default=30)
+    tx.add_argument("--loitering_min_hours", type=float, default=8.0)
+    tx.add_argument("--loitering_max_speed_knots", type=float, default=2.0)
+    tx.add_argument("--loitering_min_shore_nm", type=float, default=20.0)
+    tx.add_argument("--loitering_candidate_speed_knots", type=float, default=4.0)
+    tx.add_argument("--loitering_merge_gap_minutes", type=int, default=30)
+    tx.add_argument("--normal_min_hours", type=float, default=0.5)
+    tx.add_argument("--max_encounter_events_per_file", type=int, default=250)
+    tx.add_argument("--max_loitering_events_per_file", type=int, default=250)
+    tx.add_argument("--max_normal_events_per_file", type=int, default=500)
+    tx.add_argument("--synthetic_encounters_per_file", type=int, default=0)
+    tx.add_argument("--combine_outputs", action="store_true")
+
+    # ===== plot_transshipment =====
+    ptx = sub.add_parser("plot_transshipment")
+    ptx.add_argument("--csv_path", required=True)
+    ptx.add_argument("--out_dir", default="outputs_transshipment/plots")
+    ptx.add_argument("--event_id", default="")
+    ptx.add_argument("--max_points", type=int, default=2000)
+
+    # ===== plot_transshipment_examples =====
+    ptxe = sub.add_parser("plot_transshipment_examples")
+    ptxe.add_argument("--csv_path", required=True)
+    ptxe.add_argument("--out_dir", default="outputs_transshipment/plots/examples")
+    ptxe.add_argument("--num_examples", type=int, default=6)
+    ptxe.add_argument("--max_points", type=int, default=2000)
+
+    # ===== heatmap_transshipment =====
+    htx = sub.add_parser("heatmap_transshipment")
+    htx.add_argument("--csv_path", required=True)
+    htx.add_argument("--out_dir", default="outputs_transshipment/heatmaps")
+    htx.add_argument("--bins", type=int, default=300)
+    htx.add_argument("--log_scale", action="store_true")
+
     # ===== plot_preprocessed =====
     ppre = sub.add_parser("plot_preprocessed")
     ppre.add_argument("--npz_path", required=True)
     ppre.add_argument("--out_dir", default="outputs_preprocessed/plots")
-    ppre.add_argument("--task", default="auto", choices=["auto", "spoofing", "godark"])
+    ppre.add_argument("--task", default="auto", choices=["auto", "spoofing", "godark", "transshipment"])
     ppre.add_argument("--sample_vessel", default="")
     ppre.add_argument("--max_windows", type=int, default=12)
     ppre.add_argument(
@@ -288,6 +421,8 @@ def main():
             max_windows_per_file=int(args.max_windows_per_file),
             balance_gear_classes=bool(args.balance_gear_classes),
             spoofing_window_threshold=float(args.spoofing_window_threshold),
+            transshipment_target=str(args.transshipment_target),
+            transshipment_feature_mode=str(args.transshipment_feature_mode),
             apply_jump_filter=(True if bool(args.apply_jump_filter) else None),
         )
 
@@ -315,6 +450,14 @@ def main():
             test_size=float(args.test_size),
             val_size=float(args.val_size),
             early_stop_patience=int(args.early_stop_patience),
+            godark_event_prob_thresholds=list(args.godark_event_prob_thresholds),
+            godark_event_min_windows_grid=list(args.godark_event_min_windows_grid),
+            godark_event_min_positive_ratio=(
+                None if args.godark_event_min_positive_ratio is None else float(args.godark_event_min_positive_ratio)
+            ),
+            godark_event_min_positive_ratio_grid=list(args.godark_event_min_positive_ratio_grid),
+            godark_event_short_min_positive_ratio=float(args.godark_event_short_min_positive_ratio),
+            godark_event_min_recall=float(args.godark_event_min_recall),
         )
 
     elif args.cmd == "eval":
@@ -329,6 +472,24 @@ def main():
             batch_size=int(args.batch_size),
             test_size=float(args.test_size),
             random_state=int(args.random_state),
+            godark_event_prob_threshold=(
+                None if float(args.godark_event_prob_threshold) < 0.0 else float(args.godark_event_prob_threshold)
+            ),
+            godark_event_min_positive_windows=(
+                None
+                if int(args.godark_event_min_positive_windows) <= 0
+                else int(args.godark_event_min_positive_windows)
+            ),
+            godark_event_min_positive_ratio=(
+                None
+                if float(args.godark_event_min_positive_ratio) < 0.0
+                else float(args.godark_event_min_positive_ratio)
+            ),
+            godark_event_short_min_positive_ratio=(
+                None
+                if float(args.godark_event_short_min_positive_ratio) < 0.0
+                else float(args.godark_event_short_min_positive_ratio)
+            ),
         )
 
     elif args.cmd == "plot":
@@ -464,6 +625,65 @@ def main():
             out_dir=Path(args.out_dir),
             num_examples=int(args.num_examples),
             max_points=int(args.max_points),
+        )
+
+    elif args.cmd == "make_transshipment":
+        cfg = TransshipmentCfg(
+            seed=int(args.seed),
+            mode=str(args.mode),
+            limit_rows=int(args.limit_rows),
+            chunksize=int(args.chunksize),
+            sample_frac=float(args.sample_frac),
+            max_vessels_per_file=int(args.max_vessels_per_file),
+            min_points_per_vessel=int(args.min_points_per_vessel),
+            grid_minutes=int(args.grid_minutes),
+            max_interp_gap_minutes=int(args.max_interp_gap_minutes),
+            encounter_distance_km=float(args.encounter_distance_km),
+            encounter_candidate_distance_km=float(args.encounter_candidate_distance_km),
+            encounter_min_hours=float(args.encounter_min_hours),
+            encounter_max_speed_knots=float(args.encounter_max_speed_knots),
+            encounter_min_port_km=float(args.encounter_min_port_km),
+            encounter_merge_gap_minutes=int(args.encounter_merge_gap_minutes),
+            loitering_min_hours=float(args.loitering_min_hours),
+            loitering_max_speed_knots=float(args.loitering_max_speed_knots),
+            loitering_min_shore_nm=float(args.loitering_min_shore_nm),
+            loitering_candidate_speed_knots=float(args.loitering_candidate_speed_knots),
+            loitering_merge_gap_minutes=int(args.loitering_merge_gap_minutes),
+            normal_min_hours=float(args.normal_min_hours),
+            max_encounter_events_per_file=int(args.max_encounter_events_per_file),
+            max_loitering_events_per_file=int(args.max_loitering_events_per_file),
+            max_normal_events_per_file=int(args.max_normal_events_per_file),
+            synthetic_encounters_per_file=int(args.synthetic_encounters_per_file),
+            combine_outputs=bool(args.combine_outputs),
+        )
+        generate_transshipment_dataset(
+            input_path=Path(args.input_path),
+            out_dir=Path(args.out_dir),
+            cfg=cfg,
+        )
+
+    elif args.cmd == "plot_transshipment":
+        plot_transshipment_event_from_csv(
+            csv_path=Path(args.csv_path),
+            out_dir=Path(args.out_dir),
+            event_id=args.event_id,
+            max_points=int(args.max_points),
+        )
+
+    elif args.cmd == "plot_transshipment_examples":
+        plot_transshipment_examples_from_csv(
+            csv_path=Path(args.csv_path),
+            out_dir=Path(args.out_dir),
+            num_examples=int(args.num_examples),
+            max_points=int(args.max_points),
+        )
+
+    elif args.cmd == "heatmap_transshipment":
+        heatmap_transshipment_from_csv(
+            csv_path=Path(args.csv_path),
+            out_dir=Path(args.out_dir),
+            bins=int(args.bins),
+            log_scale=bool(args.log_scale),
         )
 
     elif args.cmd == "plot_preprocessed":
