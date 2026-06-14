@@ -1358,7 +1358,12 @@ def build_sequences_to_npz(
         coord_cols=np.array(["timestamp", "lat", "lon", "y_point"], dtype=object),
         window_event_ids=window_event_ids.astype(object),
         window_kinds=window_kinds.astype(object),
-        feature_cols=np.array(_transshipment_feature_cols(cfg.transshipment_feature_mode) if task == "transshipment" else [], dtype=object),
+        feature_cols=np.array(
+            _transshipment_feature_cols(cfg.transshipment_feature_mode)
+            if task == "transshipment"
+            else list(SEQ_FEATURE_COLS),
+            dtype=object,
+        ),
         rule_features=rule_features.astype(np.float32),
         rule_cols=np.array(TRANS_RULE_SCORE_COLS if task == "transshipment" else [], dtype=object),
         transshipment_target=np.array(str(cfg.transshipment_target), dtype=object),

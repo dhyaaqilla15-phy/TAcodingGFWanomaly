@@ -21,13 +21,17 @@ from agg_utils import (
     aggregate_vessel,
     confusion_matrix_np,
     metrics_from_cm,
+    per_class_metrics_from_cm,
 )
 from transshipment_ml import predict_transshipment_tabular_and_hybrid
 from godark_event import (
+    DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD,
+    DEFAULT_GODARK_EVENT_MIN_PRECISION,
     DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
     DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
     DEFAULT_GODARK_EVENT_PROB_THRESHOLD,
     DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
     godark_event_breakdown,
     godark_event_report,
     godark_score,
@@ -133,6 +137,25 @@ def save_confusion_png(cm: np.ndarray, labels: List[str], out_path: Path, normal
     plt.close(fig)
 
 
+def _per_class_metric_rows(cm: np.ndarray, labels: List[str], scope: str) -> List[Dict[str, object]]:
+    cls = per_class_metrics_from_cm(cm)
+    rows: List[Dict[str, object]] = []
+    for i, label in enumerate(labels):
+        rows.append(
+            {
+                "scope": str(scope),
+                "class_id": int(i),
+                "class_label": str(label),
+                "precision": float(cls["precision"][i]) if i < len(cls["precision"]) else 0.0,
+                "recall": float(cls["recall"][i]) if i < len(cls["recall"]) else 0.0,
+                "f1": float(cls["f1"][i]) if i < len(cls["f1"]) else 0.0,
+                "support": int(cls["support"][i]) if i < len(cls["support"]) else 0,
+                "pred_count": int(cls["pred_count"][i]) if i < len(cls["pred_count"]) else 0,
+            }
+        )
+    return rows
+
+
 def _load_split_indices(out_dir: Path) -> Dict[str, np.ndarray] | None:
     p = out_dir / "split_indices.npz"
     if not p.exists():
@@ -218,9 +241,11 @@ def evaluate(
     test_size: float = 0.2,
     random_state: int = 42,
     godark_event_prob_threshold: float | None = None,
+    godark_event_mean_prob_threshold: float | None = None,
     godark_event_min_positive_windows: int | None = None,
     godark_event_min_positive_ratio: float | None = None,
     godark_event_short_min_positive_ratio: float | None = None,
+    godark_event_use_short_rescue: bool | None = None,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -350,6 +375,11 @@ def evaluate(
         if godark_event_prob_threshold is None
         else godark_event_prob_threshold
     )
+    godark_mean_prob_threshold = float(
+        DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD
+        if godark_event_mean_prob_threshold is None
+        else godark_event_mean_prob_threshold
+    )
     godark_min_windows = int(
         DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS
         if godark_event_min_positive_windows is None
@@ -360,16 +390,27 @@ def evaluate(
         if godark_event_min_positive_ratio is None
         else godark_event_min_positive_ratio
     )
+    godark_min_precision = float(DEFAULT_GODARK_EVENT_MIN_PRECISION)
     godark_short_min_ratio = float(
         DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO
         if godark_event_short_min_positive_ratio is None
         else godark_event_short_min_positive_ratio
+    )
+    godark_use_short_rescue = bool(
+        DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE
+        if godark_event_use_short_rescue is None
+        else godark_event_use_short_rescue
     )
     if task_name == "godark":
         godark_prob_threshold = float(
             ckpt.get("godark_event_prob_threshold", godark_prob_threshold)
             if godark_event_prob_threshold is None
             else godark_event_prob_threshold
+        )
+        godark_mean_prob_threshold = float(
+            ckpt.get("godark_event_mean_prob_threshold", godark_mean_prob_threshold)
+            if godark_event_mean_prob_threshold is None
+            else godark_event_mean_prob_threshold
         )
         godark_min_windows = int(
             ckpt.get("godark_event_min_positive_windows", godark_min_windows)
@@ -381,10 +422,16 @@ def evaluate(
             if godark_event_min_positive_ratio is None
             else godark_event_min_positive_ratio
         )
+        godark_min_precision = float(ckpt.get("godark_event_min_precision", godark_min_precision))
         godark_short_min_ratio = float(
             ckpt.get("godark_event_short_min_positive_ratio", godark_short_min_ratio)
             if godark_event_short_min_positive_ratio is None
             else godark_event_short_min_positive_ratio
+        )
+        godark_use_short_rescue = bool(
+            ckpt.get("godark_event_use_short_rescue", godark_use_short_rescue)
+            if godark_event_use_short_rescue is None
+            else godark_event_use_short_rescue
         )
 
     adj_logits = logits_np - (float(best_tau) * log_pi.reshape(1, -1))
@@ -452,10 +499,33 @@ def evaluate(
     cm_primary = cm_seq if metric_scope == "sequence" else cm_v
     save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
     save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
+    save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence.png", normalize=False)
+    save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence_normalized.png", normalize=True)
+    save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel.png", normalize=False)
+    save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel_normalized.png", normalize=True)
+
+    per_class_path = out_dir / "per_class_metrics.csv"
+    per_class_rows = (
+        _per_class_metric_rows(cm_seq, labels, "sequence")
+        + _per_class_metric_rows(cm_v, labels, "vessel")
+    )
+    pd.DataFrame(per_class_rows).to_csv(per_class_path, index=False)
 
     pv_name = "per_event_predictions.csv" if task_name == "transshipment" else "per_vessel_predictions.csv"
     pv_path = out_dir / pv_name
-    pd.DataFrame(pv_rows).sort_values(["true_label", "confidence"], ascending=[True, False]).to_csv(pv_path, index=False)
+    pv_df = pd.DataFrame(pv_rows).sort_values(["true_label", "confidence"], ascending=[True, False])
+    pv_df.to_csv(pv_path, index=False)
+
+    high_conf_wrong_threshold = 0.75
+    wrong_high_conf_path = out_dir / "wrong_high_confidence_predictions.csv"
+    if not pv_df.empty and {"true_id", "pred_id", "confidence"}.issubset(pv_df.columns):
+        wrong_high_conf_df = pv_df[
+            (pv_df["true_id"].astype(int) != pv_df["pred_id"].astype(int))
+            & (pv_df["confidence"].astype(float) >= high_conf_wrong_threshold)
+        ].sort_values("confidence", ascending=False)
+    else:
+        wrong_high_conf_df = pd.DataFrame(columns=pv_df.columns)
+    wrong_high_conf_df.to_csv(wrong_high_conf_path, index=False)
 
     godark_event_metrics = None
     godark_event_path = None
@@ -469,9 +539,11 @@ def evaluate(
             probs=probs,
             label_map=label_map,
             prob_threshold=godark_prob_threshold,
+            mean_prob_threshold=godark_mean_prob_threshold,
             min_positive_windows=godark_min_windows,
             min_positive_ratio=godark_min_ratio,
             short_min_positive_ratio=godark_short_min_ratio,
+            use_short_rescue=godark_use_short_rescue,
         )
         godark_event_metrics = dict(godark_event_metrics)
         godark_event_metrics["godark_score"] = godark_score(m_seq, godark_event_metrics)
@@ -551,6 +623,10 @@ def evaluate(
         "test_vessels": int(len(v2idx)),
         "test_events": int(len(v2idx)) if task_name == "transshipment" else None,
         "prediction_table": str(pv_path),
+        "per_class_metrics_table": str(per_class_path),
+        "wrong_high_confidence_table": str(wrong_high_conf_path),
+        "wrong_high_confidence_threshold": float(high_conf_wrong_threshold),
+        "wrong_high_confidence_count": int(len(wrong_high_conf_df)),
         "godark_event_prediction_table": (str(godark_event_path) if godark_event_path is not None else None),
         "godark_event_error_breakdown_table": (
             str(godark_event_breakdown_path) if godark_event_breakdown_path is not None else None
@@ -558,16 +634,24 @@ def evaluate(
         "godark_event_decision": (
             {
                 "prob_threshold": float(godark_prob_threshold),
+                "mean_prob_threshold": float(godark_mean_prob_threshold),
                 "min_positive_windows": int(godark_min_windows),
                 "min_positive_ratio": float(godark_min_ratio),
                 "short_min_positive_ratio": float(godark_short_min_ratio),
+                "use_short_rescue": bool(godark_use_short_rescue),
+                "checkpoint_status": ckpt.get("checkpoint_status", None),
+                "checkpoint_valid": ckpt.get("checkpoint_valid", None),
+                "checkpoint_invalid_reason": ckpt.get("checkpoint_invalid_reason", None),
+                "validation_min_precision": float(godark_min_precision),
                 "source": (
                     "cli_override"
                     if (
                         godark_event_prob_threshold is not None
+                        or godark_event_mean_prob_threshold is not None
                         or godark_event_min_positive_windows is not None
                         or godark_event_min_positive_ratio is not None
                         or godark_event_short_min_positive_ratio is not None
+                        or godark_event_use_short_rescue is not None
                     )
                     else "checkpoint_or_default"
                 ),

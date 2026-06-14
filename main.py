@@ -112,17 +112,72 @@ def main():
     t.add_argument("--sgd_momentum", type=float, default=0.9)
     t.add_argument("--early_stop_patience", type=int, default=90)
     t.add_argument(
+        "--non_deterministic",
+        action="store_true",
+        default=False,
+        help="Matikan mode deterministic training. Default: deterministic aktif.",
+    )
+    t.add_argument(
+        "--strict_deterministic",
+        action="store_true",
+        default=False,
+        help="Jika aktif, PyTorch akan error saat menemukan operasi non-deterministic.",
+    )
+    t.add_argument(
+        "--gear_minority_f1_weight",
+        type=float,
+        default=None,
+        help="Khusus task=gear: bobot tie-break F1 kelas langka pada pemilihan agregasi/checkpoint. Kosong = default stabil.",
+    )
+    t.add_argument(
+        "--gear_class_weight_power",
+        type=float,
+        default=None,
+        help="Khusus task=gear: pangkat class weight loss. 1.0 = tidak agresif.",
+    )
+    t.add_argument(
+        "--gear_class_weight_max",
+        type=float,
+        default=None,
+        help="Khusus task=gear: batas maksimum class weight sebelum normalisasi. Kosong = default stabil.",
+    )
+    t.add_argument(
+        "--gear_tau_max",
+        type=float,
+        default=None,
+        help="Khusus task=gear: batas maksimum tau logit-adjustment. Default 0.6 agar sweep tidak memilih tau besar yang tidak stabil.",
+    )
+    t.add_argument(
+        "--godark_tau_max",
+        type=float,
+        default=1.2,
+        help="Khusus task=godark: batas maksimum tau logit-adjustment agar kelas positif tidak over-correct.",
+    )
+    t.add_argument(
         "--godark_event_prob_thresholds",
         nargs="*",
         type=float,
-        default=[0.50, 0.60, 0.70, 0.80, 0.90, 0.95],
+        default=[0.80, 0.90, 0.95],
         help="Khusus task=godark: grid threshold probabilitas event yang dipilih di validation set.",
+    )
+    t.add_argument(
+        "--godark_event_mean_prob_threshold",
+        type=float,
+        default=None,
+        help="Khusus task=godark: override mean probability threshold sebagai satu nilai. Jika kosong, pakai grid mean probability.",
+    )
+    t.add_argument(
+        "--godark_event_mean_prob_thresholds",
+        nargs="*",
+        type=float,
+        default=[0.50, 0.60, 0.70],
+        help="Khusus task=godark: grid mean probability threshold event.",
     )
     t.add_argument(
         "--godark_event_min_windows_grid",
         nargs="*",
         type=int,
-        default=[1, 2, 3, 5, 8, 10],
+        default=[3, 5, 8, 10],
         help="Khusus task=godark: grid jumlah minimal window di atas threshold untuk event positif.",
     )
     t.add_argument(
@@ -135,7 +190,7 @@ def main():
         "--godark_event_min_positive_ratio_grid",
         nargs="*",
         type=float,
-        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        default=[0.5, 0.6, 0.8, 1.0],
         help="Khusus task=godark: grid rasio minimal window di atas threshold untuk event positif.",
     )
     t.add_argument(
@@ -145,10 +200,22 @@ def main():
         help="Khusus task=godark: batas recall event validation sebelum precision/F1 diprioritaskan.",
     )
     t.add_argument(
+        "--godark_event_min_precision",
+        type=float,
+        default=0.30,
+        help="Khusus task=godark: batas precision event validation agar rule recall tinggi yang terlalu longgar tidak terpilih.",
+    )
+    t.add_argument(
         "--godark_event_short_min_positive_ratio",
         type=float,
         default=0.85,
         help="Khusus task=godark: rescue event pendek jika rasio window di atas threshold melewati nilai ini.",
+    )
+    t.add_argument(
+        "--godark_event_use_short_rescue",
+        action="store_true",
+        default=False,
+        help="Khusus task=godark: aktifkan rescue event pendek. Default mati karena rawan false-positive pada hard-negative gap.",
     )
 
     # ===== eval =====
@@ -167,6 +234,12 @@ def main():
         help="Override threshold event Go-Dark saat eval. Default -1 memakai nilai checkpoint.",
     )
     e.add_argument(
+        "--godark_event_mean_prob_threshold",
+        type=float,
+        default=-1.0,
+        help="Override mean probability threshold Go-Dark saat eval. Default -1 memakai checkpoint.",
+    )
+    e.add_argument(
         "--godark_event_min_positive_windows",
         type=int,
         default=0,
@@ -183,6 +256,12 @@ def main():
         type=float,
         default=-1.0,
         help="Override rasio rescue event pendek Go-Dark saat eval. Default -1 memakai checkpoint.",
+    )
+    e.add_argument(
+        "--godark_event_use_short_rescue",
+        action="store_true",
+        default=None,
+        help="Override eval untuk mengaktifkan short rescue. Jika tidak diisi, memakai checkpoint.",
     )
 
     # ===== plot =====
@@ -447,17 +526,38 @@ def main():
             sgd_momentum=float(args.sgd_momentum),
             device=args.device,
             random_state=int(args.random_state),
+            deterministic=(not bool(args.non_deterministic)),
+            deterministic_warn_only=(not bool(args.strict_deterministic)),
             test_size=float(args.test_size),
             val_size=float(args.val_size),
             early_stop_patience=int(args.early_stop_patience),
+            gear_minority_f1_weight=(
+                None if args.gear_minority_f1_weight is None else float(args.gear_minority_f1_weight)
+            ),
+            gear_class_weight_power=(
+                None if args.gear_class_weight_power is None else float(args.gear_class_weight_power)
+            ),
+            gear_class_weight_max=(
+                None if args.gear_class_weight_max is None else float(args.gear_class_weight_max)
+            ),
+            gear_tau_max=(
+                None if args.gear_tau_max is None else float(args.gear_tau_max)
+            ),
+            godark_tau_max=float(args.godark_tau_max),
             godark_event_prob_thresholds=list(args.godark_event_prob_thresholds),
+            godark_event_mean_prob_threshold=(
+                None if args.godark_event_mean_prob_threshold is None else float(args.godark_event_mean_prob_threshold)
+            ),
+            godark_event_mean_prob_thresholds=list(args.godark_event_mean_prob_thresholds),
             godark_event_min_windows_grid=list(args.godark_event_min_windows_grid),
             godark_event_min_positive_ratio=(
                 None if args.godark_event_min_positive_ratio is None else float(args.godark_event_min_positive_ratio)
             ),
             godark_event_min_positive_ratio_grid=list(args.godark_event_min_positive_ratio_grid),
             godark_event_short_min_positive_ratio=float(args.godark_event_short_min_positive_ratio),
+            godark_event_use_short_rescue=bool(args.godark_event_use_short_rescue),
             godark_event_min_recall=float(args.godark_event_min_recall),
+            godark_event_min_precision=float(args.godark_event_min_precision),
         )
 
     elif args.cmd == "eval":
@@ -475,6 +575,11 @@ def main():
             godark_event_prob_threshold=(
                 None if float(args.godark_event_prob_threshold) < 0.0 else float(args.godark_event_prob_threshold)
             ),
+            godark_event_mean_prob_threshold=(
+                None
+                if float(args.godark_event_mean_prob_threshold) < 0.0
+                else float(args.godark_event_mean_prob_threshold)
+            ),
             godark_event_min_positive_windows=(
                 None
                 if int(args.godark_event_min_positive_windows) <= 0
@@ -490,6 +595,7 @@ def main():
                 if float(args.godark_event_short_min_positive_ratio) < 0.0
                 else float(args.godark_event_short_min_positive_ratio)
             ),
+            godark_event_use_short_rescue=args.godark_event_use_short_rescue,
         )
 
     elif args.cmd == "plot":

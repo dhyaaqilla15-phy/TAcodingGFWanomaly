@@ -111,12 +111,11 @@ def confusion_matrix_np(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int
     return cm
 
 
-def metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
+def per_class_metrics_from_cm(cm: np.ndarray) -> Dict[str, np.ndarray]:
     cm = cm.astype(np.float64)
     tp = np.diag(cm)
     support = cm.sum(axis=1)
     pred_count = cm.sum(axis=0)
-    total = cm.sum()
 
     with np.errstate(divide="ignore", invalid="ignore"):
         precision = tp / pred_count
@@ -126,6 +125,24 @@ def metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
     precision = np.nan_to_num(precision, nan=0.0)
     recall = np.nan_to_num(recall, nan=0.0)
     f1 = np.nan_to_num(f1, nan=0.0)
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "support": support,
+        "pred_count": pred_count,
+    }
+
+
+def metrics_from_cm(cm: np.ndarray) -> Dict[str, float]:
+    cm = cm.astype(np.float64)
+    total = cm.sum()
+    cls = per_class_metrics_from_cm(cm)
+    f1 = cls["f1"]
+    recall = cls["recall"]
+    support = cls["support"]
+    tp = np.diag(cm)
 
     acc = float(tp.sum() / max(total, 1.0))
     macro_f1 = float(f1.mean()) if len(f1) else 0.0
@@ -147,6 +164,7 @@ def pick_best_tau_and_agg_by_vessel(
     tau_list: List[float],
     agg_grid: List[AggParams],
     num_classes: int,
+    minority_f1_weight: float = 0.0,
 ) -> Tuple[float, AggParams, Dict[str, float]]:
     g_str = np.asarray(g_np).astype(str)
     uniq = np.unique(g_str)
@@ -155,6 +173,7 @@ def pick_best_tau_and_agg_by_vessel(
     best_tau = None
     best_agg = None
     best_m = None
+    best_key = None
 
     for p in agg_grid:
         for tau in tau_list:
@@ -174,13 +193,40 @@ def pick_best_tau_and_agg_by_vessel(
 
             cm = confusion_matrix_np(np.array(y_true_v), np.array(y_pred_v), num_classes)
             m = metrics_from_cm(cm)
+            cls = per_class_metrics_from_cm(cm)
+            support = cls["support"]
+            present_mask = support > 0
+            present_f1 = cls["f1"][present_mask]
+            min_present_f1 = float(present_f1.min()) if present_f1.size else 0.0
+            present_support = support[present_mask]
+            if present_support.size:
+                rare_cutoff = float(np.median(present_support))
+                rare_mask = present_mask & (support <= rare_cutoff)
+                rare_f1 = cls["f1"][rare_mask]
+            else:
+                rare_f1 = np.zeros((0,), dtype=np.float64)
+            rare_mean_f1 = float(rare_f1.mean()) if rare_f1.size else min_present_f1
+            minority_score = (0.65 * rare_mean_f1) + (0.35 * min_present_f1)
+            key = (
+                float(m["macro_f1"]),
+                float(m["balanced_acc"]),
+                float(minority_f1_weight) * minority_score,
+                rare_mean_f1,
+                min_present_f1,
+            )
+            m = {
+                **m,
+                "rare_mean_f1": rare_mean_f1,
+                "min_present_f1": min_present_f1,
+                "minority_selection_score": minority_score,
+            }
 
             if best_tau is None:
                 best_tau, best_agg, best_m = float(tau), p, m
+                best_key = key
             else:
-                if m["macro_f1"] > best_m["macro_f1"] + 1e-9:
+                if key > best_key:
                     best_tau, best_agg, best_m = float(tau), p, m
-                elif abs(m["macro_f1"] - best_m["macro_f1"]) <= 1e-9 and m["balanced_acc"] > best_m["balanced_acc"] + 1e-9:
-                    best_tau, best_agg, best_m = float(tau), p, m
+                    best_key = key
 
     return float(best_tau), best_agg, dict(best_m)

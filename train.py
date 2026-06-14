@@ -24,7 +24,11 @@ from agg_utils import (
     pick_best_tau_and_agg_by_vessel,
     softmax_np,
 )
+from deterministic_config import apply_determinism
 from godark_event import (
+    DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD,
+    DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLDS,
+    DEFAULT_GODARK_EVENT_MIN_PRECISION,
     DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
     DEFAULT_GODARK_EVENT_MIN_RATIO_GRID,
     DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
@@ -33,10 +37,20 @@ from godark_event import (
     DEFAULT_GODARK_EVENT_PROB_THRESHOLD,
     DEFAULT_GODARK_EVENT_PROB_THRESHOLDS,
     DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
     godark_selection_key,
     pick_best_godark_event_setting,
 )
 from transshipment_ml import train_transshipment_tabular_baseline
+
+
+DEFAULT_GODARK_TAU_MAX = 1.2
+DEFAULT_GODARK_CHECKPOINT_MIN_RECALL = 0.60
+DEFAULT_GODARK_CHECKPOINT_MIN_F1 = 0.30
+DEFAULT_GEAR_MINORITY_F1_WEIGHT = 0.03
+DEFAULT_GEAR_CLASS_WEIGHT_POWER = 1.00
+DEFAULT_GEAR_CLASS_WEIGHT_MAX = 10.00
+DEFAULT_GEAR_TAU_MAX = 0.60
 
 
 class AisSeqDataset(Dataset):
@@ -178,6 +192,19 @@ def _has_all_classes_in_vessel_modes(vessel_label: Dict[str, int], num_classes: 
     return all(c in vals for c in range(num_classes))
 
 
+def _sharpen_class_weights(
+    class_w: torch.Tensor,
+    *,
+    power: float,
+    max_weight: float,
+) -> torch.Tensor:
+    w = class_w.detach().float().cpu().numpy().astype(np.float64)
+    w = np.power(np.clip(w, 1e-6, None), float(max(power, 1.0)))
+    w = np.clip(w, 1e-6, float(max(max_weight, 1.0)))
+    w = w / float(np.clip(w.mean(), 1e-12, None))
+    return torch.tensor(w, dtype=torch.float32)
+
+
 def _task_name_from_label_map(label_map: Dict[int, str]) -> str:
     vals = {str(v).strip().lower() for v in label_map.values()}
     if vals == {"normal", "spoofing"}:
@@ -199,6 +226,46 @@ def _task_name_from_label_map(label_map: Dict[int, str]) -> str:
 
 def _primary_metric_scope(task_name: str) -> str:
     return "sequence" if task_name in {"spoofing", "godark", "transshipment"} else "vessel"
+
+
+def _save_history_plot(history: List[Dict[str, object]], out_path: Path) -> None:
+    if not history:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[train] WARNING: cannot save history plot: {exc}")
+        return
+
+    epochs = [int(r.get("epoch", i + 1)) for i, r in enumerate(history)]
+
+    def _series(key: str) -> List[float]:
+        vals: List[float] = []
+        for r in history:
+            v = r.get(key, None)
+            vals.append(float(v) if v is not None else float("nan"))
+        return vals
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    axes[0].plot(epochs, _series("train_loss"), label="train_loss", color="#1f77b4")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend(loc="best")
+
+    axes[1].plot(epochs, _series("val_macro_f1"), label="val_macro_f1", color="#2ca02c")
+    axes[1].plot(epochs, _series("val_balanced_acc"), label="val_balanced_acc", color="#ff7f0e")
+    axes[1].set_ylabel("Validation")
+    axes[1].legend(loc="best")
+
+    axes[2].plot(epochs, _series("lr"), label="lr", color="#9467bd")
+    axes[2].set_ylabel("LR")
+    axes[2].set_xlabel("Epoch")
+    axes[2].legend(loc="best")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
 
 
 def _pick_best_tau_by_sequence(
@@ -238,10 +305,13 @@ def _pick_best_godark_by_validation(
     tau_list: List[float],
     num_classes: int,
     prob_thresholds: List[float],
+    mean_prob_thresholds: List[float],
     min_windows_grid: List[int],
     min_positive_ratios: List[float],
     short_min_positive_ratio: float,
+    use_short_rescue: bool,
     min_event_recall: float,
+    min_event_precision: float,
 ) -> Tuple[float, Dict[str, float], Dict[str, float], Tuple[float, ...]]:
     best_tau = 0.0
     best_seq_m: Dict[str, float] | None = None
@@ -263,10 +333,13 @@ def _pick_best_godark_by_validation(
             label_map=label_map,
             seq_metrics=seq_m,
             prob_thresholds=prob_thresholds,
+            mean_prob_thresholds=mean_prob_thresholds,
             min_windows_grid=min_windows_grid,
             min_positive_ratios=min_positive_ratios,
             short_min_positive_ratio=short_min_positive_ratio,
+            use_short_rescue=use_short_rescue,
             min_event_recall=min_event_recall,
+            min_event_precision=min_event_precision,
         )
         key = tuple(event_key)
         if best_key is None or key > best_key:
@@ -286,15 +359,62 @@ def _pick_best_godark_by_validation(
             "event_fn": 0,
             "event_tn": 0,
             "godark_event_prob_threshold": float(DEFAULT_GODARK_EVENT_PROB_THRESHOLD),
+            "godark_event_mean_prob_threshold": float(DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD),
             "godark_event_min_positive_windows": int(DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS),
             "godark_event_min_positive_ratio": float(DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO),
+            "godark_event_use_short_rescue": int(bool(use_short_rescue)),
             "godark_score": 0.0,
             "event_recall_floor": float(min_event_recall),
             "event_recall_floor_met": 0,
+            "event_precision_floor": float(min_event_precision),
+            "event_precision_floor_met": 0,
         }
-        return float(tau), dict(seq_m), fallback_event, godark_selection_key(seq_m, fallback_event, min_event_recall)
+        return (
+            float(tau),
+            dict(seq_m),
+            fallback_event,
+            godark_selection_key(
+                seq_m,
+                fallback_event,
+                min_event_recall=min_event_recall,
+                min_event_precision=min_event_precision,
+            ),
+        )
 
     return float(best_tau), dict(best_seq_m), dict(best_event_m), tuple(best_key or ())
+
+
+def _godark_checkpoint_status(
+    metrics: Dict[str, float] | None,
+    *,
+    min_precision: float,
+    min_recall: float = DEFAULT_GODARK_CHECKPOINT_MIN_RECALL,
+    min_f1: float = DEFAULT_GODARK_CHECKPOINT_MIN_F1,
+) -> Dict[str, object]:
+    if metrics is None:
+        return {"checkpoint_status": "not_applicable", "checkpoint_valid": None, "checkpoint_invalid_reason": None}
+
+    precision = float(metrics.get("event_precision", 0.0))
+    recall = float(metrics.get("event_recall", 0.0))
+    f1 = float(metrics.get("event_f1", 0.0))
+    score = float(metrics.get("godark_score", 0.0))
+    reasons: List[str] = []
+    if precision < float(min_precision):
+        reasons.append("precision_floor_not_met")
+    if recall < float(min_recall):
+        reasons.append("recall_floor_not_met")
+    if f1 < float(min_f1):
+        reasons.append("f1_floor_not_met")
+    if score <= 0.0:
+        reasons.append("non_positive_godark_score")
+
+    if reasons:
+        return {
+            "checkpoint_status": "invalid_godark_event_quality",
+            "checkpoint_valid": False,
+            "checkpoint_invalid_reason": ",".join(reasons),
+        }
+    return {"checkpoint_status": "valid", "checkpoint_valid": True, "checkpoint_invalid_reason": None}
 
 
 class VesselBalancedBatchSampler:
@@ -313,6 +433,7 @@ class VesselBalancedBatchSampler:
         self.batch_size = int(batch_size)
         self.vessels_per_batch = int(max(1, vessels_per_batch))
         self.seed = int(seed)
+        self.epoch = 0
 
         self.v2idx: Dict[str, np.ndarray] = {}
         for v in np.unique(self.groups):
@@ -331,7 +452,8 @@ class VesselBalancedBatchSampler:
         return self.num_batches
 
     def __iter__(self) -> Iterator[List[int]]:
-        rng = np.random.RandomState(self.seed + np.random.randint(0, 10_000))
+        rng = np.random.RandomState(self.seed + self.epoch)
+        self.epoch += 1
 
         base = self.vessels_per_batch // self.num_classes
         rem = self.vessels_per_batch % self.num_classes
@@ -539,24 +661,47 @@ def train_from_npz(
     aug_cfg: AugCfg = AugCfg(),
     use_focal: bool = True,
     focal_gamma: float = 1.2,
+    gear_minority_f1_weight: float | None = None,
+    gear_class_weight_power: float | None = None,
+    gear_class_weight_max: float | None = None,
+    gear_tau_max: float | None = None,
+    deterministic: bool = True,
+    deterministic_warn_only: bool = True,
+    godark_tau_max: float = DEFAULT_GODARK_TAU_MAX,
     godark_event_prob_thresholds: List[float] | None = None,
+    godark_event_mean_prob_threshold: float | None = None,
+    godark_event_mean_prob_thresholds: List[float] | None = None,
     godark_event_min_windows_grid: List[int] | None = None,
     godark_event_min_positive_ratio: float | None = None,
     godark_event_min_positive_ratio_grid: List[float] | None = None,
     godark_event_short_min_positive_ratio: float = DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    godark_event_use_short_rescue: bool = DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
     godark_event_min_recall: float = DEFAULT_GODARK_EVENT_MIN_RECALL,
+    godark_event_min_precision: float = DEFAULT_GODARK_EVENT_MIN_PRECISION,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     train_t0 = time.perf_counter()
+    determinism_settings = apply_determinism(
+        seed=int(random_state),
+        enabled=bool(deterministic),
+        warn_only=bool(deterministic_warn_only),
+    )
 
     dev = pick_device(device)
     if dev.type == "cuda":
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False if deterministic else True
+        torch.backends.cudnn.deterministic = bool(deterministic)
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
+    print(
+        "[train] determinism "
+        f"enabled={bool(deterministic)} seed={int(random_state)} "
+        f"cudnn_benchmark={bool(torch.backends.cudnn.benchmark)} "
+        f"cudnn_deterministic={bool(torch.backends.cudnn.deterministic)}"
+    )
 
     X, y, groups, label_map, coords = load_npz(Path(data_npz))
     feature_cols = _load_feature_cols(Path(data_npz))
@@ -574,6 +719,15 @@ def train_from_npz(
     godark_event_prob_thresholds = [
         float(v) for v in (godark_event_prob_thresholds or list(DEFAULT_GODARK_EVENT_PROB_THRESHOLDS))
     ]
+    if godark_event_mean_prob_threshold is not None:
+        godark_event_mean_prob_threshold_grid = [float(max(0.0, godark_event_mean_prob_threshold))]
+    else:
+        godark_event_mean_prob_threshold_grid = [
+            float(max(0.0, v))
+            for v in (godark_event_mean_prob_thresholds or list(DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLDS))
+        ]
+    if not godark_event_mean_prob_threshold_grid:
+        godark_event_mean_prob_threshold_grid = [float(DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD)]
     godark_event_min_windows_grid = [
         int(max(1, v)) for v in (godark_event_min_windows_grid or list(DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID))
     ]
@@ -631,10 +785,13 @@ def train_from_npz(
             "[train] godark event selection "
             f"{'enabled' if use_godark_event_selection else 'disabled'} "
             f"prob_thresholds={godark_event_prob_thresholds} "
+            f"mean_prob_thresholds={godark_event_mean_prob_threshold_grid} "
             f"min_windows_grid={godark_event_min_windows_grid} "
             f"min_positive_ratio_grid={godark_event_min_positive_ratios} "
             f"short_min_ratio={float(godark_event_short_min_positive_ratio):.3f} "
-            f"min_event_recall={float(godark_event_min_recall):.3f}"
+            f"use_short_rescue={bool(godark_event_use_short_rescue)} "
+            f"min_event_recall={float(godark_event_min_recall):.3f} "
+            f"min_event_precision={float(godark_event_min_precision):.3f}"
         )
 
     print(
@@ -677,6 +834,27 @@ def train_from_npz(
         pri_np = _prior_from_window_counts(y_train, num_classes)
         class_w = _weights_from_window_counts(y_train, num_classes).to(dev)
 
+    gear_class_weight_power_eff = float(
+        DEFAULT_GEAR_CLASS_WEIGHT_POWER if gear_class_weight_power is None else gear_class_weight_power
+    )
+    gear_class_weight_max_eff = float(
+        DEFAULT_GEAR_CLASS_WEIGHT_MAX if gear_class_weight_max is None else gear_class_weight_max
+    )
+
+    if task_name == "gear":
+        base_class_w = class_w.detach().cpu().numpy().astype(np.float64)
+        class_w = _sharpen_class_weights(
+            class_w,
+            power=gear_class_weight_power_eff,
+            max_weight=gear_class_weight_max_eff,
+        ).to(dev)
+        print(
+            "[train] gear class weights sharpened "
+            f"base={np.round(base_class_w, 3).tolist()} "
+            f"final={np.round(class_w.detach().cpu().numpy(), 3).tolist()} "
+            f"power={gear_class_weight_power_eff} max={gear_class_weight_max_eff}"
+        )
+
     pri = torch.tensor(pri_np, dtype=torch.float32, device=dev)
     log_pi = torch.log(pri.clamp_min(1e-8))
     log_pi_np = log_pi.detach().cpu().numpy().astype(np.float32)
@@ -685,6 +863,24 @@ def train_from_npz(
     tau_coarse = [round(0.3 * i, 2) for i in range(0, 18)]  # 0.0..5.1
     tau_fine = [round(0.1 * i, 2) for i in range(1, 11)]    # 0.1..1.0
     tau_candidates = sorted(set(tau_coarse + tau_fine))
+    if task_name == "godark":
+        tau_max = float(max(0.0, godark_tau_max))
+        tau_candidates = [round(0.2 * i, 2) for i in range(int(np.floor(tau_max / 0.2)) + 1)]
+        if tau_max > 0.0 and round(tau_max, 2) not in tau_candidates:
+            tau_candidates.append(round(tau_max, 2))
+        tau_candidates = sorted(set(tau_candidates))
+        if not tau_candidates:
+            tau_candidates = [0.0]
+        print(f"[train] godark tau_candidates={tau_candidates}")
+    elif task_name == "gear":
+        tau_candidates = sorted(set(tau_candidates + [round(0.15 * i, 2) for i in range(0, 41)]))
+        gear_tau_max_eff = float(DEFAULT_GEAR_TAU_MAX if gear_tau_max is None else max(0.0, gear_tau_max))
+        tau_candidates = [float(t) for t in tau_candidates if float(t) <= gear_tau_max_eff + 1e-9]
+        if not tau_candidates:
+            tau_candidates = [0.0]
+        print(f"[train] gear tau_max={gear_tau_max_eff} tau_candidates={tau_candidates}")
+    else:
+        gear_tau_max_eff = None
 
     # Reduced grid: fokus pada kombinasi yang paling stabil
     # Mengurangi overfitting pada validation set dengan limiting search space
@@ -694,6 +890,20 @@ def train_from_npz(
         AggParams(keep_frac=0.18, min_keep=8,  weight_power=3.0, conf_mode="maxprob_margin2", agg_method="mean_logit"),
         AggParams(keep_frac=0.15, min_keep=8,  weight_power=2.0, conf_mode="maxprob_margin",  agg_method="mean_prob"),
     ]
+    gear_minority_f1_weight_eff = float(
+        DEFAULT_GEAR_MINORITY_F1_WEIGHT if gear_minority_f1_weight is None else gear_minority_f1_weight
+    )
+    if task_name != "gear":
+        gear_minority_f1_weight_eff = 0.0
+    if task_name == "gear":
+        agg_grid = [
+            AggParams(keep_frac=0.08, min_keep=4,  weight_power=2.0, conf_mode="maxprob_margin2", agg_method="mean_logit"),
+            AggParams(keep_frac=0.10, min_keep=5,  weight_power=2.0, conf_mode="maxprob_margin2", agg_method="mean_logit"),
+            *agg_grid,
+            AggParams(keep_frac=0.22, min_keep=10, weight_power=2.0, conf_mode="maxprob_margin",  agg_method="mean_logit"),
+            AggParams(keep_frac=0.18, min_keep=8,  weight_power=2.0, conf_mode="maxprob_margin",  agg_method="geom_prob"),
+        ]
+        print(f"[train] gear minority_f1_weight={gear_minority_f1_weight_eff:.3f}")
 
     coords_train = coords[split.train_idx] if use_geo_aux else None
     train_ds = AisSeqDataset(X_train, y_train, coords=coords_train)
@@ -712,10 +922,13 @@ def train_from_npz(
     else:
         cw_cpu = class_w.detach().cpu().numpy().astype(np.float64)
         sample_weights = cw_cpu[np.asarray(y_train, dtype=np.int64)]
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(int(random_state))
         sampler = WeightedRandomSampler(
             weights=torch.as_tensor(sample_weights, dtype=torch.double),
             num_samples=int(len(sample_weights)),
             replacement=True,
+            generator=sampler_generator,
         )
         train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
 
@@ -800,11 +1013,14 @@ def train_from_npz(
     best_balanced_acc = 0.0
     best_accuracy = 0.0
     best_selection_key: Tuple[float, ...] | None = None
+    best_gear_selection_key: Tuple[float, ...] | None = None
     best_godark_event_metrics: Dict[str, float] | None = None
     best_godark_event_prob_threshold = float(DEFAULT_GODARK_EVENT_PROB_THRESHOLD)
+    best_godark_event_mean_prob_threshold = float(godark_event_mean_prob_threshold_grid[0])
     best_godark_event_min_positive_windows = int(DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS)
     best_godark_event_min_positive_ratio = float(godark_event_min_positive_ratios[0])
     best_godark_event_short_min_positive_ratio = float(godark_event_short_min_positive_ratio)
+    best_godark_event_use_short_rescue = bool(godark_event_use_short_rescue)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -957,10 +1173,13 @@ def train_from_npz(
                 tau_list=tau_candidates,
                 num_classes=num_classes,
                 prob_thresholds=godark_event_prob_thresholds,
+                mean_prob_thresholds=godark_event_mean_prob_threshold_grid,
                 min_windows_grid=godark_event_min_windows_grid,
                 min_positive_ratios=godark_event_min_positive_ratios,
                 short_min_positive_ratio=float(godark_event_short_min_positive_ratio),
+                use_short_rescue=bool(godark_event_use_short_rescue),
                 min_event_recall=float(godark_event_min_recall),
+                min_event_precision=float(godark_event_min_precision),
             )
             agg_ep = agg_grid[0]
         elif metric_scope == "sequence":
@@ -981,11 +1200,20 @@ def train_from_npz(
                 tau_list=tau_candidates,
                 agg_grid=agg_grid,
                 num_classes=num_classes,
+                minority_f1_weight=gear_minority_f1_weight_eff,
             )
 
         if ema is not None:
             ema.restore(model)
 
+        godark_status_ep = _godark_checkpoint_status(
+            godark_event_metrics_ep,
+            min_precision=float(godark_event_min_precision),
+        ) if use_godark_event_selection else {
+            "checkpoint_status": "not_applicable",
+            "checkpoint_valid": None,
+            "checkpoint_invalid_reason": None,
+        }
         lr_now = float(optim.param_groups[0]["lr"])
         if use_godark_event_selection and godark_event_metrics_ep is not None:
             print(
@@ -995,8 +1223,9 @@ def train_from_npz(
                 f"f1={godark_event_metrics_ep['event_f1']:.4f} fp={int(godark_event_metrics_ep['event_fp'])} "
                 f"fn={int(godark_event_metrics_ep['event_fn'])} score={godark_event_metrics_ep['godark_score']:.4f} "
                 f"thr={godark_event_metrics_ep['godark_event_prob_threshold']:.2f} "
+                f"mean_thr={godark_event_metrics_ep['godark_event_mean_prob_threshold']:.2f} "
                 f"min_win={int(godark_event_metrics_ep['godark_event_min_positive_windows'])} "
-                f"tau={tau_ep:.2f} lr={lr_now:.2e}"
+                f"status={godark_status_ep['checkpoint_status']} tau={tau_ep:.2f} lr={lr_now:.2e}"
             )
         elif metric_scope == "sequence":
             print(
@@ -1023,6 +1252,9 @@ def train_from_npz(
                 "val_macro_f1": m_ep["macro_f1"],
                 "val_balanced_acc": m_ep["balanced_acc"],
                 "val_acc": m_ep["accuracy"],
+                "val_rare_mean_f1": m_ep.get("rare_mean_f1", None),
+                "val_min_present_f1": m_ep.get("min_present_f1", None),
+                "val_minority_selection_score": m_ep.get("minority_selection_score", None),
                 "val_godark_score": (
                     None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("godark_score", 0.0))
                 ),
@@ -1046,6 +1278,26 @@ def train_from_npz(
                     if godark_event_metrics_ep is None
                     else int(godark_event_metrics_ep.get("event_recall_floor_met", 0))
                 ),
+                "val_event_precision_floor_met": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else int(godark_event_metrics_ep.get("event_precision_floor_met", 0))
+                ),
+                "val_event_fp_rate": (
+                    None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("event_fp_rate", 0.0))
+                ),
+                "val_checkpoint_status": str(godark_status_ep["checkpoint_status"]),
+                "val_checkpoint_valid": godark_status_ep["checkpoint_valid"],
+                "val_checkpoint_invalid_reason": godark_status_ep["checkpoint_invalid_reason"],
+                "val_hard_negative_gap_fp": (
+                    None if godark_event_metrics_ep is None else int(godark_event_metrics_ep.get("hard_negative_gap_fp", 0))
+                ),
+                "val_hard_negative_feature_fp": (
+                    None if godark_event_metrics_ep is None else int(godark_event_metrics_ep.get("hard_negative_feature_fp", 0))
+                ),
+                "val_normal_random_fp": (
+                    None if godark_event_metrics_ep is None else int(godark_event_metrics_ep.get("normal_random_fp", 0))
+                ),
                 "val_macro_f1_seq": (m_ep["macro_f1"] if metric_scope == "sequence" else None),
                 "val_balanced_acc_seq": (m_ep["balanced_acc"] if metric_scope == "sequence" else None),
                 "val_acc_seq": (m_ep["accuracy"] if metric_scope == "sequence" else None),
@@ -1063,6 +1315,11 @@ def train_from_npz(
                     None
                     if godark_event_metrics_ep is None
                     else float(godark_event_metrics_ep.get("godark_event_prob_threshold", DEFAULT_GODARK_EVENT_PROB_THRESHOLD))
+                ),
+                "godark_event_mean_prob_threshold": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else float(godark_event_metrics_ep.get("godark_event_mean_prob_threshold", DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD))
                 ),
                 "godark_event_min_positive_windows": (
                     None
@@ -1094,11 +1351,32 @@ def train_from_npz(
                         )
                     )
                 ),
+                "godark_event_use_short_rescue": (
+                    None
+                    if godark_event_metrics_ep is None
+                    else int(godark_event_metrics_ep.get("godark_event_use_short_rescue", int(bool(godark_event_use_short_rescue))))
+                ),
+                "godark_event_min_precision": float(godark_event_min_precision),
             }
         )
 
         if use_godark_event_selection and godark_event_metrics_ep is not None:
             improved = best_selection_key is None or tuple(godark_selection_key_ep or ()) > best_selection_key
+        elif task_name == "gear":
+            rare_mean_f1 = float(m_ep.get("rare_mean_f1", 0.0))
+            min_present_f1 = float(m_ep.get("min_present_f1", 0.0))
+            minority_score = float(m_ep.get(
+                "minority_selection_score",
+                (0.65 * rare_mean_f1) + (0.35 * min_present_f1),
+            ))
+            gear_selection_key = (
+                float(m_ep["macro_f1"]),
+                float(m_ep["balanced_acc"]),
+                gear_minority_f1_weight_eff * minority_score,
+                rare_mean_f1,
+                min_present_f1,
+            )
+            improved = best_gear_selection_key is None or gear_selection_key > best_gear_selection_key
         else:
             improved = (m_ep["macro_f1"] > best_macro + 1e-6)
         if improved:
@@ -1108,11 +1386,19 @@ def train_from_npz(
             best_agg = agg_ep
             best_balanced_acc = float(m_ep["balanced_acc"])
             best_accuracy = float(m_ep["accuracy"])
+            if task_name == "gear":
+                best_gear_selection_key = tuple(gear_selection_key)
             if use_godark_event_selection and godark_event_metrics_ep is not None:
                 best_selection_key = tuple(godark_selection_key_ep or ())
                 best_godark_event_metrics = dict(godark_event_metrics_ep)
                 best_godark_event_prob_threshold = float(
                     godark_event_metrics_ep.get("godark_event_prob_threshold", DEFAULT_GODARK_EVENT_PROB_THRESHOLD)
+                )
+                best_godark_event_mean_prob_threshold = float(
+                    godark_event_metrics_ep.get(
+                        "godark_event_mean_prob_threshold",
+                        DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD,
+                    )
                 )
                 best_godark_event_min_positive_windows = int(
                     godark_event_metrics_ep.get(
@@ -1132,9 +1418,19 @@ def train_from_npz(
                         DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
                     )
                 )
+                best_godark_event_use_short_rescue = bool(
+                    godark_event_metrics_ep.get(
+                        "godark_event_use_short_rescue",
+                        int(bool(godark_event_use_short_rescue)),
+                    )
+                )
             no_improve = 0
 
             logit_adjust = (best_tau * log_pi).detach().cpu().numpy().astype(np.float32)
+            best_checkpoint_status = _godark_checkpoint_status(
+                best_godark_event_metrics,
+                min_precision=float(godark_event_min_precision),
+            )
 
             # Metric val dihitung pakai EMA shadow; simpan checkpoint dengan bobot yang sama.
             if ema is not None:
@@ -1163,10 +1459,23 @@ def train_from_npz(
                     "weight_decay": float(weight_decay),
                     "sgd_momentum": float(sgd_momentum),
                     "scaler_path": str(scaler_path),
+                    "random_state": int(random_state),
+                    "deterministic": bool(deterministic),
+                    "deterministic_warn_only": bool(deterministic_warn_only),
+                    "determinism_settings": determinism_settings,
                     "best_epoch": best_epoch,
                     "best_val_macro_f1": float(best_macro),
                     "best_val_balanced_acc": float(best_balanced_acc),
                     "best_val_accuracy": float(best_accuracy),
+                    "best_val_rare_mean_f1": (
+                        None if "rare_mean_f1" not in m_ep else float(m_ep.get("rare_mean_f1", 0.0))
+                    ),
+                    "best_val_min_present_f1": (
+                        None if "min_present_f1" not in m_ep else float(m_ep.get("min_present_f1", 0.0))
+                    ),
+                    "best_val_minority_selection_score": (
+                        None if "minority_selection_score" not in m_ep else float(m_ep.get("minority_selection_score", 0.0))
+                    ),
                     "best_val_godark_score": (
                         None
                         if best_godark_event_metrics is None
@@ -1193,13 +1502,40 @@ def train_from_npz(
                     "best_val_event_fn": (
                         None if best_godark_event_metrics is None else int(best_godark_event_metrics.get("event_fn", 0))
                     ),
+                    "best_val_event_fp_rate": (
+                        None
+                        if best_godark_event_metrics is None
+                        else float(best_godark_event_metrics.get("event_fp_rate", 0.0))
+                    ),
+                    "best_val_hard_negative_gap_fp": (
+                        None
+                        if best_godark_event_metrics is None
+                        else int(best_godark_event_metrics.get("hard_negative_gap_fp", 0))
+                    ),
+                    "best_val_hard_negative_feature_fp": (
+                        None
+                        if best_godark_event_metrics is None
+                        else int(best_godark_event_metrics.get("hard_negative_feature_fp", 0))
+                    ),
+                    "best_val_normal_random_fp": (
+                        None
+                        if best_godark_event_metrics is None
+                        else int(best_godark_event_metrics.get("normal_random_fp", 0))
+                    ),
+                    "checkpoint_status": best_checkpoint_status["checkpoint_status"],
+                    "checkpoint_valid": best_checkpoint_status["checkpoint_valid"],
+                    "checkpoint_invalid_reason": best_checkpoint_status["checkpoint_invalid_reason"],
                     "godark_event_prob_threshold": float(best_godark_event_prob_threshold),
+                    "godark_event_mean_prob_threshold": float(best_godark_event_mean_prob_threshold),
                     "godark_event_min_positive_windows": int(best_godark_event_min_positive_windows),
                     "godark_event_min_positive_ratio": float(best_godark_event_min_positive_ratio),
                     "godark_event_short_min_positive_ratio": float(best_godark_event_short_min_positive_ratio),
+                    "godark_event_use_short_rescue": bool(best_godark_event_use_short_rescue),
                     "godark_event_min_recall": float(godark_event_min_recall),
+                    "godark_event_min_precision": float(godark_event_min_precision),
+                    "godark_tau_max": float(godark_tau_max),
                     "godark_event_model_selection": (
-                        "godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
+                        "constrained_godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
                     ),
                     "tau": float(best_tau),
                     "priors": pri.detach().cpu().numpy().astype(np.float32),
@@ -1209,6 +1545,16 @@ def train_from_npz(
                     "agg_weight_power": float(best_agg.weight_power),
                     "agg_conf_mode": str(best_agg.conf_mode),
                     "agg_method": str(best_agg.agg_method),
+                    "gear_minority_f1_weight": float(gear_minority_f1_weight_eff),
+                    "gear_class_weight_power": (
+                        float(gear_class_weight_power_eff) if task_name == "gear" else 1.0
+                    ),
+                    "gear_class_weight_max": (
+                        float(gear_class_weight_max_eff) if task_name == "gear" else None
+                    ),
+                    "gear_tau_max": (
+                        float(gear_tau_max_eff) if task_name == "gear" else None
+                    ),
                 },
                 best_path,
             )
@@ -1220,6 +1566,7 @@ def train_from_npz(
                     f"event_f1={best_godark_event_metrics.get('event_f1', 0.0):.4f} "
                     f"event_p={best_godark_event_metrics.get('event_precision', 0.0):.4f} "
                     f"event_r={best_godark_event_metrics.get('event_recall', 0.0):.4f} "
+                    f"status={best_checkpoint_status['checkpoint_status']} "
                     f"macro_f1(seq)={best_macro:.4f} saved -> {best_path}"
                 )
             else:
@@ -1231,7 +1578,16 @@ def train_from_npz(
             print(f"[train] Early stopping: no improvement for {early_stop_patience} epochs.")
             break
 
+    final_checkpoint_status = _godark_checkpoint_status(
+        best_godark_event_metrics,
+        min_precision=float(godark_event_min_precision),
+    ) if task_name == "godark" else {
+        "checkpoint_status": "not_applicable",
+        "checkpoint_valid": None,
+        "checkpoint_invalid_reason": None,
+    }
     (out_dir / "history.json").write_text(json.dumps(hist_rows, indent=2), encoding="utf-8")
+    _save_history_plot(hist_rows, out_dir / "training_curves.png")
     (out_dir / "best_epoch.json").write_text(
         json.dumps(
             {
@@ -1245,9 +1601,46 @@ def train_from_npz(
                 "attention_layers": int(attention_layers),
                 "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                 "geo_aux_scale_km": float(geo_aux_scale_km),
+                "random_state": int(random_state),
+                "deterministic": bool(deterministic),
+                "deterministic_warn_only": bool(deterministic_warn_only),
+                "determinism_settings": determinism_settings,
                 "best_val_macro_f1": best_macro,
                 "best_val_balanced_acc": best_balanced_acc,
                 "best_val_accuracy": best_accuracy,
+                "best_val_rare_mean_f1": (
+                    None if best_path is None else next(
+                        (
+                            float(r.get("val_rare_mean_f1"))
+                            for r in hist_rows
+                            if int(r.get("epoch", -1)) == int(best_epoch)
+                            and r.get("val_rare_mean_f1") is not None
+                        ),
+                        None,
+                    )
+                ),
+                "best_val_min_present_f1": (
+                    None if best_path is None else next(
+                        (
+                            float(r.get("val_min_present_f1"))
+                            for r in hist_rows
+                            if int(r.get("epoch", -1)) == int(best_epoch)
+                            and r.get("val_min_present_f1") is not None
+                        ),
+                        None,
+                    )
+                ),
+                "best_val_minority_selection_score": (
+                    None if best_path is None else next(
+                        (
+                            float(r.get("val_minority_selection_score"))
+                            for r in hist_rows
+                            if int(r.get("epoch", -1)) == int(best_epoch)
+                            and r.get("val_minority_selection_score") is not None
+                        ),
+                        None,
+                    )
+                ),
                 "best_val_godark_score": (
                     None
                     if best_godark_event_metrics is None
@@ -1274,13 +1667,40 @@ def train_from_npz(
                 "best_val_event_fn": (
                     None if best_godark_event_metrics is None else int(best_godark_event_metrics.get("event_fn", 0))
                 ),
+                "best_val_event_fp_rate": (
+                    None
+                    if best_godark_event_metrics is None
+                    else float(best_godark_event_metrics.get("event_fp_rate", 0.0))
+                ),
+                "best_val_hard_negative_gap_fp": (
+                    None
+                    if best_godark_event_metrics is None
+                    else int(best_godark_event_metrics.get("hard_negative_gap_fp", 0))
+                ),
+                "best_val_hard_negative_feature_fp": (
+                    None
+                    if best_godark_event_metrics is None
+                    else int(best_godark_event_metrics.get("hard_negative_feature_fp", 0))
+                ),
+                "best_val_normal_random_fp": (
+                    None
+                    if best_godark_event_metrics is None
+                    else int(best_godark_event_metrics.get("normal_random_fp", 0))
+                ),
+                "checkpoint_status": final_checkpoint_status["checkpoint_status"],
+                "checkpoint_valid": final_checkpoint_status["checkpoint_valid"],
+                "checkpoint_invalid_reason": final_checkpoint_status["checkpoint_invalid_reason"],
                 "godark_event_prob_threshold": float(best_godark_event_prob_threshold),
+                "godark_event_mean_prob_threshold": float(best_godark_event_mean_prob_threshold),
                 "godark_event_min_positive_windows": int(best_godark_event_min_positive_windows),
                 "godark_event_min_positive_ratio": float(best_godark_event_min_positive_ratio),
                 "godark_event_short_min_positive_ratio": float(best_godark_event_short_min_positive_ratio),
+                "godark_event_use_short_rescue": bool(best_godark_event_use_short_rescue),
                 "godark_event_min_recall": float(godark_event_min_recall),
+                "godark_event_min_precision": float(godark_event_min_precision),
+                "godark_tau_max": float(godark_tau_max),
                 "godark_event_model_selection": (
-                    "godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
+                    "constrained_godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
                 ),
                 "tau": best_tau,
                 "agg_keep_frac": float(best_agg.keep_frac),
@@ -1288,6 +1708,16 @@ def train_from_npz(
                 "agg_weight_power": float(best_agg.weight_power),
                 "agg_conf_mode": str(best_agg.conf_mode),
                 "agg_method": str(best_agg.agg_method),
+                "gear_minority_f1_weight": float(gear_minority_f1_weight_eff),
+                "gear_class_weight_power": (
+                    float(gear_class_weight_power_eff) if task_name == "gear" else 1.0
+                ),
+                "gear_class_weight_max": (
+                    float(gear_class_weight_max_eff) if task_name == "gear" else None
+                ),
+                "gear_tau_max": (
+                    float(gear_tau_max_eff) if task_name == "gear" else None
+                ),
             },
             indent=2,
         ),
@@ -1320,16 +1750,33 @@ def train_from_npz(
                 "test_size": float(test_size),
                 "val_size": float(val_size),
                 "random_state": int(random_state),
+                "deterministic": bool(deterministic),
+                "deterministic_warn_only": bool(deterministic_warn_only),
+                "determinism_settings": determinism_settings,
                 "early_stop_patience": int(early_stop_patience),
                 "use_ema": bool(use_ema),
                 "ema_decay": float(ema_decay),
                 "use_focal": bool(use_focal),
                 "focal_gamma": float(focal_gamma),
+                "gear_minority_f1_weight": float(gear_minority_f1_weight_eff),
+                "gear_class_weight_power": (
+                    float(gear_class_weight_power_eff) if task_name == "gear" else 1.0
+                ),
+                "gear_class_weight_max": (
+                    float(gear_class_weight_max_eff) if task_name == "gear" else None
+                ),
+                "gear_tau_max": (
+                    float(gear_tau_max_eff) if task_name == "gear" else None
+                ),
+                "godark_tau_max": float(godark_tau_max),
                 "godark_event_prob_thresholds": [float(v) for v in godark_event_prob_thresholds],
+                "godark_event_mean_prob_threshold_grid": [float(v) for v in godark_event_mean_prob_threshold_grid],
                 "godark_event_min_windows_grid": [int(v) for v in godark_event_min_windows_grid],
                 "godark_event_min_positive_ratio_grid": [float(v) for v in godark_event_min_positive_ratios],
                 "godark_event_short_min_positive_ratio": float(godark_event_short_min_positive_ratio),
+                "godark_event_use_short_rescue": bool(godark_event_use_short_rescue),
                 "godark_event_min_recall": float(godark_event_min_recall),
+                "godark_event_min_precision": float(godark_event_min_precision),
                 "godark_event_selection_enabled": bool(use_godark_event_selection),
                 "train_duration_seconds": train_duration_seconds,
             },

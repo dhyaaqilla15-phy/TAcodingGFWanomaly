@@ -9,10 +9,14 @@ DEFAULT_GODARK_EVENT_PROB_THRESHOLD = 0.80
 DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS = 2
 DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO = 0.0
 DEFAULT_GODARK_EVENT_MIN_RECALL = 0.70
-DEFAULT_GODARK_EVENT_PROB_THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95)
-DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID = (1, 2, 3, 5, 8, 10)
-DEFAULT_GODARK_EVENT_MIN_RATIO_GRID = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+DEFAULT_GODARK_EVENT_MIN_PRECISION = 0.30
+DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD = 0.50
+DEFAULT_GODARK_EVENT_PROB_THRESHOLDS = (0.80, 0.90, 0.95)
+DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLDS = (0.50, 0.60, 0.70)
+DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID = (3, 5, 8, 10)
+DEFAULT_GODARK_EVENT_MIN_RATIO_GRID = (0.5, 0.6, 0.8, 1.0)
 DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO = 0.85
+DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE = False
 
 
 def binary_prf(tp: int, fp: int, fn: int) -> Dict[str, float]:
@@ -108,16 +112,28 @@ def _event_metrics_from_pred(
     true_event: np.ndarray,
     pred_event: np.ndarray,
     prob_threshold: float,
+    mean_prob_threshold: float,
     min_positive_windows: int,
     min_positive_ratio: float,
     short_min_positive_ratio: float = DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    use_short_rescue: bool = DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
+    event_kind_family_values: np.ndarray | None = None,
 ) -> Dict[str, float]:
     true_event = np.asarray(true_event, dtype=bool)
     pred_event = np.asarray(pred_event, dtype=bool)
+    family_values = (
+        np.asarray(event_kind_family_values).astype(str)
+        if event_kind_family_values is not None
+        else np.array(["unknown"] * true_event.size, dtype=str)
+    )
     tp = int(np.sum(true_event & pred_event))
     fp = int(np.sum((~true_event) & pred_event))
     fn = int(np.sum(true_event & (~pred_event)))
     tn = int(np.sum((~true_event) & (~pred_event)))
+    fp_mask = (~true_event) & pred_event
+    hard_negative_gap_fp = int(np.sum(fp_mask & (family_values == "hard_negative_gap")))
+    hard_negative_feature_fp = int(np.sum(fp_mask & (family_values == "hard_negative_feature")))
+    normal_random_fp = int(np.sum(fp_mask & (family_values == "normal_random")))
     prf = binary_prf(tp, fp, fn)
     return {
         "event_precision": prf["precision"],
@@ -127,13 +143,19 @@ def _event_metrics_from_pred(
         "event_fp": fp,
         "event_fn": fn,
         "event_tn": tn,
+        "event_fp_rate": float(fp / max(fp + tn, 1)),
+        "hard_negative_gap_fp": hard_negative_gap_fp,
+        "hard_negative_feature_fp": hard_negative_feature_fp,
+        "normal_random_fp": normal_random_fp,
         "true_events": int(tp + fn),
         "predicted_events": int(tp + fp),
         "evaluated_event_groups": int(true_event.size),
         "godark_event_prob_threshold": float(prob_threshold),
+        "godark_event_mean_prob_threshold": float(mean_prob_threshold),
         "godark_event_min_positive_windows": int(min_positive_windows),
         "godark_event_min_positive_ratio": float(min_positive_ratio),
         "godark_event_short_min_positive_ratio": float(short_min_positive_ratio),
+        "godark_event_use_short_rescue": int(bool(use_short_rescue)),
     }
 
 
@@ -142,26 +164,45 @@ def _rows_from_event_summary(
     pred_event: np.ndarray,
     label_map: Dict[int, str],
     prob_threshold: float,
+    mean_prob_threshold: float,
     min_positive_windows: int,
     min_positive_ratio: float,
     short_min_positive_ratio: float = DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    use_short_rescue: bool = DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
 ) -> List[dict]:
     pred_event = np.asarray(pred_event, dtype=bool)
     true_event = np.asarray(summary["true_event"], dtype=bool)
-    decision_rule = (
+    strict_rule = (
         f"max_prob>={float(prob_threshold):.3f} AND "
-        f"((windows_over_threshold>={int(min_positive_windows)} AND "
-        f"positive_window_ratio>={float(min_positive_ratio):.3f}) OR "
-        f"(n_windows<{int(min_positive_windows)} AND "
-        f"positive_window_ratio>={float(short_min_positive_ratio):.3f}))"
+        f"mean_prob>={float(mean_prob_threshold):.3f} AND "
+        f"windows_over_threshold>={int(min_positive_windows)} AND "
+        f"positive_window_ratio>={float(min_positive_ratio):.3f}"
     )
+    if use_short_rescue:
+        decision_rule = (
+            f"max_prob>={float(prob_threshold):.3f} AND "
+            f"mean_prob>={float(mean_prob_threshold):.3f} AND "
+            f"((windows_over_threshold>={int(min_positive_windows)} AND "
+            f"positive_window_ratio>={float(min_positive_ratio):.3f}) OR "
+            f"(min_windows>=3 AND n_windows<{int(min_positive_windows)} AND "
+            f"positive_window_ratio>={float(short_min_positive_ratio):.3f}))"
+        )
+    else:
+        decision_rule = strict_rule
     rows: List[dict] = []
     for i, eid in enumerate(summary["event_id"].tolist()):
         max_prob = float(summary["max_go_dark_probability"][i])
+        mean_prob = float(summary["mean_go_dark_probability"][i])
         windows_over_threshold = int(summary["windows_over_threshold"][i])
         ratio = float(summary["positive_window_ratio"][i])
         short_event = int(summary["n_windows"][i]) < int(min_positive_windows)
-        short_event_rescue = bool(short_event and ratio >= float(short_min_positive_ratio))
+        short_event_rescue = bool(
+            bool(use_short_rescue)
+            and mean_prob >= float(mean_prob_threshold)
+            and int(min_positive_windows) >= 3
+            and short_event
+            and ratio >= float(short_min_positive_ratio)
+        )
         true_i = bool(true_event[i])
         pred_i = bool(pred_event[i])
         rows.append(
@@ -183,10 +224,13 @@ def _rows_from_event_summary(
                 "max_go_dark_probability": max_prob,
                 "mean_go_dark_probability": float(summary["mean_go_dark_probability"][i]),
                 "godark_event_prob_threshold": float(prob_threshold),
+                "godark_event_mean_prob_threshold": float(mean_prob_threshold),
                 "godark_event_min_positive_windows": int(min_positive_windows),
                 "godark_event_min_positive_ratio": float(min_positive_ratio),
                 "godark_event_short_min_positive_ratio": float(short_min_positive_ratio),
+                "godark_event_use_short_rescue": int(bool(use_short_rescue)),
                 "max_prob_pass": int(max_prob >= float(prob_threshold)),
+                "mean_prob_pass": int(mean_prob >= float(mean_prob_threshold)),
                 "min_windows_pass": int(windows_over_threshold >= int(min_positive_windows)),
                 "min_ratio_pass": int(ratio >= float(min_positive_ratio)),
                 "short_event": int(short_event),
@@ -198,30 +242,54 @@ def _rows_from_event_summary(
 
 
 def godark_score(seq_metrics: Dict[str, float], event_metrics: Dict[str, float]) -> float:
-    return float(
+    base = float(
         (0.20 * float(seq_metrics.get("macro_f1", 0.0)))
         + (0.15 * float(seq_metrics.get("balanced_acc", 0.0)))
         + (0.35 * float(event_metrics.get("event_f1", 0.0)))
         + (0.15 * float(event_metrics.get("event_precision", 0.0)))
         + (0.15 * float(event_metrics.get("event_recall", 0.0)))
     )
+    fp_penalty = (
+        (0.0020 * float(event_metrics.get("event_fp", 0.0)))
+        + (0.0030 * float(event_metrics.get("hard_negative_gap_fp", 0.0)))
+        + (0.0025 * float(event_metrics.get("hard_negative_feature_fp", 0.0)))
+        + (0.0010 * float(event_metrics.get("normal_random_fp", 0.0)))
+    )
+    rule_penalty = (
+        (0.0400 if int(event_metrics.get("godark_event_min_positive_windows", 1)) <= 1 else 0.0)
+        + (0.0250 if float(event_metrics.get("godark_event_min_positive_ratio", 0.0)) <= 0.0 else 0.0)
+    )
+    return float(max(0.0, base - fp_penalty - rule_penalty))
 
 
 def godark_selection_key(
     seq_metrics: Dict[str, float],
     event_metrics: Dict[str, float],
     min_event_recall: float = DEFAULT_GODARK_EVENT_MIN_RECALL,
+    min_event_precision: float = DEFAULT_GODARK_EVENT_MIN_PRECISION,
 ) -> Tuple[float, ...]:
     recall = float(event_metrics.get("event_recall", 0.0))
     event_f1 = float(event_metrics.get("event_f1", 0.0))
     event_precision = float(event_metrics.get("event_precision", 0.0))
     macro_f1 = float(seq_metrics.get("macro_f1", 0.0))
     balanced_acc = float(seq_metrics.get("balanced_acc", 0.0))
+    event_fp = float(event_metrics.get("event_fp", 0.0))
+    strictness = (
+        float(event_metrics.get("godark_event_prob_threshold", 0.0)),
+        float(event_metrics.get("godark_event_mean_prob_threshold", 0.0)),
+        float(event_metrics.get("godark_event_min_positive_windows", 0.0)),
+        float(event_metrics.get("godark_event_min_positive_ratio", 0.0)),
+    )
     score = godark_score(seq_metrics, event_metrics)
     recall_floor_met = 1.0 if recall >= float(min_event_recall) else 0.0
+    precision_floor_met = 1.0 if event_precision >= float(min_event_precision) else 0.0
+    if recall_floor_met > 0.0 and precision_floor_met > 0.0:
+        return (3.0, score, event_f1, event_precision, recall, -event_fp, macro_f1, balanced_acc, *strictness)
+    if precision_floor_met > 0.0:
+        return (2.0, -event_fp, event_f1, recall, score, event_precision, macro_f1, balanced_acc, *strictness)
     if recall_floor_met > 0.0:
-        return (1.0, score, event_f1, event_precision, macro_f1, balanced_acc, recall)
-    return (0.0, recall, score, event_f1, event_precision, macro_f1, balanced_acc)
+        return (1.0, -event_fp, event_precision, event_f1, score, recall, macro_f1, balanced_acc, *strictness)
+    return (0.0, -event_fp, event_precision, event_f1, recall, score, macro_f1, balanced_acc, *strictness)
 
 
 def godark_event_report(
@@ -232,43 +300,55 @@ def godark_event_report(
     probs: np.ndarray,
     label_map: Dict[int, str],
     prob_threshold: float = DEFAULT_GODARK_EVENT_PROB_THRESHOLD,
+    mean_prob_threshold: float = DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD,
     min_positive_windows: int = DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS,
     min_positive_ratio: float = DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
     short_min_positive_ratio: float = DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    use_short_rescue: bool = DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
 ) -> tuple[dict, List[dict]]:
     prob_threshold = float(prob_threshold)
+    mean_prob_threshold = float(max(0.0, mean_prob_threshold))
     min_positive_windows = int(max(1, min_positive_windows))
     min_positive_ratio = float(max(0.0, min_positive_ratio))
     short_min_positive_ratio = float(max(0.0, short_min_positive_ratio))
     summary = _summarize_events_for_threshold(event_ids, kinds, y_true, y_pred, probs, prob_threshold)
+    mean_prob_pass = summary["mean_go_dark_probability"] >= mean_prob_threshold
     strict_event = (
         (summary["windows_over_threshold"] >= min_positive_windows)
         & (summary["positive_window_ratio"] >= min_positive_ratio)
     )
     short_event_rescue = (
-        (summary["n_windows"] < min_positive_windows)
+        bool(use_short_rescue)
+        & (min_positive_windows >= 3)
+        & (summary["n_windows"] < min_positive_windows)
         & (summary["positive_window_ratio"] >= short_min_positive_ratio)
     )
     pred_event = (
         (summary["max_go_dark_probability"] >= prob_threshold)
+        & mean_prob_pass
         & (strict_event | short_event_rescue)
     )
     metrics = _event_metrics_from_pred(
         true_event=summary["true_event"],
         pred_event=pred_event,
         prob_threshold=prob_threshold,
+        mean_prob_threshold=mean_prob_threshold,
         min_positive_windows=min_positive_windows,
         min_positive_ratio=min_positive_ratio,
         short_min_positive_ratio=short_min_positive_ratio,
+        use_short_rescue=bool(use_short_rescue),
+        event_kind_family_values=summary["event_kind_family"],
     )
     rows = _rows_from_event_summary(
         summary=summary,
         pred_event=pred_event,
         label_map=label_map,
         prob_threshold=prob_threshold,
+        mean_prob_threshold=mean_prob_threshold,
         min_positive_windows=min_positive_windows,
         min_positive_ratio=min_positive_ratio,
         short_min_positive_ratio=short_min_positive_ratio,
+        use_short_rescue=bool(use_short_rescue),
     )
     return metrics, rows
 
@@ -315,11 +395,15 @@ def pick_best_godark_event_setting(
     label_map: Dict[int, str],
     seq_metrics: Dict[str, float],
     prob_thresholds: Iterable[float] = DEFAULT_GODARK_EVENT_PROB_THRESHOLDS,
+    mean_prob_threshold: float = DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD,
+    mean_prob_thresholds: Iterable[float] | None = None,
     min_windows_grid: Iterable[int] = DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID,
     min_positive_ratio: float = DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO,
     min_positive_ratios: Iterable[float] | None = None,
     short_min_positive_ratio: float = DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
+    use_short_rescue: bool = DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
     min_event_recall: float = DEFAULT_GODARK_EVENT_MIN_RECALL,
+    min_event_precision: float = DEFAULT_GODARK_EVENT_MIN_PRECISION,
 ) -> tuple[dict, List[dict], Tuple[float, ...]]:
     best_metrics = None
     best_key = None
@@ -330,41 +414,62 @@ def pick_best_godark_event_setting(
         if min_positive_ratios is not None
         else [float(min_positive_ratio)]
     )
+    mean_grid = (
+        [float(v) for v in mean_prob_thresholds]
+        if mean_prob_thresholds is not None
+        else [float(mean_prob_threshold)]
+    )
 
     for prob_threshold in prob_thresholds:
         prob_threshold = float(prob_threshold)
         summary = _summarize_events_for_threshold(event_ids, kinds, y_true, y_pred, probs, prob_threshold)
         true_event = summary["true_event"]
         max_prob_pass = summary["max_go_dark_probability"] >= prob_threshold
-        for min_windows in min_windows_grid:
-            min_windows = int(max(1, min_windows))
-            min_windows_pass = summary["windows_over_threshold"] >= min_windows
-            for ratio in ratio_grid:
-                ratio = float(max(0.0, ratio))
-                short_rescue = (
-                    (summary["n_windows"] < min_windows)
-                    & (summary["positive_window_ratio"] >= float(short_min_positive_ratio))
-                )
-                pred_event = max_prob_pass & ((min_windows_pass & (summary["positive_window_ratio"] >= ratio)) | short_rescue)
-                metrics = _event_metrics_from_pred(
-                    true_event=true_event,
-                    pred_event=pred_event,
-                    prob_threshold=float(prob_threshold),
-                    min_positive_windows=int(min_windows),
-                    min_positive_ratio=float(ratio),
-                    short_min_positive_ratio=float(short_min_positive_ratio),
-                )
-                score = godark_score(seq_metrics, metrics)
-                metrics = dict(metrics)
-                metrics["godark_score"] = score
-                metrics["event_recall_floor"] = float(min_event_recall)
-                metrics["event_recall_floor_met"] = int(float(metrics["event_recall"]) >= float(min_event_recall))
-                key = godark_selection_key(seq_metrics, metrics, min_event_recall=min_event_recall)
-                if best_key is None or key > best_key:
-                    best_metrics = metrics
-                    best_key = key
-                    best_summary = summary
-                    best_pred_event = pred_event.copy()
+        for mean_threshold in mean_grid:
+            mean_threshold = float(max(0.0, mean_threshold))
+            mean_prob_pass = summary["mean_go_dark_probability"] >= mean_threshold
+            event_prob_pass = max_prob_pass & mean_prob_pass
+            for min_windows in min_windows_grid:
+                min_windows = int(max(1, min_windows))
+                min_windows_pass = summary["windows_over_threshold"] >= min_windows
+                for ratio in ratio_grid:
+                    ratio = float(max(0.0, ratio))
+                    short_rescue = (
+                        bool(use_short_rescue)
+                        & (min_windows >= 3)
+                        & (summary["n_windows"] < min_windows)
+                        & (summary["positive_window_ratio"] >= float(short_min_positive_ratio))
+                    )
+                    pred_event = event_prob_pass & ((min_windows_pass & (summary["positive_window_ratio"] >= ratio)) | short_rescue)
+                    metrics = _event_metrics_from_pred(
+                        true_event=true_event,
+                        pred_event=pred_event,
+                        prob_threshold=float(prob_threshold),
+                        mean_prob_threshold=float(mean_threshold),
+                        min_positive_windows=int(min_windows),
+                        min_positive_ratio=float(ratio),
+                        short_min_positive_ratio=float(short_min_positive_ratio),
+                        use_short_rescue=bool(use_short_rescue),
+                        event_kind_family_values=summary["event_kind_family"],
+                    )
+                    score = godark_score(seq_metrics, metrics)
+                    metrics = dict(metrics)
+                    metrics["godark_score"] = score
+                    metrics["event_recall_floor"] = float(min_event_recall)
+                    metrics["event_recall_floor_met"] = int(float(metrics["event_recall"]) >= float(min_event_recall))
+                    metrics["event_precision_floor"] = float(min_event_precision)
+                    metrics["event_precision_floor_met"] = int(float(metrics["event_precision"]) >= float(min_event_precision))
+                    key = godark_selection_key(
+                        seq_metrics,
+                        metrics,
+                        min_event_recall=min_event_recall,
+                        min_event_precision=min_event_precision,
+                    )
+                    if best_key is None or key > best_key:
+                        best_metrics = metrics
+                        best_key = key
+                        best_summary = summary
+                        best_pred_event = pred_event.copy()
 
     best_rows = []
     if best_metrics is not None and best_summary is not None and best_pred_event is not None:
@@ -373,9 +478,11 @@ def pick_best_godark_event_setting(
             pred_event=best_pred_event,
             label_map=label_map,
             prob_threshold=float(best_metrics["godark_event_prob_threshold"]),
+            mean_prob_threshold=float(best_metrics.get("godark_event_mean_prob_threshold", mean_prob_threshold)),
             min_positive_windows=int(best_metrics["godark_event_min_positive_windows"]),
             min_positive_ratio=float(best_metrics["godark_event_min_positive_ratio"]),
             short_min_positive_ratio=float(best_metrics.get("godark_event_short_min_positive_ratio", short_min_positive_ratio)),
+            use_short_rescue=bool(best_metrics.get("godark_event_use_short_rescue", use_short_rescue)),
         )
 
     return dict(best_metrics or {}), list(best_rows), tuple(best_key or ())

@@ -345,11 +345,12 @@ Evaluasi Go-Dark sekarang memakai decision rule event-level yang disimpan dari v
 ```text
 event positif jika:
 max_go_dark_probability >= godark_event_prob_threshold
+DAN mean_go_dark_probability >= godark_event_mean_prob_threshold
 DAN windows_over_threshold >= godark_event_min_positive_windows
 DAN positive_window_ratio >= godark_event_min_positive_ratio
 ```
 
-Saat training Go-Dark, pipeline menyapu beberapa threshold validation dan menyimpan kombinasi terbaik ke checkpoint berdasarkan `godark_score` selama recall event melewati batas minimum. Grid yang disapu mencakup `godark_event_prob_thresholds`, `godark_event_min_windows_grid`, dan `godark_event_min_positive_ratio_grid`. Event pendek juga punya rescue rule melalui `godark_event_short_min_positive_ratio`, sehingga event dengan window sedikit tetap bisa positif jika rasio window kuat sangat tinggi. Saat eval test, threshold tersebut dipakai apa adanya agar tidak ada tuning di test set. Untuk diagnosis, baca `per_godark_event_predictions.csv` dan `godark_event_error_breakdown.csv`, terutama false positive dari `hard_negative_feature` dan `normal_random`.
+Saat training Go-Dark, pipeline menyapu beberapa threshold validation dan menyimpan kombinasi terbaik ke checkpoint berdasarkan `godark_score` yang sudah diberi penalti false-positive. Seleksi sekarang memakai guardrail `godark_event_min_recall` dan `godark_event_min_precision`, grid mean probability, serta tau Go-Dark yang dibatasi. Short-event rescue default-nya mati; aktifkan hanya untuk ablation dengan `--godark_event_use_short_rescue`. Checkpoint Go-Dark juga menulis `checkpoint_status`, sehingga model dengan precision/recall/F1 event yang tidak memenuhi batas minimum tidak dianggap valid walaupun artefaknya tetap tersimpan untuk diagnosis. Saat eval test, threshold tersebut dipakai apa adanya agar tidak ada tuning di test set. Untuk diagnosis, baca `per_godark_event_predictions.csv` dan `godark_event_error_breakdown.csv`, terutama false positive dari `hard_negative_gap`, `hard_negative_feature`, dan `normal_random`.
 
 ---
 
