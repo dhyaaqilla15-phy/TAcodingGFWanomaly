@@ -38,6 +38,9 @@ from godark_event import (
 )
 
 
+GEAR_KNOWN_LIMITATION_LABELS = {"pole_and_line", "trollers"}
+
+
 def pick_device(device: str) -> torch.device:
     if device == "cpu":
         return torch.device("cpu")
@@ -63,6 +66,45 @@ def load_npz(npz_path: Path):
     if "scaled" not in data.files:
         print("[eval] WARNING: NPZ has no 'scaled' metadata. Prefer rerunning preprocess with the train-only scaler pipeline.")
     return X, y, groups, label_map
+
+
+def _label_map_from_checkpoint(ckpt: dict) -> Dict[int, str] | None:
+    raw = ckpt.get("label_map", None)
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return {int(k): str(v) for k, v in raw.items()}
+    try:
+        arr = np.asarray(raw, dtype=object)
+        return {int(k): str(v) for k, v in arr.tolist()}
+    except Exception:
+        return None
+
+
+def _remap_y_to_checkpoint_labels(
+    y: np.ndarray,
+    data_label_map: Dict[int, str],
+    ckpt_label_map: Dict[int, str] | None,
+) -> tuple[np.ndarray, Dict[int, str]]:
+    if not ckpt_label_map:
+        return y, data_label_map
+
+    data_name_to_id = {str(v): int(k) for k, v in data_label_map.items()}
+    ckpt_name_to_id = {str(v): int(k) for k, v in ckpt_label_map.items()}
+    if data_name_to_id == ckpt_name_to_id:
+        return y, ckpt_label_map
+
+    missing = sorted(set(data_name_to_id) - set(ckpt_name_to_id))
+    if missing:
+        raise ValueError(
+            "External data contains labels not present in checkpoint label_map: "
+            + ", ".join(missing)
+        )
+
+    remap = {data_id: ckpt_name_to_id[name] for name, data_id in data_name_to_id.items()}
+    y_new = np.asarray([remap[int(v)] for v in y], dtype=np.int64)
+    print(f"[eval] remapped data labels to checkpoint label_map: {remap}")
+    return y_new, ckpt_label_map
 
 
 def _load_rule_features(npz_path: Path):
@@ -139,13 +181,17 @@ def save_confusion_png(cm: np.ndarray, labels: List[str], out_path: Path, normal
 
 def _per_class_metric_rows(cm: np.ndarray, labels: List[str], scope: str) -> List[Dict[str, object]]:
     cls = per_class_metrics_from_cm(cm)
+    known_limitations = set(_known_limitation_labels("gear", labels))
     rows: List[Dict[str, object]] = []
     for i, label in enumerate(labels):
+        is_known_limitation = str(label) in known_limitations
         rows.append(
             {
                 "scope": str(scope),
                 "class_id": int(i),
                 "class_label": str(label),
+                "known_limitation": bool(is_known_limitation),
+                "viable_class": bool(not is_known_limitation),
                 "precision": float(cls["precision"][i]) if i < len(cls["precision"]) else 0.0,
                 "recall": float(cls["recall"][i]) if i < len(cls["recall"]) else 0.0,
                 "f1": float(cls["f1"][i]) if i < len(cls["f1"]) else 0.0,
@@ -154,6 +200,35 @@ def _per_class_metric_rows(cm: np.ndarray, labels: List[str], scope: str) -> Lis
             }
         )
     return rows
+
+
+def _known_limitation_labels(task_name: str, labels: List[str]) -> List[str]:
+    if str(task_name) != "gear":
+        return []
+    available = {str(label) for label in labels}
+    return [label for label in sorted(GEAR_KNOWN_LIMITATION_LABELS) if label in available]
+
+
+def _filtered_metrics_from_cm(cm: np.ndarray, labels: List[str], excluded_labels: List[str]) -> Dict[str, float]:
+    excluded = {str(label) for label in excluded_labels}
+    keep_ids = [i for i, label in enumerate(labels) if str(label) not in excluded]
+    if not keep_ids:
+        return {"accuracy": 0.0, "macro_f1": 0.0, "balanced_acc": 0.0, "weighted_f1": 0.0, "num_classes": 0}
+
+    cm_f = cm.astype(np.float64)
+    cls = per_class_metrics_from_cm(cm_f)
+    f1 = cls["f1"][keep_ids]
+    recall = cls["recall"][keep_ids]
+    support = cls["support"][keep_ids]
+    tp = np.diag(cm_f)[keep_ids]
+
+    return {
+        "accuracy": float(tp.sum() / max(float(support.sum()), 1.0)),
+        "macro_f1": float(f1.mean()) if len(f1) else 0.0,
+        "balanced_acc": float(recall.mean()) if len(recall) else 0.0,
+        "weighted_f1": float((f1 * support).sum() / max(float(support.sum()), 1.0)),
+        "num_classes": int(len(keep_ids)),
+    }
 
 
 def _load_split_indices(out_dir: Path) -> Dict[str, np.ndarray] | None:
@@ -165,6 +240,14 @@ def _load_split_indices(out_dir: Path) -> Dict[str, np.ndarray] | None:
     if "val_idx" in d.files:
         out["val_idx"] = d["val_idx"]
     return out
+
+
+def _load_split_indices_for_eval(out_dir: Path, model_path: Path) -> Dict[str, np.ndarray] | None:
+    for base in [out_dir, model_path.parent]:
+        split_idx = _load_split_indices(base)
+        if split_idx is not None:
+            return split_idx
+    return None
 
 
 def _load_eval_scaler(model_path: Path, out_dir: Path, ckpt: dict):
@@ -240,6 +323,8 @@ def evaluate(
     batch_size: int = 64,
     test_size: float = 0.2,
     random_state: int = 42,
+    split_random_state: int | None = None,
+    eval_split: str = "test",
     godark_event_prob_threshold: float | None = None,
     godark_event_mean_prob_threshold: float | None = None,
     godark_event_min_positive_windows: int | None = None,
@@ -254,30 +339,68 @@ def evaluate(
     X, y, groups, label_map = load_npz(Path(data_npz))
     rule_features, rule_cols = _load_rule_features(Path(data_npz))
     window_event_ids, window_kinds = _load_window_metadata(Path(data_npz))
+    ckpt = _torch_load_compat(model_path, map_location="cpu")
+    y, label_map = _remap_y_to_checkpoint_labels(
+        y.astype(np.int64),
+        data_label_map=label_map,
+        ckpt_label_map=_label_map_from_checkpoint(ckpt),
+    )
     num_classes = int(len(label_map))
     labels = [label_map.get(i, str(i)) for i in range(num_classes)]
     task_name = _task_name_from_label_map(label_map)
 
     dev = pick_device(device)
 
-    split_idx = _load_split_indices(out_dir)
-    if split_idx is None:
-        split = group_train_val_test_split(
-            X, y, groups,
-            val_size=0.05,
-            test_size=test_size,
-            random_state=random_state,
-        )
-        test_idx = split.test_idx
+    eval_split_seed = int(
+        random_state
+        if split_random_state is None
+        else split_random_state
+    )
+    if split_random_state is None and "split_random_state" in ckpt:
+        eval_split_seed = int(ckpt.get("split_random_state", eval_split_seed))
+
+    eval_split_key = str(eval_split).strip().lower()
+    if eval_split_key == "all":
+        split_lookup = {
+            "all": np.arange(len(y), dtype=np.int64),
+        }
     else:
-        test_idx = split_idx["test_idx"]
+        split_idx = _load_split_indices_for_eval(out_dir, model_path)
+        if split_idx is None:
+            split = group_train_val_test_split(
+                X, y, groups,
+                val_size=0.05,
+                test_size=test_size,
+                random_state=eval_split_seed,
+            )
+            split_lookup = {
+                "train": split.train_idx,
+                "val": split.val_idx,
+                "validation": split.val_idx,
+                "test": split.test_idx,
+                "all": np.arange(len(y), dtype=np.int64),
+            }
+        else:
+            split_lookup = {
+                "train": split_idx["train_idx"],
+                "val": split_idx["val_idx"],
+                "validation": split_idx["val_idx"],
+                "test": split_idx["test_idx"],
+                "all": np.arange(len(y), dtype=np.int64),
+            }
+
+    if eval_split_key not in split_lookup:
+        raise ValueError("--eval_split must be one of: train, val, validation, test, all")
+    test_idx = split_lookup[eval_split_key]
+    eval_split_name = "val" if eval_split_key == "validation" else eval_split_key
+    if len(test_idx) == 0:
+        raise ValueError(f"Selected eval split '{eval_split_name}' is empty.")
 
     y_test = y[test_idx]
     g_test = groups[test_idx]
     event_ids_test = window_event_ids[test_idx] if len(window_event_ids) == len(y) else np.array([""] * len(test_idx), dtype=object)
     kinds_test = window_kinds[test_idx] if len(window_kinds) == len(y) else np.array(["unknown"] * len(test_idx), dtype=object)
 
-    ckpt = _torch_load_compat(model_path, map_location="cpu")
     scaler, scaler_path = _load_eval_scaler(model_path, out_dir, ckpt)
     if scaler is None:
         print("[eval] WARNING: scaler.joblib not found; using X from NPZ as-is (legacy mode).")
@@ -441,6 +564,8 @@ def evaluate(
 
     cm_seq = confusion_matrix_np(y_np, pred_seq, num_classes)
     m_seq = metrics_from_cm(cm_seq)
+    known_limitation_labels = _known_limitation_labels(task_name, labels)
+    m_seq_viable = _filtered_metrics_from_cm(cm_seq, labels, known_limitation_labels)
 
     g_str = g_np.astype(str)
     uniq_v = np.unique(g_str)
@@ -495,14 +620,29 @@ def evaluate(
 
     cm_v = confusion_matrix_np(np.array(y_true_v), np.array(y_pred_v), num_classes)
     m_v = metrics_from_cm(cm_v)
+    m_v_viable = _filtered_metrics_from_cm(cm_v, labels, known_limitation_labels)
 
-    cm_primary = cm_seq if metric_scope == "sequence" else cm_v
-    save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
-    save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
-    save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence.png", normalize=False)
-    save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence_normalized.png", normalize=True)
-    save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel.png", normalize=False)
-    save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel_normalized.png", normalize=True)
+    if task_name == "gear":
+        cm_primary = cm_v
+        save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
+        save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
+        for stale_name in [
+            "confusion_matrix_sequence.png",
+            "confusion_matrix_sequence_normalized.png",
+            "confusion_matrix_vessel.png",
+            "confusion_matrix_vessel_normalized.png",
+        ]:
+            stale_path = out_dir / stale_name
+            if stale_path.exists():
+                stale_path.unlink()
+    else:
+        cm_primary = cm_seq if metric_scope == "sequence" else cm_v
+        save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
+        save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
+        save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence.png", normalize=False)
+        save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence_normalized.png", normalize=True)
+        save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel.png", normalize=False)
+        save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel_normalized.png", normalize=True)
 
     per_class_path = out_dir / "per_class_metrics.csv"
     per_class_rows = (
@@ -613,8 +753,11 @@ def evaluate(
         "primary_metric_scope": metric_scope,
         "num_classes": num_classes,
         "labels": labels,
+        "known_limitation_labels": known_limitation_labels,
         "metrics_seq": m_seq,
         "metrics_vessel": m_v,
+        "metrics_seq_viable": m_seq_viable,
+        "metrics_vessel_viable": m_v_viable,
         "metrics_godark_event": godark_event_metrics,
         "metrics_tabular": (tx_extra.get("metrics_tabular") if tx_extra is not None else None),
         "metrics_hybrid": (tx_extra.get("metrics_hybrid") if tx_extra is not None else None),
@@ -662,12 +805,18 @@ def evaluate(
         "hybrid_prediction_table": (str(tx_extra_path) if tx_extra_path is not None else None),
         "batch_size": int(batch_size),
         "device_used": str(dev),
+        "random_state": int(random_state),
+        "split_random_state": int(eval_split_seed),
+        "train_random_state": (
+            None if ckpt.get("train_random_state", None) is None else int(ckpt.get("train_random_state"))
+        ),
+        "deterministic": ckpt.get("deterministic", None),
         "logit_adjust_used": True,
         "tau": float(best_tau),
         "keep_frac": float(best_agg.keep_frac),
         "min_keep": int(best_agg.min_keep),
-        "eval_split": "held_out_test",
-        "test_tuning_used": False,
+        "eval_split": eval_split_name,
+        "test_tuning_used": bool(eval_split_name not in {"test", "all"}),
         "scaler": (str(scaler_path) if scaler_path is not None else None),
     }
     (out_dir / "eval_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -686,4 +835,11 @@ def evaluate(
             )
     else:
         print(f"[eval][VESSEL] acc={m_v['accuracy']:.4f} macro_f1={m_v['macro_f1']:.4f} bal_acc={m_v['balanced_acc']:.4f}")
+        if known_limitation_labels:
+            print(
+                f"[eval][VESSEL-VIABLE] acc={m_v_viable['accuracy']:.4f} "
+                f"macro_f1={m_v_viable['macro_f1']:.4f} "
+                f"bal_acc={m_v_viable['balanced_acc']:.4f} "
+                f"excluded={known_limitation_labels}"
+            )
         print(f"[eval][SEQ-AUX] acc={m_seq['accuracy']:.4f} macro_f1={m_seq['macro_f1']:.4f} bal_acc={m_seq['balanced_acc']:.4f}")

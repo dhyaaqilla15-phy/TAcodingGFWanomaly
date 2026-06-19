@@ -8,12 +8,19 @@ RUN_DIR="${2:-$ROOT_DIR/output/run01}"
 DEVICE="${DEVICE:-auto}"
 SEED="${SEED:-42}"
 LIMIT_ROWS="${LIMIT_ROWS:-300000}"
+GEAR_LIMIT_ROWS="${GEAR_LIMIT_ROWS:-0}"
+SOURCE_LIMIT_ROWS="${SOURCE_LIMIT_ROWS:-$LIMIT_ROWS}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 VAL_SIZE="${VAL_SIZE:-0.15}"
 GEAR_VAL_SIZE="${GEAR_VAL_SIZE:-0.20}"
 GEAR_MIN_WINDOWS_PER_VESSEL="${GEAR_MIN_WINDOWS_PER_VESSEL:-0}"
+GEAR_EXCLUDE_LABELS="${GEAR_EXCLUDE_LABELS:-unknown pole_and_line trollers}"
+SOURCE_EXCLUDE_LABELS="${SOURCE_EXCLUDE_LABELS:-pole_and_line trollers}"
+GEAR_USE_OPERATIONAL_FILTER="${GEAR_USE_OPERATIONAL_FILTER:-0}"
+GEAR_OP_SPEED_MIN="${GEAR_OP_SPEED_MIN:-1.0}"
+GEAR_OP_SPEED_MAX="${GEAR_OP_SPEED_MAX:-12.0}"
 PREPROCESS_MAX_WINDOWS_PER_FILE="${PREPROCESS_MAX_WINDOWS_PER_FILE:-20000}"
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-320}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-50}"
 TRAIN_HIDDEN_SIZE="${TRAIN_HIDDEN_SIZE:-384}"
 TRAIN_NUM_LAYERS="${TRAIN_NUM_LAYERS:-2}"
 TRAIN_INPUT_PROJ_DIM="${TRAIN_INPUT_PROJ_DIM:-256}"
@@ -40,12 +47,19 @@ Optional environment variables:
   DEVICE=auto|cpu|cuda
   SEED=42
   LIMIT_ROWS=300000
+  GEAR_LIMIT_ROWS=0
+  SOURCE_LIMIT_ROWS=\$LIMIT_ROWS
   BATCH_SIZE=128
   VAL_SIZE=0.15
   GEAR_VAL_SIZE=0.20
   GEAR_MIN_WINDOWS_PER_VESSEL=0
+  GEAR_EXCLUDE_LABELS="unknown pole_and_line trollers"
+  SOURCE_EXCLUDE_LABELS="pole_and_line trollers"
+  GEAR_USE_OPERATIONAL_FILTER=0
+  GEAR_OP_SPEED_MIN=1.0
+  GEAR_OP_SPEED_MAX=12.0
   PREPROCESS_MAX_WINDOWS_PER_FILE=20000
-  TRAIN_EPOCHS=320
+  TRAIN_EPOCHS=50
   TRAIN_HIDDEN_SIZE=384
   TRAIN_NUM_LAYERS=2
   TRAIN_INPUT_PROJ_DIM=256
@@ -84,6 +98,17 @@ OUT_TRANS="$RUN_DIR/transshipment"
 
 mkdir -p "$OUT_GEAR" "$OUT_SPOOF" "$OUT_GODARK" "$OUT_TRANS"
 
+read -r -a gear_exclude_labels <<< "$GEAR_EXCLUDE_LABELS"
+read -r -a source_exclude_labels <<< "$SOURCE_EXCLUDE_LABELS"
+gear_operational_filter_args=()
+if [[ "$GEAR_USE_OPERATIONAL_FILTER" == "1" ]]; then
+  gear_operational_filter_args+=(
+    --use_operational_filter
+    --op_speed_min "$GEAR_OP_SPEED_MIN"
+    --op_speed_max "$GEAR_OP_SPEED_MAX"
+  )
+fi
+
 run_step() {
   echo
   echo "============================================================"
@@ -100,10 +125,16 @@ echo "[pipeline] data_dir = $DATA_DIR"
 echo "[pipeline] run_dir  = $RUN_DIR"
 echo "[pipeline] device   = $DEVICE"
 echo "[pipeline] seed     = $SEED"
-echo "[pipeline] limit    = $LIMIT_ROWS"
+echo "[pipeline] legacy_limit_rows = $LIMIT_ROWS"
+echo "[pipeline] gear_limit_rows = $GEAR_LIMIT_ROWS"
+echo "[pipeline] source_limit_rows = $SOURCE_LIMIT_ROWS"
 echo "[pipeline] val_size = $VAL_SIZE"
 echo "[pipeline] gear_val_size = $GEAR_VAL_SIZE"
 echo "[pipeline] gear_min_windows_per_vessel = $GEAR_MIN_WINDOWS_PER_VESSEL"
+echo "[pipeline] gear_exclude_labels = $GEAR_EXCLUDE_LABELS"
+echo "[pipeline] gear_use_operational_filter = $GEAR_USE_OPERATIONAL_FILTER"
+echo "[pipeline] gear_op_speed = $GEAR_OP_SPEED_MIN..$GEAR_OP_SPEED_MAX"
+echo "[pipeline] source_exclude_labels = $SOURCE_EXCLUDE_LABELS"
 echo "[pipeline] preprocess_max_windows_per_file = $PREPROCESS_MAX_WINDOWS_PER_FILE"
 echo "[pipeline] train_epochs = $TRAIN_EPOCHS"
 echo "[pipeline] train_hidden_size = $TRAIN_HIDDEN_SIZE"
@@ -121,10 +152,11 @@ run_step "[1/20] Gear preprocess" \
   --data_dir "$DATA_DIR" \
   --out_dir "$OUT_GEAR" \
   --task gear \
-  --limit_rows "$LIMIT_ROWS" \
+  --limit_rows "$GEAR_LIMIT_ROWS" \
   --max_windows_per_file "$PREPROCESS_MAX_WINDOWS_PER_FILE" \
-  --exclude_labels unknown \
-  --min_windows_per_vessel "$GEAR_MIN_WINDOWS_PER_VESSEL"
+  --exclude_labels "${gear_exclude_labels[@]}" \
+  --min_windows_per_vessel "$GEAR_MIN_WINDOWS_PER_VESSEL" \
+  "${gear_operational_filter_args[@]}"
 
 run_step "[2/20] Gear train" \
   python3 "$MAIN_PY" train \
@@ -157,7 +189,8 @@ run_step "[4/20] Spoofing generate" \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_SPOOF" \
   --attacks gradual_drift location_jump replay meaconing ghost mirroring \
-  --limit_rows "$LIMIT_ROWS" \
+  --limit_rows "$SOURCE_LIMIT_ROWS" \
+  --exclude_labels "${source_exclude_labels[@]}" \
   --normal_keep_frac 0.25 \
   --max_vessels_per_file 20 \
   --points_per_attack 120 \
@@ -214,7 +247,8 @@ run_step "[10/20] Go-dark generate" \
   python3 "$MAIN_PY" make_godark \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_GODARK" \
-  --limit_rows "$LIMIT_ROWS" \
+  --limit_rows "$SOURCE_LIMIT_ROWS" \
+  --exclude_labels "${source_exclude_labels[@]}" \
   --max_vessels_per_file 20 \
   --min_points_per_vessel 120 \
   --events_per_vessel 6 \
@@ -285,7 +319,8 @@ run_step "[16/20] Transshipment candidate generate" \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_TRANS" \
   --mode both \
-  --limit_rows "$LIMIT_ROWS" \
+  --limit_rows "$SOURCE_LIMIT_ROWS" \
+  --exclude_labels "${source_exclude_labels[@]}" \
   --max_vessels_per_file 60 \
   --min_points_per_vessel 40 \
   --grid_minutes 10 \

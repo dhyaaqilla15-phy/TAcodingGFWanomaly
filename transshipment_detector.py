@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 from dataload import read_ais_csv
-from data_preparation import haversine_km_np
+from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, haversine_km_np
 
 try:
     from sklearn.neighbors import BallTree
@@ -90,6 +90,7 @@ class TransshipmentCfg:
     limit_rows: int = 0
     chunksize: int = 0
     sample_frac: float = 0.0
+    exclude_labels: Sequence[str] = DEFAULT_SOURCE_EXCLUDE_LABELS
 
     max_vessels_per_file: int = 60
     min_points_per_vessel: int = 40
@@ -121,6 +122,26 @@ class TransshipmentCfg:
 
 def _wrap_lon(lon: np.ndarray) -> np.ndarray:
     return ((lon + 180.0) % 360.0) - 180.0
+
+
+def _label_set(labels: Sequence[str] | None) -> set[str]:
+    return {str(label).strip().lower() for label in (labels or []) if str(label).strip()}
+
+
+def _input_csvs(input_path: Path, exclude_labels: Sequence[str] | None) -> List[Path]:
+    excluded = _label_set(exclude_labels)
+    if input_path.is_dir():
+        csvs = sorted(input_path.glob("*.csv"))
+    else:
+        csvs = [input_path]
+
+    if excluded:
+        skipped = [p for p in csvs if p.stem.strip().lower() in excluded]
+        csvs = [p for p in csvs if p.stem.strip().lower() not in excluded]
+        if skipped:
+            names = ", ".join(p.name for p in skipped)
+            print(f"[transshipment] exclude source labels={sorted(excluded)} skipped={names}")
+    return csvs
 
 
 def _angle_diff_deg(a: np.ndarray | float, b: np.ndarray | float) -> np.ndarray:
@@ -186,10 +207,7 @@ def _prep_base_df(df: pd.DataFrame, gear_label: str, gear_id: int) -> pd.DataFra
 
 def _read_input_path(input_path: Path, cfg: TransshipmentCfg) -> pd.DataFrame:
     input_path = Path(input_path)
-    if input_path.is_dir():
-        csvs = sorted(input_path.glob("*.csv"))
-    else:
-        csvs = [input_path]
+    csvs = _input_csvs(input_path, cfg.exclude_labels)
     if not csvs:
         raise FileNotFoundError(f"No CSV found in {input_path}")
 

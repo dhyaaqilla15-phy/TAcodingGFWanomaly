@@ -64,12 +64,16 @@ unknown.csv
 
 ## Preprocess gear
 
+Secara default pipeline gear final memakai 4 kelas training: `drifting_longlines`,
+`fixed_gear`, `purse_seines`, dan `trawlers`. Label `unknown`, `pole_and_line`,
+dan `trollers` dikeluarkan dari preprocess training.
+
 ```bash
 python3 main.py preprocess \
   --data_dir "Dataset" \
   --out_dir outputs_gear \
   --task gear \
-  --exclude_labels unknown
+  --exclude_labels unknown pole_and_line trollers
 ```
 
 Output:
@@ -147,12 +151,15 @@ mirroring
 
 ## Generate spoofing
 
+Generator spoofing default-nya tidak memakai sumber `pole_and_line` dan `trollers`.
+
 ```bash
 python3 main.py make_spoofing \
   --input_path "Dataset" \
   --out_dir outputs_spoofing \
   --attacks gradual_drift location_jump replay meaconing ghost mirroring \
   --limit_rows 300000 \
+  --exclude_labels pole_and_line trollers \
   --normal_keep_frac 0.25 \
   --max_vessels_per_file 20 \
   --points_per_attack 120 \
@@ -239,11 +246,14 @@ Go-dark berarti kapal menghilang dari AIS/GPS selama periode tertentu, lalu munc
 
 ## Generate go-dark
 
+Generator go-dark default-nya tidak memakai sumber `pole_and_line` dan `trollers`.
+
 ```bash
 python3 main.py make_godark \
   --input_path "Dataset" \
   --out_dir outputs_godark \
   --limit_rows 300000 \
+  --exclude_labels pole_and_line trollers \
   --max_vessels_per_file 20 \
   --min_points_per_vessel 120 \
   --events_per_vessel 1 \
@@ -365,12 +375,15 @@ Transshipment di AIS tidak bisa membuktikan transfer ikan/barang secara langsung
 
 ## Generate transshipment candidates
 
+Generator transshipment default-nya tidak memakai sumber `pole_and_line` dan `trollers`.
+
 ```bash
 python3 main.py make_transshipment \
   --input_path "Dataset" \
   --out_dir outputs_transshipment \
   --mode both \
   --limit_rows 300000 \
+  --exclude_labels pole_and_line trollers \
   --max_vessels_per_file 60 \
   --grid_minutes 10 \
   --encounter_distance_km 0.5 \
@@ -500,6 +513,8 @@ Default script ini akan:
 
 - membaca data dari `Dataset`
 - menyimpan hasil ke `output/run01`
+- memproses gear dari full CSV (`GEAR_LIMIT_ROWS=0`) supaya split vessel-level stabil
+- membatasi generator spoofing/go-dark/transshipment dengan `SOURCE_LIMIT_ROWS=300000`
 - menjalankan `gear`, `spoofing`, `go-dark`, dan `transshipment` sampai `eval`
 
 Kalau mau ganti folder data dan output:
@@ -512,6 +527,12 @@ Kalau mau ganti device atau seed:
 
 ```bash
 DEVICE=cuda SEED=43 bash run_all_pipeline.sh
+```
+
+Kalau ingin mengubah batas baris generator tanpa memotong gear:
+
+```bash
+DEVICE=cuda SOURCE_LIMIT_ROWS=300000 bash run_all_pipeline.sh Dataset Outputs/run01
 ```
 
 ---

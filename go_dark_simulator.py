@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 from dataload import read_ais_csv
-from data_preparation import haversine_km_np, bearing_deg_np
+from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, haversine_km_np, bearing_deg_np
 
 
 NAUTICAL_MILE_KM = 1.852
@@ -41,6 +41,7 @@ class GoDarkSimCfg:
     limit_rows: int = 0
     chunksize: int = 0
     sample_frac: float = 0.0
+    exclude_labels: Sequence[str] = DEFAULT_SOURCE_EXCLUDE_LABELS
 
     # Vessel dan event sampling
     max_vessels_per_file: int = 20
@@ -79,6 +80,26 @@ class GoDarkSimCfg:
     
     # Output
     combine_outputs: bool = False
+
+
+def _label_set(labels: Sequence[str] | None) -> set[str]:
+    return {str(label).strip().lower() for label in (labels or []) if str(label).strip()}
+
+
+def _input_csvs(input_path: Path, exclude_labels: Sequence[str] | None) -> List[Path]:
+    excluded = _label_set(exclude_labels)
+    if input_path.is_dir():
+        csvs = sorted(input_path.glob("*.csv"))
+    else:
+        csvs = [input_path]
+
+    if excluded:
+        skipped = [p for p in csvs if p.stem.strip().lower() in excluded]
+        csvs = [p for p in csvs if p.stem.strip().lower() not in excluded]
+        if skipped:
+            names = ", ".join(p.name for p in skipped)
+            print(f"[godark] exclude source labels={sorted(excluded)} skipped={names}")
+    return csvs
 
 
 def _prep_base_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -657,10 +678,7 @@ def generate_go_dark_dataset(input_path: Path, out_dir: Path, cfg: GoDarkSimCfg)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if input_path.is_dir():
-        csvs = sorted(input_path.glob("*.csv"))
-    else:
-        csvs = [input_path]
+    csvs = _input_csvs(input_path, cfg.exclude_labels)
 
     if not csvs:
         raise FileNotFoundError(f"No CSV found in {input_path}")

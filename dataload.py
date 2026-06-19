@@ -44,20 +44,25 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.rename(columns=rename)
 
-    # timestamp string -> epoch seconds
-    if "timestamp" in df.columns and df["timestamp"].dtype == "object":
-        t = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-        df["timestamp"] = (t.view("int64") // 10**9).astype("Int64")
-
-    # numeric timestamp: detect ms -> seconds
-    if "timestamp" in df.columns and df["timestamp"].dtype != "object":
+    if "timestamp" in df.columns:
         ts = pd.to_numeric(df["timestamp"], errors="coerce")
+        if ts.isna().any():
+            t = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+            if t.isna().any():
+                t_mixed = pd.to_datetime(df["timestamp"], errors="coerce", utc=True, format="mixed")
+                t = t.fillna(t_mixed)
+            t_ns = t.to_numpy(dtype="datetime64[ns]").astype("int64")
+            ts_iso = pd.Series(t_ns // 10**9, index=df.index).where(t.notna(), float("nan"))
+            ts = ts.fillna(ts_iso)
         if ts.notna().any():
             med = float(ts.dropna().median())
-            if med > 1e11:  # ms epoch
-                df["timestamp"] = (ts / 1000.0).round().astype("Int64")
-            else:
-                df["timestamp"] = ts.round().astype("Int64")
+            if med > 1e14:  # ns epoch
+                ts = ts / 1e9
+            elif med > 1e11:  # ms epoch
+                ts = ts / 1000.0
+            elif med > 1e8:
+                ts = ts
+        df["timestamp"] = ts.round().astype("Int64")
 
     return df
 

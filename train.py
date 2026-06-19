@@ -653,6 +653,8 @@ def train_from_npz(
     test_size: float = 0.2,
     val_size: float = 0.15,
     random_state: int = 42,
+    split_random_state: int | None = None,
+    train_random_state: int | None = None,
     device: str = "auto",
     early_stop_patience: int = 90,
     use_ema: bool = True,
@@ -682,8 +684,10 @@ def train_from_npz(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     train_t0 = time.perf_counter()
+    split_seed = int(random_state if split_random_state is None else split_random_state)
+    train_seed = int(random_state if train_random_state is None else train_random_state)
     determinism_settings = apply_determinism(
-        seed=int(random_state),
+        seed=int(train_seed),
         enabled=bool(deterministic),
         warn_only=bool(deterministic_warn_only),
     )
@@ -698,7 +702,7 @@ def train_from_npz(
             pass
     print(
         "[train] determinism "
-        f"enabled={bool(deterministic)} seed={int(random_state)} "
+        f"enabled={bool(deterministic)} train_seed={int(train_seed)} split_seed={int(split_seed)} "
         f"cudnn_benchmark={bool(torch.backends.cudnn.benchmark)} "
         f"cudnn_deterministic={bool(torch.backends.cudnn.deterministic)}"
     )
@@ -759,7 +763,7 @@ def train_from_npz(
         X, y, groups,
         val_size=val_size,
         test_size=test_size,
-        random_state=random_state,
+        random_state=split_seed,
         stratify_groups=True,
         max_tries=400,
     )
@@ -768,6 +772,8 @@ def train_from_npz(
         train_idx=split.train_idx,
         val_idx=split.val_idx,
         test_idx=split.test_idx,
+        split_random_state=np.array([split_seed], dtype=np.int64),
+        train_random_state=np.array([train_seed], dtype=np.int64),
     )
 
     scaler_path = out_dir / "scaler.joblib"
@@ -814,7 +820,7 @@ def train_from_npz(
             out_path=tabular_path,
             rule_features=(rule_features[split.train_idx] if rule_features is not None else None),
             rule_cols=rule_cols,
-            random_state=random_state,
+            random_state=train_seed,
         )
         if ok_tabular:
             print(f"[train] transshipment tabular baseline saved -> {tabular_path}")
@@ -916,14 +922,14 @@ def train_from_npz(
             num_classes=num_classes,
             batch_size=batch_size,
             vessels_per_batch=vessels_per_batch,
-            seed=random_state,
+            seed=train_seed,
         )
         train_loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=0)
     else:
         cw_cpu = class_w.detach().cpu().numpy().astype(np.float64)
         sample_weights = cw_cpu[np.asarray(y_train, dtype=np.int64)]
         sampler_generator = torch.Generator()
-        sampler_generator.manual_seed(int(random_state))
+        sampler_generator.manual_seed(int(train_seed))
         sampler = WeightedRandomSampler(
             weights=torch.as_tensor(sample_weights, dtype=torch.double),
             num_samples=int(len(sample_weights)),
@@ -1460,6 +1466,8 @@ def train_from_npz(
                     "sgd_momentum": float(sgd_momentum),
                     "scaler_path": str(scaler_path),
                     "random_state": int(random_state),
+                    "split_random_state": int(split_seed),
+                    "train_random_state": int(train_seed),
                     "deterministic": bool(deterministic),
                     "deterministic_warn_only": bool(deterministic_warn_only),
                     "determinism_settings": determinism_settings,
@@ -1602,6 +1610,8 @@ def train_from_npz(
                 "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                 "geo_aux_scale_km": float(geo_aux_scale_km),
                 "random_state": int(random_state),
+                "split_random_state": int(split_seed),
+                "train_random_state": int(train_seed),
                 "deterministic": bool(deterministic),
                 "deterministic_warn_only": bool(deterministic_warn_only),
                 "determinism_settings": determinism_settings,
@@ -1750,6 +1760,8 @@ def train_from_npz(
                 "test_size": float(test_size),
                 "val_size": float(val_size),
                 "random_state": int(random_state),
+                "split_random_state": int(split_seed),
+                "train_random_state": int(train_seed),
                 "deterministic": bool(deterministic),
                 "deterministic_warn_only": bool(deterministic_warn_only),
                 "determinism_settings": determinism_settings,

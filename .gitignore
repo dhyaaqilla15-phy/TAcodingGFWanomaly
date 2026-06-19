@@ -10,8 +10,12 @@ venv/
 # Training/data artifacts
 output/
 outputs/
+Outputs/
 outputs_*/
 Dataset/
+Dataset_Test/
+Dataset_Test_Enriched/
+data_external/
 *.pt
 *.pth
 *.npz

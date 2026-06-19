@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -43,6 +44,9 @@ def _row_for(model_dir: Path) -> dict[str, object]:
     return {
         "run": run_name,
         "seed": train.get("random_state"),
+        "split_seed": train.get("split_random_state", train.get("random_state")),
+        "train_seed": train.get("train_random_state", train.get("random_state")),
+        "deterministic": train.get("deterministic"),
         "epochs": train.get("epochs"),
         "geo_aux_weight": train.get("geo_aux_weight"),
         "gear_minority_f1_weight": train.get("gear_minority_f1_weight"),
@@ -64,7 +68,12 @@ def _row_for(model_dir: Path) -> dict[str, object]:
         "test_balanced_acc": mv.get("balanced_acc"),
         "test_accuracy": mv.get("accuracy"),
         "test_weighted_f1": mv.get("weighted_f1"),
+        "test_viable_macro_f1": (eval_summary.get("metrics_vessel_viable") or {}).get("macro_f1"),
+        "test_viable_balanced_acc": (eval_summary.get("metrics_vessel_viable") or {}).get("balanced_acc"),
+        "test_viable_accuracy": (eval_summary.get("metrics_vessel_viable") or {}).get("accuracy"),
+        "test_viable_weighted_f1": (eval_summary.get("metrics_vessel_viable") or {}).get("weighted_f1"),
         "seq_macro_f1": ms.get("macro_f1"),
+        "seq_viable_macro_f1": (eval_summary.get("metrics_seq_viable") or {}).get("macro_f1"),
         "wrong_high_confidence_count": eval_summary.get("wrong_high_confidence_count"),
         "drifting_longlines_f1": per_class.get("drifting_longlines"),
         "fixed_gear_f1": per_class.get("fixed_gear"),
@@ -73,6 +82,54 @@ def _row_for(model_dir: Path) -> dict[str, object]:
         "trawlers_f1": per_class.get("trawlers"),
         "trollers_f1": per_class.get("trollers"),
     }
+
+
+def _to_float(v: object) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(x):
+        return None
+    return x
+
+
+def _mean_std(values: list[float]) -> dict[str, float | int | None]:
+    vals = [float(v) for v in values if v is not None]
+    n = len(vals)
+    if n == 0:
+        return {"n": 0, "mean": None, "std": None, "min": None, "max": None}
+    mean = sum(vals) / n
+    if n > 1:
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+        std = math.sqrt(var)
+    else:
+        std = 0.0
+    return {"n": n, "mean": mean, "std": std, "min": min(vals), "max": max(vals)}
+
+
+def _write_stats(rows: list[dict[str, object]], out_path: Path) -> None:
+    metrics = [
+        "test_accuracy",
+        "test_macro_f1",
+        "test_balanced_acc",
+        "test_weighted_f1",
+        "test_viable_accuracy",
+        "test_viable_macro_f1",
+        "test_viable_balanced_acc",
+        "test_viable_weighted_f1",
+        "seq_macro_f1",
+        "seq_viable_macro_f1",
+        "wrong_high_confidence_count",
+    ]
+    stats = {
+        metric: _mean_std([x for x in (_to_float(row.get(metric)) for row in rows) if x is not None])
+        for metric in metrics
+    }
+    out_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    print(f"[summarize_gear_trials] stats -> {out_path}")
 
 
 def main() -> None:
@@ -84,6 +141,9 @@ def main() -> None:
     fieldnames = [
         "run",
         "seed",
+        "split_seed",
+        "train_seed",
+        "deterministic",
         "epochs",
         "geo_aux_weight",
         "gear_minority_f1_weight",
@@ -105,7 +165,12 @@ def main() -> None:
         "test_balanced_acc",
         "test_accuracy",
         "test_weighted_f1",
+        "test_viable_macro_f1",
+        "test_viable_balanced_acc",
+        "test_viable_accuracy",
+        "test_viable_weighted_f1",
         "seq_macro_f1",
+        "seq_viable_macro_f1",
         "wrong_high_confidence_count",
         "drifting_longlines_f1",
         "fixed_gear_f1",
@@ -120,6 +185,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     print(f"[summarize_gear_trials] wrote {len(rows)} rows -> {out_path}")
+    _write_stats(rows, out_path.with_name(out_path.stem + "_stats.json"))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from data_preparation import build_sequences_to_npz
+from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, build_sequences_to_npz
 from train import train_from_npz
 from eval import evaluate
 from plot_trajectory import (
@@ -37,7 +37,15 @@ def main():
     p.add_argument("--data_dir", required=True)
     p.add_argument("--out_dir", required=True)
     p.add_argument("--task", default="gear", choices=["gear", "fishing", "spoofing", "godark", "transshipment"])
-    p.add_argument("--exclude_labels", nargs="*", default=[])
+    p.add_argument(
+        "--exclude_labels",
+        nargs="*",
+        default=[],
+        help=(
+            "Label CSV yang dikeluarkan. Untuk task=gear, unknown, pole_and_line, "
+            "dan trollers selalu ikut dikeluarkan agar training memakai 4 kelas final."
+        ),
+    )
     p.add_argument("--limit_rows", type=int, default=0)
     p.add_argument("--chunksize", type=int, default=0)
     p.add_argument("--seq_len", type=int, default=120)
@@ -58,6 +66,13 @@ def main():
         action="store_true",
         help="Opsional: downsample window gear agar setiap kelas punya jumlah sama. Default off karena training sudah memakai class/vessel balancing.",
     )
+    p.add_argument(
+        "--use_operational_filter",
+        action="store_true",
+        help="Filter titik AIS berdasarkan speed operasional sebelum windowing. Untuk eksperimen gear.",
+    )
+    p.add_argument("--op_speed_min", type=float, default=1.0)
+    p.add_argument("--op_speed_max", type=float, default=12.0)
     p.add_argument("--spoofing_window_threshold", type=float, default=0.20)
     p.add_argument(
         "--transshipment_target",
@@ -76,6 +91,11 @@ def main():
         action="store_true",
         help="Default task=spoofing, task=godark, dan task=transshipment tidak membuang jump. Flag ini memaksa jump filter aktif.",
     )
+    p.add_argument(
+        "--no_jump_filter",
+        action="store_true",
+        help="Matikan jump filter. Berguna untuk external test yang sudah berupa segmen/track terkurasi.",
+    )
 
     # ===== train =====
     t = sub.add_parser("train")
@@ -83,6 +103,18 @@ def main():
     t.add_argument("--out_dir", required=True)
     t.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     t.add_argument("--random_state", type=int, default=42)
+    t.add_argument(
+        "--split_random_state",
+        type=int,
+        default=None,
+        help="Seed khusus pembagian train/val/test. Kosong = ikut --random_state.",
+    )
+    t.add_argument(
+        "--train_random_state",
+        type=int,
+        default=None,
+        help="Seed khusus inisialisasi/training/sampler. Kosong = ikut --random_state.",
+    )
     t.add_argument("--test_size", type=float, default=0.2)
     t.add_argument("--val_size", type=float, default=0.15)
     t.add_argument("--epochs", type=int, default=320)
@@ -225,8 +257,20 @@ def main():
     e.add_argument("--out_dir", required=True)
     e.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     e.add_argument("--random_state", type=int, default=42)
+    e.add_argument(
+        "--split_random_state",
+        type=int,
+        default=None,
+        help="Seed split saat eval jika split_indices.npz tidak ada. Kosong = checkpoint split seed atau --random_state.",
+    )
     e.add_argument("--test_size", type=float, default=0.2)
     e.add_argument("--batch_size", type=int, default=64)
+    e.add_argument(
+        "--eval_split",
+        default="test",
+        choices=["train", "val", "validation", "test", "all"],
+        help="Split yang dievaluasi. Pakai all untuk external test NPZ penuh.",
+    )
     e.add_argument(
         "--godark_event_prob_threshold",
         type=float,
@@ -305,6 +349,12 @@ def main():
     sp.add_argument("--chunksize", type=int, default=0)
     sp.add_argument("--sample_frac", type=float, default=0.0)
     sp.add_argument("--normal_keep_frac", type=float, default=1.0)
+    sp.add_argument(
+        "--exclude_labels",
+        nargs="*",
+        default=list(DEFAULT_SOURCE_EXCLUDE_LABELS),
+        help="Label sumber CSV yang dikeluarkan dari generator spoofing. Default: pole_and_line trollers.",
+    )
     sp.add_argument("--max_vessels_per_file", type=int, default=20)
     sp.add_argument("--min_points_per_vessel", type=int, default=80)
     sp.add_argument("--points_per_attack", type=int, default=120)
@@ -355,6 +405,12 @@ def main():
     gd.add_argument("--limit_rows", type=int, default=0)
     gd.add_argument("--chunksize", type=int, default=0)
     gd.add_argument("--sample_frac", type=float, default=0.0)
+    gd.add_argument(
+        "--exclude_labels",
+        nargs="*",
+        default=list(DEFAULT_SOURCE_EXCLUDE_LABELS),
+        help="Label sumber CSV yang dikeluarkan dari generator go-dark. Default: pole_and_line trollers.",
+    )
     gd.add_argument("--max_vessels_per_file", type=int, default=20)
     gd.add_argument("--min_points_per_vessel", type=int, default=120)
     gd.add_argument("--events_per_vessel", type=int, default=1)
@@ -424,6 +480,12 @@ def main():
     tx.add_argument("--limit_rows", type=int, default=0)
     tx.add_argument("--chunksize", type=int, default=0)
     tx.add_argument("--sample_frac", type=float, default=0.0)
+    tx.add_argument(
+        "--exclude_labels",
+        nargs="*",
+        default=list(DEFAULT_SOURCE_EXCLUDE_LABELS),
+        help="Label sumber CSV yang dikeluarkan dari generator transshipment. Default: pole_and_line trollers.",
+    )
     tx.add_argument("--max_vessels_per_file", type=int, default=60)
     tx.add_argument("--min_points_per_vessel", type=int, default=40)
     tx.add_argument("--grid_minutes", type=int, default=10)
@@ -499,10 +561,17 @@ def main():
             max_windows_per_vessel=int(args.max_windows_per_vessel),
             max_windows_per_file=int(args.max_windows_per_file),
             balance_gear_classes=bool(args.balance_gear_classes),
+            use_operational_filter=bool(args.use_operational_filter),
+            op_speed_min=float(args.op_speed_min),
+            op_speed_max=float(args.op_speed_max),
             spoofing_window_threshold=float(args.spoofing_window_threshold),
             transshipment_target=str(args.transshipment_target),
             transshipment_feature_mode=str(args.transshipment_feature_mode),
-            apply_jump_filter=(True if bool(args.apply_jump_filter) else None),
+            apply_jump_filter=(
+                False
+                if bool(args.no_jump_filter)
+                else (True if bool(args.apply_jump_filter) else None)
+            ),
         )
 
     elif args.cmd == "train":
@@ -526,6 +595,8 @@ def main():
             sgd_momentum=float(args.sgd_momentum),
             device=args.device,
             random_state=int(args.random_state),
+            split_random_state=(None if args.split_random_state is None else int(args.split_random_state)),
+            train_random_state=(None if args.train_random_state is None else int(args.train_random_state)),
             deterministic=(not bool(args.non_deterministic)),
             deterministic_warn_only=(not bool(args.strict_deterministic)),
             test_size=float(args.test_size),
@@ -572,6 +643,8 @@ def main():
             batch_size=int(args.batch_size),
             test_size=float(args.test_size),
             random_state=int(args.random_state),
+            split_random_state=(None if args.split_random_state is None else int(args.split_random_state)),
+            eval_split=str(args.eval_split),
             godark_event_prob_threshold=(
                 None if float(args.godark_event_prob_threshold) < 0.0 else float(args.godark_event_prob_threshold)
             ),
@@ -635,6 +708,7 @@ def main():
             chunksize=int(args.chunksize),
             sample_frac=float(args.sample_frac),
             normal_keep_frac=float(args.normal_keep_frac),
+            exclude_labels=list(args.exclude_labels),
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
             points_per_attack=int(args.points_per_attack),
@@ -687,6 +761,7 @@ def main():
             limit_rows=int(args.limit_rows),
             chunksize=int(args.chunksize),
             sample_frac=float(args.sample_frac),
+            exclude_labels=list(args.exclude_labels),
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
             events_per_vessel=int(args.events_per_vessel),
@@ -740,6 +815,7 @@ def main():
             limit_rows=int(args.limit_rows),
             chunksize=int(args.chunksize),
             sample_frac=float(args.sample_frac),
+            exclude_labels=list(args.exclude_labels),
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
             grid_minutes=int(args.grid_minutes),

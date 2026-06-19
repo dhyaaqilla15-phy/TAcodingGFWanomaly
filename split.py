@@ -344,13 +344,57 @@ def group_train_val_test_split(
     y = np.asarray(y).astype(np.int64)
     groups = np.asarray(groups)
 
-    if val_size <= 0 or test_size <= 0 or (val_size + test_size) >= 1:
-        raise ValueError("val_size and test_size must be > 0 and sum to < 1.")
+    if val_size <= 0 or test_size < 0 or (val_size + test_size) >= 1:
+        raise ValueError("val_size must be > 0, test_size must be >= 0, and sum to < 1.")
 
     num_classes = int(np.max(y)) + 1 if y.size else 1
     uniq = np.unique(groups)
-    if uniq.size < 3:
-        raise ValueError("Need at least 3 unique groups for a non-overlapping train/val/test split.")
+    if uniq.size < (3 if test_size > 0 else 2):
+        raise ValueError("Need more unique groups for a non-overlapping group split.")
+
+    if float(test_size) == 0.0:
+        uniq_labels, labels, groups_str = _group_labels(y, groups)
+        rng = np.random.RandomState(random_state)
+        train_groups: list[str] = []
+        val_groups: list[str] = []
+
+        if stratify_groups:
+            for c in range(num_classes):
+                cls_groups = uniq_labels[labels == c].copy()
+                if cls_groups.size < 2:
+                    raise RuntimeError(
+                        "Could not create a train/val split with every class present "
+                        "in both splits. Add more vessels or reduce classes."
+                    )
+                rng.shuffle(cls_groups)
+                n_val = max(1, int(round(cls_groups.size * float(val_size))))
+                if n_val >= cls_groups.size:
+                    n_val = cls_groups.size - 1
+                val_groups.extend(cls_groups[:n_val].tolist())
+                train_groups.extend(cls_groups[n_val:].tolist())
+        else:
+            g_train, g_val = train_test_split(
+                uniq,
+                test_size=val_size,
+                random_state=random_state,
+                shuffle=True,
+            )
+            train_groups = np.asarray(g_train).astype(str).tolist()
+            val_groups = np.asarray(g_val).astype(str).tolist()
+
+        split = _indices_from_group_sets(
+            groups_str=np.asarray(groups).astype(str),
+            train_groups=train_groups,
+            val_groups=val_groups,
+            test_groups=[],
+        )
+        if split.train_idx.size == 0 or split.val_idx.size == 0:
+            raise RuntimeError("Could not create a non-empty train/val split.")
+        if not _validate_class_distribution(split.train_idx, split.val_idx, y, groups, num_classes):
+            raise RuntimeError(
+                "Could not create a train/val split with every class present in both splits."
+            )
+        return split
 
     if not stratify_groups:
         trainval_size = 1.0 - float(test_size)

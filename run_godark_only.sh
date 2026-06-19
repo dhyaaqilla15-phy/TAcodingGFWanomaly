@@ -8,6 +8,7 @@ RUN_DIR="${2:-$ROOT_DIR/output/run04}"
 DEVICE="${DEVICE:-auto}"
 SEED="${SEED:-42}"
 LIMIT_ROWS="${LIMIT_ROWS:-300000}"
+SOURCE_EXCLUDE_LABELS="${SOURCE_EXCLUDE_LABELS:-pole_and_line trollers}"
 
 usage() {
   cat <<EOF
@@ -22,6 +23,7 @@ Optional environment variables:
   DEVICE=auto|cpu|cuda
   SEED=42
   LIMIT_ROWS=300000
+  SOURCE_EXCLUDE_LABELS="pole_and_line trollers"
 
 Example:
   bash run_godark_only.sh
@@ -44,6 +46,8 @@ OUT_GODARK="$RUN_DIR/godark"
 
 mkdir -p "$OUT_GODARK"
 
+read -r -a source_exclude_labels <<< "$SOURCE_EXCLUDE_LABELS"
+
 run_step() {
   echo
   echo "============================================================"
@@ -61,12 +65,14 @@ echo "[pipeline] run_dir  = $RUN_DIR"
 echo "[pipeline] device   = $DEVICE"
 echo "[pipeline] seed     = $SEED"
 echo "[pipeline] limit    = $LIMIT_ROWS"
+echo "[pipeline] source_exclude_labels = $SOURCE_EXCLUDE_LABELS"
 
 run_step "[1/4] Go-dark generate (AGGRESSIVE: 5x events, 100 label_after)" \
   python3 "$MAIN_PY" make_godark \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_GODARK" \
   --limit_rows "$LIMIT_ROWS" \
+  --exclude_labels "${source_exclude_labels[@]}" \
   --max_vessels_per_file 20 \
   --min_points_per_vessel 120 \
   --events_per_vessel 5 \

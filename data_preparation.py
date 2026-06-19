@@ -11,6 +11,10 @@ from tqdm import tqdm
 from dataload import read_ais_csv, infer_label_from_filename
 
 
+DEFAULT_SOURCE_EXCLUDE_LABELS = ("pole_and_line", "trollers")
+DEFAULT_GEAR_EXCLUDE_LABELS = ("unknown", *DEFAULT_SOURCE_EXCLUDE_LABELS)
+
+
 SEQ_FEATURE_COLS = [
     "speed",
     "vx",
@@ -123,6 +127,32 @@ def _transshipment_feature_cols(mode: str) -> List[str]:
     return list(TRANS_MODEL_FEATURE_COLS_FAIR)
 
 
+def _normalize_exclude_labels(task: str, exclude_labels: Optional[List[str]]) -> List[str]:
+    labels = [str(label) for label in (exclude_labels or []) if str(label).strip()]
+    if str(task) != "gear":
+        return labels
+
+    seen = set(labels)
+    for label in DEFAULT_GEAR_EXCLUDE_LABELS:
+        if label not in seen:
+            labels.append(label)
+            seen.add(label)
+    return labels
+
+
+def timestamp_to_epoch_seconds(values: pd.Series) -> pd.Series:
+    ts_num = pd.to_numeric(values, errors="coerce")
+    if ts_num.isna().any():
+        ts_dt = pd.to_datetime(values, errors="coerce", utc=True)
+        if ts_dt.isna().any():
+            ts_dt_mixed = pd.to_datetime(values, errors="coerce", utc=True, format="mixed")
+            ts_dt = ts_dt.fillna(ts_dt_mixed)
+        ts_ns = ts_dt.to_numpy(dtype="datetime64[ns]").astype("int64")
+        ts_iso = pd.Series(ts_ns // 10**9, index=values.index).where(ts_dt.notna(), np.nan)
+        ts_num = ts_num.fillna(ts_iso)
+    return ts_num
+
+
 def haversine_km_np(lat1, lon1, lat2, lon2) -> np.ndarray:
     r = 6371.0088
     lat1 = np.deg2rad(lat1)
@@ -165,7 +195,7 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
 
     df = df.dropna(subset=["mmsi", "timestamp", "lat", "lon"]).copy()
 
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    df["timestamp"] = timestamp_to_epoch_seconds(df["timestamp"])
     df = df.dropna(subset=["timestamp"]).copy()
     df["timestamp"] = df["timestamp"].astype("int64")
 
@@ -1115,6 +1145,9 @@ def build_sequences_to_npz(
     max_windows_per_vessel: int = 1200,
     max_windows_per_file: int = 20000,
     balance_gear_classes: bool = False,
+    use_operational_filter: bool = False,
+    op_speed_min: float = 1.0,
+    op_speed_max: float = 12.0,
     spoofing_window_threshold: float = 0.20,
     transshipment_target: str = "multiclass",
     transshipment_feature_mode: str = "fair",
@@ -1129,6 +1162,13 @@ def build_sequences_to_npz(
     if task == "transshipment" and int(min_points_per_vessel) == 80:
         min_points_per_vessel = 3
 
+    if str(task) == "gear" and int(limit_rows) > 0:
+        print(
+            "[preprocess] WARNING: task=gear is using limit_rows="
+            f"{int(limit_rows)}. This reads only the first rows of each gear CSV "
+            "and can leave too few vessels for stable vessel-level validation."
+        )
+
     cfg = PreprocessCfg(
         task=task,
         seq_len=int(seq_len),
@@ -1140,13 +1180,16 @@ def build_sequences_to_npz(
         max_windows_per_vessel=int(max_windows_per_vessel),
         max_windows_per_file=int(max_windows_per_file),
         balance_gear_classes=bool(balance_gear_classes),
+        use_operational_filter=bool(use_operational_filter),
+        op_speed_min=float(op_speed_min),
+        op_speed_max=float(op_speed_max),
         spoofing_window_threshold=float(spoofing_window_threshold),
         transshipment_target=str(transshipment_target),
         transshipment_feature_mode=str(transshipment_feature_mode),
         apply_jump_filter=bool(apply_jump_filter),
     )
 
-    exclude_labels = exclude_labels or []
+    exclude_labels = _normalize_exclude_labels(task, exclude_labels)
 
     csvs = sorted(list(Path(data_dir).glob("*.csv")))
 
@@ -1200,6 +1243,11 @@ def build_sequences_to_npz(
         f"min_windows_per_vessel={cfg.min_windows_per_vessel}"
     )
     print(f"[preprocess] max_windows_per_file={cfg.max_windows_per_file}")
+    if cfg.use_operational_filter:
+        print(
+            "[preprocess] operational_filter enabled: "
+            f"speed between {cfg.op_speed_min:g} and {cfg.op_speed_max:g} knots"
+        )
 
     for p in tqdm(csvs, desc="files"):
         stem = infer_label_from_filename(p)
