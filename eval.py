@@ -397,6 +397,7 @@ def evaluate(
                 val_size=0.05,
                 test_size=test_size,
                 random_state=eval_split_seed,
+                mixed_label_groups=(task_name == "spoofing"),
             )
             split_lookup = {
                 "train": split.train_idx,

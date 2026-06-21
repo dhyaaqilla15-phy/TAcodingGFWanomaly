@@ -334,6 +334,7 @@ def group_train_val_test_split(
     random_state: int = 42,
     stratify_groups: bool = True,
     max_tries: int = 400,
+    mixed_label_groups: bool = False,
 ) -> Split3Result:
     """
     Three-way group split (no vessel leakage).
@@ -353,6 +354,61 @@ def group_train_val_test_split(
         raise ValueError("Need more unique groups for a non-overlapping group split.")
 
     if float(test_size) == 0.0:
+        if mixed_label_groups:
+            groups_str = np.asarray(groups).astype(str)
+            all_classes = np.unique(y).astype(np.int64)
+            class_totals = np.bincount(
+                y,
+                minlength=max(num_classes, 1),
+            ).astype(np.float64)
+            best_split: Split3Result | None = None
+            best_score = float("inf")
+
+            for k in range(max_tries):
+                g_train, g_val = train_test_split(
+                    uniq,
+                    test_size=val_size,
+                    random_state=int(random_state + k),
+                    shuffle=True,
+                )
+                candidate = _indices_from_group_sets(
+                    groups_str=groups_str,
+                    train_groups=np.asarray(g_train).astype(str).tolist(),
+                    val_groups=np.asarray(g_val).astype(str).tolist(),
+                    test_groups=[],
+                )
+                if not _validate_window_distribution(
+                    candidate.train_idx,
+                    candidate.val_idx,
+                    y,
+                    num_classes,
+                ):
+                    continue
+
+                val_counts = np.bincount(
+                    y[candidate.val_idx],
+                    minlength=max(num_classes, 1),
+                ).astype(np.float64)
+                total_fraction = float(candidate.val_idx.size) / max(len(y), 1)
+                class_fractions = val_counts[all_classes] / np.maximum(
+                    class_totals[all_classes],
+                    1.0,
+                )
+                score = abs(total_fraction - float(val_size))
+                score += float(
+                    np.mean(np.abs(class_fractions - float(val_size)))
+                )
+                if score < best_score:
+                    best_score = score
+                    best_split = candidate
+
+            if best_split is None:
+                raise RuntimeError(
+                    "Could not create a leakage-free mixed-label train/val "
+                    "split with every window class present in both splits."
+                )
+            return best_split
+
         uniq_labels, labels, groups_str = _group_labels(y, groups)
         rng = np.random.RandomState(random_state)
         train_groups: list[str] = []

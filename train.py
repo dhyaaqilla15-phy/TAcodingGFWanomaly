@@ -787,6 +787,7 @@ def train_from_npz(
         random_state=split_seed,
         stratify_groups=True,
         max_tries=400,
+        mixed_label_groups=(task_name == "spoofing"),
     )
     np.savez_compressed(
         out_dir / "split_indices.npz",

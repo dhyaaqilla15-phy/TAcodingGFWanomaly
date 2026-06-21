@@ -16,6 +16,9 @@
 - Preprocess, training, and evaluation assert the fixed binary mapping
   `0=normal`, `1=spoofing`; positive probabilities and true positives always
   refer to the anomaly class.
+- Train/validation splitting is group-disjoint by `original_mmsi` and uses a
+  mixed-label group strategy, because each source vessel contains both normal
+  and spoofing windows. Both window classes are required in each split.
 - Normal trajectory retention is 50%, so a 300-point eligible source still
   has enough contiguous normal points for a 120-point window.
 - Location-jump state and detectable jump-boundary labels are stored
