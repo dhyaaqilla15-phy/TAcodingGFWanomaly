@@ -13,6 +13,9 @@
 - Natural validation prevalence is retained. Training handles imbalance with
   class weights, focal loss, and a weighted sampler; validation is not
   artificially balanced, so precision and PR-AUC remain interpretable.
+- Preprocess, training, and evaluation assert the fixed binary mapping
+  `0=normal`, `1=spoofing`; positive probabilities and true positives always
+  refer to the anomaly class.
 - Normal trajectory retention is 50%, so a 300-point eligible source still
   has enough contiguous normal points for a 120-point window.
 - Location-jump state and detectable jump-boundary labels are stored

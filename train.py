@@ -714,6 +714,15 @@ def train_from_npz(
     task_name = _task_name_from_label_map(label_map)
     metric_scope = _primary_metric_scope(task_name)
     if task_name == "spoofing":
+        normalized_label_map = {
+            int(key): str(value).strip().lower()
+            for key, value in label_map.items()
+        }
+        if normalized_label_map != {0: "normal", 1: "spoofing"}:
+            raise ValueError(
+                "Spoofing requires label_map {0: 'normal', 1: 'spoofing'}; "
+                f"got {normalized_label_map}."
+            )
         aug_cfg = AugCfg(
             p_aug=0.30,
             p_time_mask=0.0,

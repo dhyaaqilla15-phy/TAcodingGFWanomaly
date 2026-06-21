@@ -349,6 +349,16 @@ def evaluate(
     num_classes = int(len(label_map))
     labels = [label_map.get(i, str(i)) for i in range(num_classes)]
     task_name = _task_name_from_label_map(label_map)
+    if task_name == "spoofing":
+        normalized_label_map = {
+            int(key): str(value).strip().lower()
+            for key, value in label_map.items()
+        }
+        if normalized_label_map != {0: "normal", 1: "spoofing"}:
+            raise ValueError(
+                "Spoofing evaluation requires class 1 to be the anomaly; "
+                f"got {normalized_label_map}."
+            )
 
     dev = pick_device(device)
 

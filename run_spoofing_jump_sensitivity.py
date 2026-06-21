@@ -303,15 +303,29 @@ def validate_npz(npz_path: Path) -> None:
     data = np.load(npz_path, allow_pickle=True)
     y = data["y"].astype(np.int64)
     groups = data["groups"].astype(str)
+    label_map = {
+        int(key): str(value).strip().lower()
+        for key, value in data["label_map"].tolist()
+    }
     classes = sorted(np.unique(y).astype(int).tolist())
-    kinds = set(data["window_kinds"].astype(str).tolist())
+    kinds_array = np.char.lower(data["window_kinds"].astype(str))
+    kinds = set(kinds_array.tolist())
     features = set(data["feature_cols"].astype(str).tolist())
+    if label_map != {0: "normal", 1: "spoofing"}:
+        raise RuntimeError(f"Label spoofing tertukar atau tidak valid: {label_map}.")
     if classes != [0, 1]:
         raise RuntimeError(f"NPZ harus memiliki dua kelas; ditemukan {classes}.")
     if not {"gradual_drift", "location_jump"}.issubset(kinds):
         raise RuntimeError(f"Jenis serangan tidak lengkap: {sorted(kinds)}.")
     if {"distance_from_shore", "distance_from_port"} & features:
         raise RuntimeError("Fitur lokasi absolut tidak boleh masuk spoofing.")
+    if np.any((kinds_array == "normal") & (y == 1)):
+        raise RuntimeError("Ditemukan window normal dengan target anomali (1).")
+    positive_kinds = set(kinds_array[y == 1].tolist())
+    if not positive_kinds.issubset({"gradual_drift", "location_jump"}):
+        raise RuntimeError(
+            f"Target anomali berasal dari jenis tidak valid: {positive_kinds}."
+        )
     positive_count = int(np.sum(y == 1))
     positive_ratio = float(np.mean(y == 1))
     positive_groups = int(np.unique(groups[y == 1]).size)
