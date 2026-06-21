@@ -15,7 +15,9 @@
 - Location-jump state and detectable jump-boundary labels are stored
   separately; motion-only training labels only windows that contain the jump.
 - Each synthetic scenario records nominal/applied coordinate offsets and the
-  resulting displacement in kilometres.
+  resulting displacement in kilometres, duration, and gradual-drift rate.
+- Attack segments cannot cross a timestamp gap above three hours, preventing
+  natural AIS outages from becoming a synthetic spoofing shortcut.
 - Evaluation writes PR-AUC, ROC-AUC, sequence/scenario predictions, and
   metrics per attack type.
 
@@ -125,6 +127,8 @@ Do not sweep everything at once. Use internal validation only.
    - drift magnitude: 0.01, 0.03, 0.05, 0.08 degrees.
    `location_jump` is event-labelled at the jump boundary, so the fraction
    threshold is not applied to it.
+   Because AIS reporting cadence varies, always report `attack_duration_hours`.
+   For gradual drift, compare `attack_drift_rate_kmh`, not only total degrees.
 3. Model capacity:
    - hidden size: 128, 256;
    - LSTM layers: 1, 2;
@@ -136,6 +140,15 @@ Do not sweep everything at once. Use internal validation only.
 5. Confirm the best two or three model configurations on seeds 42-46.
 6. Freeze generation, preprocessing, model, and decision threshold, then
    evaluate `Dataset_Test_Enriched` once.
+
+## Fixed, Not Tuned
+
+- split grouping by `original_mmsi`;
+- maximum continuity gap of three hours;
+- exclusion of absolute shore/port-distance features;
+- geographic auxiliary weight of zero;
+- external-test membership;
+- random seed (used for robustness measurement, not model selection).
 
 ## Required Ablations
 

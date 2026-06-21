@@ -369,6 +369,7 @@ def main():
     sp.add_argument("--max_vessels_per_file", type=int, default=20)
     sp.add_argument("--min_points_per_vessel", type=int, default=80)
     sp.add_argument("--points_per_attack", type=int, default=120)
+    sp.add_argument("--max_attack_gap_seconds", type=int, default=10800)
     sp.add_argument("--drift_lat_deg", type=float, default=0.08)
     sp.add_argument("--drift_lon_deg", type=float, default=0.08)
     sp.add_argument("--jump_lat_deg", type=float, default=0.70)
@@ -725,6 +726,7 @@ def main():
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
             points_per_attack=int(args.points_per_attack),
+            max_attack_gap_seconds=int(args.max_attack_gap_seconds),
             drift_lat_deg=float(args.drift_lat_deg),
             drift_lon_deg=float(args.drift_lon_deg),
             jump_lat_deg=float(args.jump_lat_deg),

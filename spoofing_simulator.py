@@ -42,6 +42,7 @@ class SpoofingSimCfg:
     max_vessels_per_file: int = 20
     min_points_per_vessel: int = 80
     points_per_attack: int = 120
+    max_attack_gap_seconds: int = 3 * 3600
 
     # parameter spoofing
     drift_lat_deg: float = 0.08
@@ -185,19 +186,45 @@ def _choose_vessels(df: pd.DataFrame, cfg: SpoofingSimCfg, rng: np.random.Random
     return [int(x) for x in eligible.tolist()]
 
 
-def _segment(g: pd.DataFrame, n_points: int, rng: np.random.RandomState, extra: int = 0) -> pd.DataFrame:
+def _segment(
+    g: pd.DataFrame,
+    n_points: int,
+    rng: np.random.RandomState,
+    extra: int = 0,
+    max_gap_seconds: int = 3 * 3600,
+) -> pd.DataFrame:
     g = g.sort_values("timestamp").reset_index(drop=True)
     need = int(n_points) + int(extra)
     if len(g) < need:
         return pd.DataFrame(columns=g.columns)
-    start_max = len(g) - need
-    start = int(rng.randint(0, start_max + 1)) if start_max > 0 else 0
-    return g.iloc[start:start + need].copy().reset_index(drop=True)
+    ts = g["timestamp"].to_numpy(dtype=np.int64)
+    gap = np.diff(ts)
+    breaks = np.where((gap <= 0) | (gap > int(max_gap_seconds)))[0] + 1
+    starts = np.r_[0, breaks]
+    ends = np.r_[breaks, len(g)]
+    candidates: list[tuple[int, int]] = []
+    total_starts = 0
+    for start, end in zip(starts, ends):
+        count = int(end - start - need + 1)
+        if count > 0:
+            candidates.append((int(start), count))
+            total_starts += count
+    if total_starts <= 0:
+        return pd.DataFrame(columns=g.columns)
+    selected = int(rng.randint(0, total_starts))
+    for run_start, count in candidates:
+        if selected < count:
+            start = run_start + selected
+            return g.iloc[start:start + need].copy().reset_index(drop=True)
+        selected -= count
+    raise RuntimeError("Failed to select a contiguous spoofing segment.")
 
 
 def _recompute_speed_course(seg: pd.DataFrame) -> pd.DataFrame:
     """Hitung ulang speed/course dari lat/lon/timestamp agar manipulasi tetap konsisten."""
     seg = seg.sort_values(["mmsi", "timestamp"]).copy()
+    seg["speed"] = pd.to_numeric(seg["speed"], errors="coerce").fillna(0.0).astype(float)
+    seg["course"] = pd.to_numeric(seg["course"], errors="coerce").fillna(0.0).astype(float)
     for _, idx in seg.groupby("mmsi", sort=False).groups.items():
         idx = np.array(list(idx), dtype=object)
         if len(idx) < 2:
@@ -263,8 +290,23 @@ def _finish_attack(
         if attack in CONTEXT_REQUIRED_ATTACKS
         else "single_window_kinematic"
     )
+    seg["attack_points"] = int(len(seg))
+    seg["attack_duration_hours"] = float(
+        max(
+            0.0,
+            (float(seg["timestamp"].max()) - float(seg["timestamp"].min()))
+            / 3600.0,
+        )
+    )
     for key, value in (magnitude or {}).items():
         seg[key] = float(value)
+    displacement_km = float(seg.get("attack_displacement_km", pd.Series([0.0])).iloc[0])
+    duration_hours = float(seg["attack_duration_hours"].iloc[0])
+    seg["attack_drift_rate_kmh"] = (
+        displacement_km / duration_hours
+        if attack == "gradual_drift" and duration_hours > 0.0
+        else 0.0
+    )
     return seg
 
 
@@ -289,7 +331,12 @@ def _attack_gradual_drift(
     sid: str,
     scenario_mmsi: int,
 ) -> pd.DataFrame:
-    seg = _segment(g, cfg.points_per_attack, rng)
+    seg = _segment(
+        g,
+        cfg.points_per_attack,
+        rng,
+        max_gap_seconds=cfg.max_attack_gap_seconds,
+    )
     if seg.empty:
         return seg
     frac = np.linspace(0.0, 1.0, len(seg), dtype=float)
@@ -331,7 +378,12 @@ def _attack_location_jump(
     sid: str,
     scenario_mmsi: int,
 ) -> pd.DataFrame:
-    seg = _segment(g, cfg.points_per_attack, rng)
+    seg = _segment(
+        g,
+        cfg.points_per_attack,
+        rng,
+        max_gap_seconds=cfg.max_attack_gap_seconds,
+    )
     if seg.empty:
         return seg
     cut_lo = max(1, len(seg) // 3)
@@ -384,7 +436,12 @@ def _attack_replay(
     sid: str,
     scenario_mmsi: int,
 ) -> pd.DataFrame:
-    seg = _segment(g, cfg.points_per_attack, rng)
+    seg = _segment(
+        g,
+        cfg.points_per_attack,
+        rng,
+        max_gap_seconds=cfg.max_attack_gap_seconds,
+    )
     if seg.empty:
         return seg
     start_new = int(g["timestamp"].max()) + int(cfg.replay_delay_seconds) + int(rng.randint(0, 1800))
@@ -402,7 +459,13 @@ def _attack_meaconing(
     scenario_mmsi: int,
 ) -> pd.DataFrame:
     lag = max(1, int(cfg.meacon_lag_steps))
-    seg = _segment(g, cfg.points_per_attack, rng, extra=lag)
+    seg = _segment(
+        g,
+        cfg.points_per_attack,
+        rng,
+        extra=lag,
+        max_gap_seconds=cfg.max_attack_gap_seconds,
+    )
     if seg.empty or len(seg) <= lag:
         return pd.DataFrame(columns=g.columns)
 
@@ -426,7 +489,12 @@ def _attack_ghost(
     sid: str,
     scenario_mmsi: int,
 ) -> pd.DataFrame:
-    seg = _segment(g, cfg.points_per_attack, rng)
+    seg = _segment(
+        g,
+        cfg.points_per_attack,
+        rng,
+        max_gap_seconds=cfg.max_attack_gap_seconds,
+    )
     if seg.empty:
         return seg
 
@@ -450,7 +518,12 @@ def _attack_mirroring(
     sid: str,
     scenario_mmsi: int,
 ) -> pd.DataFrame:
-    seg = _segment(g, cfg.points_per_attack, rng)
+    seg = _segment(
+        g,
+        cfg.points_per_attack,
+        rng,
+        max_gap_seconds=cfg.max_attack_gap_seconds,
+    )
     if seg.empty:
         return seg
 
@@ -528,6 +601,9 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
     normal["attack_applied_lat_deg"] = 0.0
     normal["attack_applied_lon_deg"] = 0.0
     normal["attack_displacement_km"] = 0.0
+    normal["attack_points"] = 0
+    normal["attack_duration_hours"] = 0.0
+    normal["attack_drift_rate_kmh"] = 0.0
 
     vessels = _choose_vessels(df, cfg, rng)
     if not vessels:
@@ -589,6 +665,9 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
         "attack_applied_lat_deg",
         "attack_applied_lon_deg",
         "attack_displacement_km",
+        "attack_points",
+        "attack_duration_hours",
+        "attack_drift_rate_kmh",
     ]
     magnitude_summary = (
         merged.loc[merged["attack_type"] != "normal", magnitude_cols]
