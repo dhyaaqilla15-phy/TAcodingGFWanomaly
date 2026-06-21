@@ -152,6 +152,59 @@ def _sequence_feature_cols(cfg: PreprocessCfg) -> List[str]:
     return [c for c in SEQ_FEATURE_COLS if c not in LOCATION_FEATURE_COLS]
 
 
+def _select_spoofing_cap_indices(
+    y: np.ndarray,
+    kinds: np.ndarray,
+    max_count: int,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    n = int(len(y))
+    if max_count <= 0 or n <= max_count:
+        return np.arange(n, dtype=np.int64)
+
+    y = np.asarray(y, dtype=np.int64)
+    kinds = np.asarray(kinds).astype(str)
+    positive_idx = np.where(y == 1)[0]
+    normal_idx = np.where(y == 0)[0]
+
+    # Keep attack diversity first. Positive spoofing scenarios are scarce and
+    # must not disappear through a global random cap dominated by normal data.
+    positive_budget = min(
+        int(positive_idx.size),
+        max(1, int(round(max_count * 0.50))),
+    )
+    selected_positive: List[np.ndarray] = []
+    attack_names = sorted(np.unique(kinds[positive_idx]).tolist())
+    remaining_budget = positive_budget
+    for pos, attack in enumerate(attack_names):
+        idx = positive_idx[kinds[positive_idx] == attack]
+        attacks_left = len(attack_names) - pos
+        take = min(
+            int(idx.size),
+            max(1, remaining_budget // max(attacks_left, 1)),
+        )
+        if idx.size > take:
+            idx = rng.choice(idx, size=take, replace=False)
+        selected_positive.append(np.asarray(idx, dtype=np.int64))
+        remaining_budget -= int(len(idx))
+
+    pos_keep = (
+        np.concatenate(selected_positive)
+        if selected_positive
+        else np.zeros((0,), dtype=np.int64)
+    )
+    normal_budget = max_count - int(pos_keep.size)
+    if normal_idx.size > normal_budget:
+        normal_idx = rng.choice(
+            normal_idx,
+            size=normal_budget,
+            replace=False,
+        )
+    keep = np.concatenate([pos_keep, np.asarray(normal_idx, dtype=np.int64)])
+    rng.shuffle(keep)
+    return keep
+
+
 def timestamp_to_epoch_seconds(values: pd.Series) -> pd.Series:
     ts_num = pd.to_numeric(values, errors="coerce")
     if ts_num.isna().any():
@@ -1019,6 +1072,24 @@ def build_sequences_from_df(
 
         feat = g[feat_cols].to_numpy(dtype=np.float32)
         coords = g[["timestamp", "lat", "lon", "y_point"]].to_numpy(dtype=np.float64)
+        split_group_id = str(vessel_id)
+        spoof_scenario_ids = np.array([str(vessel_id)] * len(g), dtype=object)
+        spoof_attack_types = np.array(["normal"] * len(g), dtype=object)
+        if cfg.task == "spoofing":
+            if "original_mmsi" in g.columns:
+                source_ids = g["original_mmsi"].dropna().astype(str).unique()
+                if source_ids.size != 1:
+                    raise ValueError(
+                        "Each spoofing scenario trajectory must map to exactly "
+                        f"one original_mmsi; got {source_ids.tolist()}."
+                    )
+                split_group_id = str(source_ids[0])
+            if "scenario_id" in g.columns:
+                spoof_scenario_ids = g["scenario_id"].astype(str).to_numpy()
+            if "attack_type" in g.columns:
+                spoof_attack_types = (
+                    g["attack_type"].astype(str).str.lower().to_numpy()
+                )
         event_ids = (
             g.get("go_dark_event_id", pd.Series("normal", index=g.index))
             .astype(str)
@@ -1139,10 +1210,23 @@ def build_sequences_from_df(
 
                 X_list.append(window)
                 y_list.append(y_win)
-                g_list.append(vessel_id)
+                g_list.append(split_group_id)
                 coord_list.append(coord_window)
-                event_id_list.append(str(vessel_id))
-                kind_list.append("positive_event" if y_win else "normal_random")
+                if cfg.task == "spoofing":
+                    scenario_values = spoof_scenario_ids[
+                        s + i:s + i + cfg.seq_len
+                    ]
+                    attack_values = spoof_attack_types[
+                        s + i:s + i + cfg.seq_len
+                    ]
+                    event_id_list.append(str(scenario_values[0]))
+                    attack_counts = pd.Series(attack_values).value_counts()
+                    kind_list.append(str(attack_counts.index[0]))
+                else:
+                    event_id_list.append(str(vessel_id))
+                    kind_list.append(
+                        "positive_event" if y_win else "normal_random"
+                    )
                 win_count += 1
 
                 if (
@@ -1209,6 +1293,14 @@ def build_sequences_to_npz(
 
     if apply_jump_filter is None:
         apply_jump_filter = task not in ["spoofing", "godark", "transshipment"]
+
+    if str(task) == "spoofing" and bool(use_location_features):
+        print(
+            "[preprocess] WARNING: disabling distance_from_shore and "
+            "distance_from_port for spoofing. Synthetic coordinate attacks do "
+            "not have recomputed geospatial distance rasters."
+        )
+        use_location_features = False
 
     if task == "transshipment" and int(min_points_per_vessel) == 80:
         min_points_per_vessel = 3
@@ -1344,6 +1436,13 @@ def build_sequences_to_npz(
             rng = np.random.RandomState(42)
             if task == "godark":
                 idx = _select_godark_indices(y, window_kinds, int(cfg.max_windows_per_file), rng)
+            elif task == "spoofing":
+                idx = _select_spoofing_cap_indices(
+                    y,
+                    window_kinds,
+                    int(cfg.max_windows_per_file),
+                    rng,
+                )
             else:
                 idx = rng.choice(len(X), size=cfg.max_windows_per_file, replace=False)
 

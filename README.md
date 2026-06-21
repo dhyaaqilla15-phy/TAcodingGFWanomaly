@@ -149,6 +149,12 @@ ghost
 mirroring
 ```
 
+Eksperimen utama hanya memakai `gradual_drift` dan `location_jump`, karena
+keduanya dapat menghasilkan perubahan kinematik di dalam satu window.
+`replay`, `meaconing`, `ghost`, dan `mirroring` memerlukan konteks historis,
+identitas silang, atau referensi geospasial eksternal dan harus dilaporkan
+sebagai eksperimen keterbatasan terpisah.
+
 ## Generate spoofing
 
 Generator spoofing default-nya tidak memakai sumber `pole_and_line` dan `trollers`.
@@ -157,7 +163,7 @@ Generator spoofing default-nya tidak memakai sumber `pole_and_line` dan `troller
 python3 main.py make_spoofing \
   --input_path "Dataset" \
   --out_dir outputs_spoofing \
-  --attacks gradual_drift location_jump replay meaconing ghost mirroring \
+  --attacks gradual_drift location_jump \
   --limit_rows 300000 \
   --exclude_labels pole_and_line trollers \
   --normal_keep_frac 0.25 \
@@ -235,8 +241,22 @@ Output penting:
 outputs_spoofing/model_spoofing/confusion_matrix.png
 outputs_spoofing/model_spoofing/confusion_matrix_normalized.png
 outputs_spoofing/model_spoofing/per_vessel_predictions.csv
+outputs_spoofing/model_spoofing/spoofing_sequence_predictions.csv
+outputs_spoofing/model_spoofing/spoofing_attack_metrics.csv
 outputs_spoofing/model_spoofing/eval_summary.json
 ```
+
+Untuk eksperimen multiseed yang memisahkan internal train/validation dan
+external test:
+
+```bash
+python3 run_spoofing_multiseed.py run
+```
+
+Pipeline spoofing otomatis menonaktifkan fitur jarak pantai/pelabuhan dan
+geographic auxiliary loss karena koordinat sintetis tidak memiliki distance
+raster yang dihitung ulang. Pemisahan split menggunakan `original_mmsi`, bukan
+ID trajectory sintetis.
 
 ---
 

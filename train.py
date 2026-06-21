@@ -713,6 +713,18 @@ def train_from_npz(
     input_size = int(X.shape[-1])
     task_name = _task_name_from_label_map(label_map)
     metric_scope = _primary_metric_scope(task_name)
+    if task_name == "spoofing":
+        aug_cfg = AugCfg(
+            p_aug=0.30,
+            p_time_mask=0.0,
+            p_feat_mask=0.0,
+            p_jitter=0.20,
+            noise_std=0.008,
+        )
+        print(
+            "[train] spoofing augmentation: time/feature masking disabled; "
+            "small jitter retained to avoid erasing the anomaly signal."
+        )
     godark_event_prob_thresholds = [
         float(v) for v in (godark_event_prob_thresholds or list(DEFAULT_GODARK_EVENT_PROB_THRESHOLDS))
     ]
@@ -740,6 +752,13 @@ def train_from_npz(
     if task_name == "godark" and not has_window_metadata:
         print("[train] WARNING: NPZ has no Go-Dark window_event_ids/window_kinds; event-level model selection is disabled.")
     use_geo_aux = bool(float(geo_aux_weight) > 0.0 and coords is not None)
+    if task_name == "spoofing" and use_geo_aux:
+        print(
+            "[train] WARNING: geo auxiliary loss disabled for spoofing. "
+            "Predicting absolute coordinates can encourage geographic "
+            "memorization instead of manipulation detection."
+        )
+        use_geo_aux = False
     if float(geo_aux_weight) > 0.0 and coords is None:
         print("[train] WARNING: NPZ has no coords; Haversine auxiliary loss is disabled.")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
@@ -12,6 +13,8 @@ from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, haversine_km_np, bea
 
 
 DEFAULT_ATTACKS = ["gradual_drift", "location_jump", "replay", "meaconing", "ghost", "mirroring"]
+DEFAULT_DETECTABLE_ATTACKS = ["gradual_drift", "location_jump"]
+CONTEXT_REQUIRED_ATTACKS = {"replay", "meaconing", "ghost", "mirroring"}
 
 
 @dataclass
@@ -25,7 +28,7 @@ class SpoofingSimCfg:
     bisa dipakai.
     """
 
-    attacks: List[str] = field(default_factory=lambda: DEFAULT_ATTACKS.copy())
+    attacks: List[str] = field(default_factory=lambda: DEFAULT_DETECTABLE_ATTACKS.copy())
     seed: int = 42
 
     # sampling agar aman untuk dataset besar
@@ -58,7 +61,7 @@ class SpoofingSimCfg:
 
 def _as_list(attacks: Sequence[str] | str | None) -> List[str]:
     if attacks is None:
-        return DEFAULT_ATTACKS.copy()
+        return DEFAULT_DETECTABLE_ATTACKS.copy()
     if isinstance(attacks, str):
         attacks = [a.strip() for a in attacks.replace(",", " ").split() if a.strip()]
     out = []
@@ -69,7 +72,13 @@ def _as_list(attacks: Sequence[str] | str | None) -> List[str]:
     bad = sorted(set(out) - set(DEFAULT_ATTACKS))
     if bad:
         raise ValueError(f"Unknown attack(s): {bad}. Pilihan: {DEFAULT_ATTACKS}")
-    return out or DEFAULT_ATTACKS.copy()
+    return out or DEFAULT_DETECTABLE_ATTACKS.copy()
+
+
+def _stable_seed(base_seed: int, text: str) -> int:
+    digest = hashlib.sha256(str(text).encode("utf-8")).digest()
+    offset = int.from_bytes(digest[:8], byteorder="little", signed=False)
+    return int((int(base_seed) + offset) % (2**32 - 1))
 
 
 def _label_set(labels: Sequence[str] | None) -> set[str]:
@@ -149,7 +158,17 @@ def _read_input_csv(path: Path, cfg: SpoofingSimCfg) -> pd.DataFrame:
     df = _prep_base_df(df)
 
     if cfg.sample_frac and 0.0 < cfg.sample_frac < 1.0:
-        df = df.sample(frac=float(cfg.sample_frac), random_state=int(cfg.seed)).copy()
+        vessels = np.sort(df["mmsi"].unique())
+        keep_count = max(1, int(round(len(vessels) * float(cfg.sample_frac))))
+        rng = np.random.RandomState(_stable_seed(int(cfg.seed), path.stem))
+        keep_vessels = rng.choice(
+            vessels,
+            size=min(keep_count, len(vessels)),
+            replace=False,
+        )
+        # Sample complete vessels, not random rows. Random row sampling destroys
+        # temporal continuity and creates artificial gaps in normal tracks.
+        df = df[df["mmsi"].isin(keep_vessels)].copy()
         df = df.sort_values(["mmsi", "timestamp"]).reset_index(drop=True)
 
     return df
@@ -205,16 +224,37 @@ def _recompute_speed_course(seg: pd.DataFrame) -> pd.DataFrame:
     return seg
 
 
-def _finish_attack(seg: pd.DataFrame, attack: str, original_mmsi: int, scenario_id: str) -> pd.DataFrame:
+def _finish_attack(
+    seg: pd.DataFrame,
+    attack: str,
+    original_mmsi: int,
+    scenario_id: str,
+    scenario_mmsi: int,
+    spoof_mask: np.ndarray | None = None,
+) -> pd.DataFrame:
     if seg.empty:
         return seg
+    # Every synthetic scenario needs its own trajectory ID. Reusing the source
+    # MMSI and timestamp would make preprocess drop either the normal or
+    # spoofed row as a duplicate.
+    seg["mmsi"] = int(scenario_mmsi)
     seg = _recompute_speed_course(seg)
-    seg["is_spoofing"] = 1
-    seg["label"] = "Spoofed"
+    if spoof_mask is None:
+        spoof_mask = np.ones(len(seg), dtype=bool)
+    spoof_mask = np.asarray(spoof_mask, dtype=bool)
+    if spoof_mask.shape[0] != len(seg):
+        raise ValueError("spoof_mask length must match attack segment length.")
+    seg["is_spoofing"] = spoof_mask.astype("int8")
+    seg["label"] = np.where(spoof_mask, "Spoofed", "Normal")
     seg["attack_type"] = attack
     seg["original_mmsi"] = str(original_mmsi)
     seg["scenario_id"] = scenario_id
     seg["note"] = f"synthetic_{attack}"
+    seg["identifiability"] = (
+        "context_required"
+        if attack in CONTEXT_REQUIRED_ATTACKS
+        else "single_window_kinematic"
+    )
     return seg
 
 
@@ -231,7 +271,14 @@ def _signed_uniform_offset(rng: np.random.RandomState, min_value: float, max_val
     return sign * float(rng.uniform(min_value, max_value))
 
 
-def _attack_gradual_drift(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.random.RandomState, sid: str) -> pd.DataFrame:
+def _attack_gradual_drift(
+    g: pd.DataFrame,
+    vessel: int,
+    cfg: SpoofingSimCfg,
+    rng: np.random.RandomState,
+    sid: str,
+    scenario_mmsi: int,
+) -> pd.DataFrame:
     seg = _segment(g, cfg.points_per_attack, rng)
     if seg.empty:
         return seg
@@ -240,10 +287,24 @@ def _attack_gradual_drift(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng
     lon_offset = _signed_offset(rng, cfg.drift_lon_deg)
     seg["lat"] = _clip_lat(seg["lat"].to_numpy(dtype=float) + frac * lat_offset)
     seg["lon"] = _wrap_lon(seg["lon"].to_numpy(dtype=float) + frac * lon_offset)
-    return _finish_attack(seg, "gradual_drift", vessel, sid)
+    return _finish_attack(
+        seg,
+        "gradual_drift",
+        vessel,
+        sid,
+        scenario_mmsi,
+        spoof_mask=frac > 0.0,
+    )
 
 
-def _attack_location_jump(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.random.RandomState, sid: str) -> pd.DataFrame:
+def _attack_location_jump(
+    g: pd.DataFrame,
+    vessel: int,
+    cfg: SpoofingSimCfg,
+    rng: np.random.RandomState,
+    sid: str,
+    scenario_mmsi: int,
+) -> pd.DataFrame:
     seg = _segment(g, cfg.points_per_attack, rng)
     if seg.empty:
         return seg
@@ -256,20 +317,43 @@ def _attack_location_jump(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng
     lon[cut:] = _wrap_lon(lon[cut:] + _signed_offset(rng, cfg.jump_lon_deg))
     seg["lat"] = lat
     seg["lon"] = lon
-    return _finish_attack(seg, "location_jump", vessel, sid)
+    spoof_mask = np.zeros(len(seg), dtype=bool)
+    spoof_mask[cut:] = True
+    return _finish_attack(
+        seg,
+        "location_jump",
+        vessel,
+        sid,
+        scenario_mmsi,
+        spoof_mask=spoof_mask,
+    )
 
 
-def _attack_replay(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.random.RandomState, sid: str) -> pd.DataFrame:
+def _attack_replay(
+    g: pd.DataFrame,
+    vessel: int,
+    cfg: SpoofingSimCfg,
+    rng: np.random.RandomState,
+    sid: str,
+    scenario_mmsi: int,
+) -> pd.DataFrame:
     seg = _segment(g, cfg.points_per_attack, rng)
     if seg.empty:
         return seg
     start_new = int(g["timestamp"].max()) + int(cfg.replay_delay_seconds) + int(rng.randint(0, 1800))
     delta = start_new - int(seg["timestamp"].iloc[0])
     seg["timestamp"] = seg["timestamp"].astype("int64") + int(delta)
-    return _finish_attack(seg, "replay", vessel, sid)
+    return _finish_attack(seg, "replay", vessel, sid, scenario_mmsi)
 
 
-def _attack_meaconing(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.random.RandomState, sid: str) -> pd.DataFrame:
+def _attack_meaconing(
+    g: pd.DataFrame,
+    vessel: int,
+    cfg: SpoofingSimCfg,
+    rng: np.random.RandomState,
+    sid: str,
+    scenario_mmsi: int,
+) -> pd.DataFrame:
     lag = max(1, int(cfg.meacon_lag_steps))
     seg = _segment(g, cfg.points_per_attack, rng, extra=lag)
     if seg.empty or len(seg) <= lag:
@@ -284,10 +368,17 @@ def _attack_meaconing(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np
         delayed["speed"] = old["speed"].to_numpy(dtype=float)
     if "course" in delayed.columns:
         delayed["course"] = old["course"].to_numpy(dtype=float)
-    return _finish_attack(delayed, "meaconing", vessel, sid)
+    return _finish_attack(delayed, "meaconing", vessel, sid, scenario_mmsi)
 
 
-def _attack_ghost(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.random.RandomState, sid: str, ghost_id: int) -> pd.DataFrame:
+def _attack_ghost(
+    g: pd.DataFrame,
+    vessel: int,
+    cfg: SpoofingSimCfg,
+    rng: np.random.RandomState,
+    sid: str,
+    scenario_mmsi: int,
+) -> pd.DataFrame:
     seg = _segment(g, cfg.points_per_attack, rng)
     if seg.empty:
         return seg
@@ -298,14 +389,20 @@ def _attack_ghost(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.ran
     lat_off = _signed_offset(rng, rng.uniform(min_off, max_off))
     lon_off = _signed_offset(rng, rng.uniform(min_off, max_off))
 
-    seg["mmsi"] = int(ghost_id)
     seg["lat"] = _clip_lat(seg["lat"].to_numpy(dtype=float) + lat_off)
     seg["lon"] = _wrap_lon(seg["lon"].to_numpy(dtype=float) + lon_off)
     seg["source"] = seg["source"].astype(str) + "_ghost"
-    return _finish_attack(seg, "ghost", vessel, sid)
+    return _finish_attack(seg, "ghost", vessel, sid, scenario_mmsi)
 
 
-def _attack_mirroring(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np.random.RandomState, sid: str) -> pd.DataFrame:
+def _attack_mirroring(
+    g: pd.DataFrame,
+    vessel: int,
+    cfg: SpoofingSimCfg,
+    rng: np.random.RandomState,
+    sid: str,
+    scenario_mmsi: int,
+) -> pd.DataFrame:
     seg = _segment(g, cfg.points_per_attack, rng)
     if seg.empty:
         return seg
@@ -316,7 +413,31 @@ def _attack_mirroring(g: pd.DataFrame, vessel: int, cfg: SpoofingSimCfg, rng: np
     seg["lat"] = _clip_lat(seg["lat"].to_numpy(dtype=float) + lat_off)
     seg["lon"] = _wrap_lon(seg["lon"].to_numpy(dtype=float) + lon_off)
     seg["source"] = seg["source"].astype(str) + "_mirroring"
-    return _finish_attack(seg, "mirroring", vessel, sid)
+    return _finish_attack(seg, "mirroring", vessel, sid, scenario_mmsi)
+
+
+def _sample_contiguous_normal(
+    df: pd.DataFrame,
+    keep_frac: float,
+    seed: int,
+) -> pd.DataFrame:
+    frac = float(keep_frac)
+    if frac >= 1.0:
+        return df.copy()
+    if frac <= 0.0:
+        return df.iloc[0:0].copy()
+
+    parts = []
+    for vessel, group in df.groupby("mmsi", sort=False):
+        group = group.sort_values("timestamp")
+        keep = max(1, int(round(len(group) * frac)))
+        if keep >= len(group):
+            parts.append(group)
+            continue
+        rng = np.random.RandomState(_stable_seed(seed, f"normal::{vessel}"))
+        start = int(rng.randint(0, len(group) - keep + 1))
+        parts.append(group.iloc[start:start + keep])
+    return pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0].copy()
 
 
 def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCfg) -> Path:
@@ -326,26 +447,34 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
     summary_dir = out_dir / "summaries"
     summary_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.RandomState(int(cfg.seed) + (abs(hash(csv_path.stem)) % 100_000))
+    rng = np.random.RandomState(_stable_seed(int(cfg.seed), csv_path.stem))
     attacks = _as_list(cfg.attacks)
+    context_attacks = sorted(set(attacks) & CONTEXT_REQUIRED_ATTACKS)
+    if context_attacks:
+        print(
+            "[spoof] WARNING: context-required attacks requested: "
+            f"{context_attacks}. They are not identifiable reliably from an "
+            "isolated kinematic window and must be reported separately."
+        )
 
     print(f"[spoof] read: {csv_path}")
     df = _read_input_csv(csv_path, cfg)
     if df.empty:
         raise RuntimeError(f"No valid rows in {csv_path}")
 
-    normal = df.copy()
-    if 0.0 < float(cfg.normal_keep_frac) < 1.0:
-        normal = normal.sample(frac=float(cfg.normal_keep_frac), random_state=int(cfg.seed)).copy()
-    elif float(cfg.normal_keep_frac) <= 0.0:
-        normal = normal.iloc[0:0].copy()
+    normal = _sample_contiguous_normal(
+        df,
+        keep_frac=float(cfg.normal_keep_frac),
+        seed=int(cfg.seed),
+    )
 
     normal["is_spoofing"] = 0
     normal["label"] = "Normal"
     normal["attack_type"] = "normal"
     normal["original_mmsi"] = normal["mmsi"].astype(str)
-    normal["scenario_id"] = "normal"
+    normal["scenario_id"] = "normal::" + normal["original_mmsi"]
     normal["note"] = "original_ais"
+    normal["identifiability"] = "normal"
 
     vessels = _choose_vessels(df, cfg, rng)
     if not vessels:
@@ -355,7 +484,7 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
         )
 
     spoof_parts = []
-    ghost_base = 900_000_000_000_000 + int(rng.randint(0, 50_000_000))
+    scenario_base = 900_000_000_000_000 + int(rng.randint(0, 50_000_000))
     scenario_no = 0
 
     for vessel in vessels:
@@ -363,19 +492,19 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
         for attack in attacks:
             scenario_no += 1
             sid = f"{csv_path.stem}_{attack}_{scenario_no:05d}"
+            scenario_mmsi = scenario_base + scenario_no
             if attack == "gradual_drift":
-                part = _attack_gradual_drift(g, vessel, cfg, rng, sid)
+                part = _attack_gradual_drift(g, vessel, cfg, rng, sid, scenario_mmsi)
             elif attack == "location_jump":
-                part = _attack_location_jump(g, vessel, cfg, rng, sid)
+                part = _attack_location_jump(g, vessel, cfg, rng, sid, scenario_mmsi)
             elif attack == "replay":
-                part = _attack_replay(g, vessel, cfg, rng, sid)
+                part = _attack_replay(g, vessel, cfg, rng, sid, scenario_mmsi)
             elif attack == "meaconing":
-                part = _attack_meaconing(g, vessel, cfg, rng, sid)
+                part = _attack_meaconing(g, vessel, cfg, rng, sid, scenario_mmsi)
             elif attack == "ghost":
-                ghost_id = ghost_base + scenario_no
-                part = _attack_ghost(g, vessel, cfg, rng, sid, ghost_id=ghost_id)
+                part = _attack_ghost(g, vessel, cfg, rng, sid, scenario_mmsi)
             elif attack == "mirroring":
-                part = _attack_mirroring(g, vessel, cfg, rng, sid)
+                part = _attack_mirroring(g, vessel, cfg, rng, sid, scenario_mmsi)
             else:
                 raise ValueError(attack)
 

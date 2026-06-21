@@ -188,7 +188,7 @@ run_step "[4/20] Spoofing generate" \
   python3 "$MAIN_PY" make_spoofing \
   --input_path "$DATA_DIR" \
   --out_dir "$OUT_SPOOF" \
-  --attacks gradual_drift location_jump replay meaconing ghost mirroring \
+  --attacks gradual_drift location_jump \
   --limit_rows "$SOURCE_LIMIT_ROWS" \
   --exclude_labels "${source_exclude_labels[@]}" \
   --normal_keep_frac 0.25 \
@@ -211,11 +211,11 @@ run_step "[6/20] Spoofing plot preprocessed trajectory" \
   --task spoofing \
   --max_windows 12
 
-run_step "[7/20] Spoofing plot attack examples (6 types)" \
+run_step "[7/20] Spoofing plot identifiable attack examples" \
   python3 "$MAIN_PY" plot_spoofing_examples \
   --csv_path "$OUT_SPOOF/spoofed_all.csv" \
   --out_dir "$OUT_SPOOF/plots/attacks" \
-  --attacks gradual_drift location_jump replay meaconing ghost mirroring
+  --attacks gradual_drift location_jump
 
 run_step "[8/20] Spoofing train" \
   python3 "$MAIN_PY" train \
@@ -233,7 +233,7 @@ run_step "[8/20] Spoofing train" \
   --attention_heads "$TRAIN_ATTENTION_HEADS" \
   --attention_layers "$TRAIN_ATTENTION_LAYERS" \
   --early_stop_patience "$TRAIN_EARLY_STOP_PATIENCE" \
-  --geo_aux_weight "$TRAIN_GEO_AUX_WEIGHT"
+  --geo_aux_weight 0
 
 run_step "[9/20] Spoofing eval" \
   python3 "$MAIN_PY" eval \

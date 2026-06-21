@@ -7,6 +7,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 
 from model import LSTMClassifier
@@ -576,6 +577,16 @@ def evaluate(
     confs = conf_score_from_probs(probs, mode=best_agg.conf_mode)
     pred_seq = np.argmax(probs, axis=1).astype(np.int64)
 
+    binary_ranking_metrics = None
+    if num_classes == 2 and np.unique(y_np).size == 2:
+        positive_probs = probs[:, 1].astype(np.float64)
+        binary_ranking_metrics = {
+            "average_precision": float(
+                average_precision_score(y_np, positive_probs)
+            ),
+            "roc_auc": float(roc_auc_score(y_np, positive_probs)),
+        }
+
     cm_seq = confusion_matrix_np(y_np, pred_seq, num_classes)
     m_seq = metrics_from_cm(cm_seq)
     known_limitation_labels = _known_limitation_labels(task_name, labels)
@@ -664,6 +675,139 @@ def evaluate(
         + _per_class_metric_rows(cm_v, labels, "vessel")
     )
     pd.DataFrame(per_class_rows).to_csv(per_class_path, index=False)
+
+    spoofing_attack_path = None
+    spoofing_sequence_path = None
+    spoofing_scenario_path = None
+    spoofing_scenario_metrics = None
+    spoofing_attack_rows = []
+    if task_name == "spoofing" and len(kinds_test) == len(y_np):
+        kinds_str = np.asarray(kinds_test).astype(str)
+        normal_mask = np.isin(
+            np.char.lower(kinds_str),
+            ["normal", "normal_random"],
+        )
+        attack_names = sorted(
+            {
+                str(kind).strip().lower()
+                for kind in kinds_str.tolist()
+                if str(kind).strip().lower()
+                not in {"", "normal", "normal_random", "unknown"}
+            }
+        )
+        context_required = {"replay", "meaconing", "ghost", "mirroring"}
+        for attack in attack_names:
+            attack_mask = np.char.lower(kinds_str) == attack
+            subset = normal_mask | attack_mask
+            if not subset.any():
+                continue
+            cm_attack = confusion_matrix_np(
+                y_np[subset],
+                pred_seq[subset],
+                num_classes,
+            )
+            metrics_attack = metrics_from_cm(cm_attack)
+            tp = int(cm_attack[1, 1]) if cm_attack.shape == (2, 2) else 0
+            fp = int(cm_attack[0, 1]) if cm_attack.shape == (2, 2) else 0
+            fn = int(cm_attack[1, 0]) if cm_attack.shape == (2, 2) else 0
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = (
+                2.0 * precision * recall / max(precision + recall, 1e-12)
+            )
+            spoofing_attack_rows.append(
+                {
+                    "attack_type": attack,
+                    "identifiability": (
+                        "context_required"
+                        if attack in context_required
+                        else "single_window_kinematic"
+                    ),
+                    "positive_windows": int(
+                        (attack_mask & (y_np == 1)).sum()
+                    ),
+                    "normal_windows": int((subset & (y_np == 0)).sum()),
+                    "tp": tp,
+                    "fp": fp,
+                    "fn": fn,
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "f1": float(f1),
+                    "accuracy": float(metrics_attack["accuracy"]),
+                    "balanced_acc": float(metrics_attack["balanced_acc"]),
+                    "macro_f1": float(metrics_attack["macro_f1"]),
+                }
+            )
+        spoofing_attack_path = out_dir / "spoofing_attack_metrics.csv"
+        pd.DataFrame(spoofing_attack_rows).to_csv(
+            spoofing_attack_path,
+            index=False,
+        )
+        spoofing_sequence_path = out_dir / "spoofing_sequence_predictions.csv"
+        pd.DataFrame(
+            {
+                "source_group": g_np.astype(str),
+                "scenario_id": np.asarray(event_ids_test).astype(str),
+                "attack_type": kinds_str,
+                "true_id": y_np.astype(int),
+                "pred_id": pred_seq.astype(int),
+                "spoofing_probability": probs[:, 1].astype(float),
+                "correct": (y_np == pred_seq),
+            }
+        ).to_csv(spoofing_sequence_path, index=False)
+
+        scenario_rows = []
+        scenario_ids_str = np.asarray(event_ids_test).astype(str)
+        for scenario_id in np.unique(scenario_ids_str):
+            idx = np.where(scenario_ids_str == scenario_id)[0]
+            scenario_true = int(np.max(y_np[idx]))
+            scenario_attack = str(
+                pd.Series(kinds_str[idx]).value_counts().index[0]
+            )
+            scenario_probs = probs[idx, 1].astype(np.float64)
+            top_count = max(1, int(np.ceil(len(idx) * 0.10)))
+            top_mean_probability = float(
+                np.mean(np.sort(scenario_probs)[-top_count:])
+            )
+            scenario_pred = int(top_mean_probability >= 0.50)
+            scenario_rows.append(
+                {
+                    "scenario_id": scenario_id,
+                    "source_group": str(g_np[idx[0]]),
+                    "attack_type": scenario_attack,
+                    "true_id": scenario_true,
+                    "pred_id": scenario_pred,
+                    "top10pct_mean_spoofing_probability": top_mean_probability,
+                    "n_windows": int(len(idx)),
+                    "correct": scenario_true == scenario_pred,
+                }
+            )
+        scenario_df = pd.DataFrame(scenario_rows)
+        spoofing_scenario_path = out_dir / "spoofing_scenario_predictions.csv"
+        scenario_df.to_csv(spoofing_scenario_path, index=False)
+        if not scenario_df.empty and scenario_df["true_id"].nunique() == 2:
+            scenario_true = scenario_df["true_id"].to_numpy(dtype=np.int64)
+            scenario_pred = scenario_df["pred_id"].to_numpy(dtype=np.int64)
+            scenario_score = scenario_df[
+                "top10pct_mean_spoofing_probability"
+            ].to_numpy(dtype=np.float64)
+            scenario_cm = confusion_matrix_np(
+                scenario_true,
+                scenario_pred,
+                num_classes,
+            )
+            spoofing_scenario_metrics = {
+                **metrics_from_cm(scenario_cm),
+                "average_precision": float(
+                    average_precision_score(scenario_true, scenario_score)
+                ),
+                "roc_auc": float(
+                    roc_auc_score(scenario_true, scenario_score)
+                ),
+                "threshold": 0.50,
+                "aggregation": "mean_top_10_percent_spoofing_probability",
+                "num_scenarios": int(len(scenario_df)),
+            }
 
     pv_name = "per_event_predictions.csv" if task_name == "transshipment" else "per_vessel_predictions.csv"
     pv_path = out_dir / pv_name
@@ -786,6 +930,26 @@ def evaluate(
         "wrong_high_confidence_table": str(wrong_high_conf_path),
         "wrong_high_confidence_threshold": float(high_conf_wrong_threshold),
         "wrong_high_confidence_count": int(len(wrong_high_conf_df)),
+        "spoofing_attack_metrics_table": (
+            str(spoofing_attack_path)
+            if spoofing_attack_path is not None
+            else None
+        ),
+        "spoofing_attack_metrics": (
+            spoofing_attack_rows if task_name == "spoofing" else None
+        ),
+        "spoofing_sequence_predictions_table": (
+            str(spoofing_sequence_path)
+            if spoofing_sequence_path is not None
+            else None
+        ),
+        "spoofing_scenario_predictions_table": (
+            str(spoofing_scenario_path)
+            if spoofing_scenario_path is not None
+            else None
+        ),
+        "spoofing_scenario_metrics": spoofing_scenario_metrics,
+        "binary_ranking_metrics": binary_ranking_metrics,
         "godark_event_prediction_table": (str(godark_event_path) if godark_event_path is not None else None),
         "godark_event_error_breakdown_table": (
             str(godark_event_breakdown_path) if godark_event_breakdown_path is not None else None

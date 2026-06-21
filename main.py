@@ -352,7 +352,7 @@ def main():
     sp.add_argument(
         "--attacks",
         nargs="*",
-        default=["gradual_drift", "location_jump", "replay", "meaconing", "ghost", "mirroring"],
+        default=["gradual_drift", "location_jump"],
         choices=["gradual_drift", "location_jump", "replay", "meaconing", "ghost", "mirroring"],
     )
     sp.add_argument("--seed", type=int, default=42)
