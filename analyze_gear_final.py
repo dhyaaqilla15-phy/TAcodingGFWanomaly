@@ -237,6 +237,77 @@ def create_final_confusion_matrices() -> None:
     )
 
 
+def create_final_validation_confusion_matrices() -> None:
+    out_dir = ANALYSIS_ROOT / "final_validation_confusion_matrices"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    seed46_eval = BASELINE_ROOT / "seed_46" / "validation_eval"
+    shutil.copy2(
+        seed46_eval / "confusion_matrix.png",
+        out_dir / "FINAL_VALIDATION_confusion_matrix_seed46.png",
+    )
+    shutil.copy2(
+        seed46_eval / "confusion_matrix_normalized.png",
+        out_dir / "FINAL_VALIDATION_confusion_matrix_seed46_normalized.png",
+    )
+
+    label_to_id = {label: idx for idx, label in enumerate(CLASS_LABELS)}
+    matrix = np.zeros((len(CLASS_LABELS), len(CLASS_LABELS)), dtype=np.int64)
+    pooled_rows = []
+    for seed in SEEDS:
+        path = (
+            BASELINE_ROOT
+            / f"seed_{seed}"
+            / "validation_eval"
+            / "per_vessel_predictions.csv"
+        )
+        for row in csv.DictReader(path.open(encoding="utf-8-sig")):
+            true_label = row["true_label"]
+            pred_label = row["pred_label"]
+            matrix[label_to_id[true_label], label_to_id[pred_label]] += 1
+            pooled_rows.append(
+                {
+                    "seed": seed,
+                    "mmsi": row["mmsi"],
+                    "true_label": true_label,
+                    "pred_label": pred_label,
+                    "correct": true_label == pred_label,
+                }
+            )
+
+    pd.DataFrame(pooled_rows).to_csv(
+        out_dir / "validation_pooled_5splits_predictions.csv",
+        index=False,
+    )
+    plot_confusion_matrix(
+        matrix,
+        CLASS_LABELS,
+        "Validation Confusion Matrix (5 splits, 115 vessel assignments)",
+        out_dir / "FINAL_VALIDATION_confusion_matrix_pooled_5splits.png",
+        normalized=False,
+    )
+    plot_confusion_matrix(
+        matrix,
+        CLASS_LABELS,
+        "Validation Confusion Matrix, Row Normalized (5 splits)",
+        out_dir
+        / "FINAL_VALIDATION_confusion_matrix_pooled_5splits_normalized.png",
+        normalized=True,
+    )
+    (out_dir / "README.md").write_text(
+        """# Final Validation Confusion Matrices
+
+- Use `FINAL_VALIDATION_confusion_matrix_seed46_normalized.png` as the main
+  validation confusion matrix for the representative checkpoint in Chapter 4.
+- The pooled five-split matrix is supporting evidence only.
+- Validation membership changes with the split seed. Therefore, the pooled
+  matrix contains 115 vessel assignments (23 per split), not 115 unique
+  vessels, and it is not a majority-vote consensus matrix.
+""",
+        encoding="utf-8",
+    )
+
+
 def vessel_data_audit(data: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (label, mmsi), group in data.groupby(["file_label", "mmsi"]):
@@ -536,6 +607,10 @@ test seed 46 karena seed tersebut digunakan sebagai checkpoint representatif.
 Confusion matrix konsensus lima seed dapat ditampilkan sebagai analisis
 pendukung kestabilan; matrix konsensus tetap berisi 21 kapal unik.
 
+Confusion matrix utama untuk Bab 4 menggunakan validation seed 46 agar sesuai
+dengan checkpoint representatif. Matrix pooled lima split hanya digunakan
+sebagai pendukung karena anggota validation berubah pada setiap seed.
+
 Performa per kelas menunjukkan bahwa purse seine dan trawler paling konsisten.
 Kelemahan utama terdapat pada drifting longlines dan fixed gear. Tiga kapal
 selalu salah pada kelima seed:
@@ -611,6 +686,7 @@ def main() -> None:
     write_report(manifest, predictions, vessel_audit)
     write_indonesian_summary()
     create_final_confusion_matrices()
+    create_final_validation_confusion_matrices()
     print(f"[gear-final-analysis] saved: {ANALYSIS_ROOT}")
 
 
