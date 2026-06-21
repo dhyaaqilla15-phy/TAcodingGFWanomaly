@@ -529,8 +529,6 @@ class EMA:
 @dataclass
 class AugCfg:
     p_aug: float = 0.40
-    p_shift: float = 0.20
-    shift_max: int = 10
     p_time_mask: float = 0.12
     time_mask_frac: Tuple[float, float] = (0.05, 0.10)
     p_feat_mask: float = 0.08
@@ -547,11 +545,6 @@ def augment_batch(x: torch.Tensor, cfg: AugCfg) -> torch.Tensor:
 
     out = x.clone()
     B, T, Fdim = out.shape
-
-    if cfg.p_shift > 0 and torch.rand(1, device=out.device).item() < cfg.p_shift:
-        sh = int(torch.randint(-cfg.shift_max, cfg.shift_max + 1, (1,), device=out.device).item())
-        if sh != 0:
-            out = torch.roll(out, shifts=sh, dims=1)
 
     if cfg.p_time_mask > 0 and torch.rand(1, device=out.device).item() < cfg.p_time_mask and T >= 8:
         lo, hi = cfg.time_mask_frac

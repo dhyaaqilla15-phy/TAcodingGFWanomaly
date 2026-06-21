@@ -44,6 +44,11 @@ SEQ_FEATURE_COLS = [
     "curvature_ma5",
 ]
 
+LOCATION_FEATURE_COLS = [
+    "distance_from_shore",
+    "distance_from_port",
+]
+
 
 @dataclass
 class PreprocessCfg:
@@ -74,6 +79,7 @@ class PreprocessCfg:
     use_operational_filter: bool = False
     op_speed_min: float = 1.0
     op_speed_max: float = 12.0
+    use_location_features: bool = True
 
     # khusus task=spoofing
     spoofing_window_threshold: float = 0.20
@@ -138,6 +144,12 @@ def _normalize_exclude_labels(task: str, exclude_labels: Optional[List[str]]) ->
             labels.append(label)
             seen.add(label)
     return labels
+
+
+def _sequence_feature_cols(cfg: PreprocessCfg) -> List[str]:
+    if cfg.use_location_features:
+        return list(SEQ_FEATURE_COLS)
+    return [c for c in SEQ_FEATURE_COLS if c not in LOCATION_FEATURE_COLS]
 
 
 def timestamp_to_epoch_seconds(values: pd.Series) -> pd.Series:
@@ -242,10 +254,33 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     df = df.sort_values(["mmsi", "timestamp"])
     df = df.drop_duplicates(subset=["mmsi", "timestamp"], keep="last")
 
+    # Derivative and rolling features must not cross a trajectory gap. Go-dark
+    # intentionally keeps the gap inside a sequence because the gap is the
+    # signal being detected.
+    if cfg.task == "godark":
+        df["_motion_segment"] = 0
+        motion_group_cols = ["mmsi"]
+    else:
+        gap_break = (
+            df.groupby("mmsi", sort=False)["timestamp"]
+            .diff()
+            .gt(float(cfg.gap_seconds))
+        )
+        df["_motion_segment"] = (
+            gap_break.groupby(df["mmsi"], sort=False)
+            .cumsum()
+            .fillna(0)
+            .astype("int64")
+        )
+        motion_group_cols = ["mmsi", "_motion_segment"]
+
+    motion_groups = df.groupby(motion_group_cols, sort=False)
+    rolling_levels = list(range(len(motion_group_cols)))
+
     # dt per step dalam detik.
     # Untuk task go-dark, gap panjang adalah sinyal penting.
     # Jadi dt tidak boleh dipotong ke default 3 jam.
-    raw_dt = df.groupby("mmsi")["timestamp"].diff().fillna(1.0).astype("float32")
+    raw_dt = motion_groups["timestamp"].diff().fillna(1.0).astype("float32")
 
     df["dt_raw_seconds"] = raw_dt.clip(
         lower=1.0,
@@ -268,18 +303,18 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     df["course_cos"] = np.cos(cr).astype("float32")
 
     # perubahan speed
-    df["dspeed"] = df.groupby("mmsi")["speed"].diff().fillna(0).astype("float32")
+    df["dspeed"] = motion_groups["speed"].diff().fillna(0).astype("float32")
 
     # perubahan course dengan shortest angle
-    prev_course = df.groupby("mmsi")["course"].shift(1).astype("float32")
+    prev_course = motion_groups["course"].shift(1).astype("float32")
     dc = (course_deg - prev_course) % 360.0
     dc = ((dc + 180.0) % 360.0) - 180.0
     df["dcourse"] = dc.fillna(0).astype("float32")
     df["abs_dcourse"] = np.abs(df["dcourse"]).astype("float32")
 
     # jarak antar titik
-    prev_lat = df.groupby("mmsi")["lat"].shift(1)
-    prev_lon = df.groupby("mmsi")["lon"].shift(1)
+    prev_lat = motion_groups["lat"].shift(1)
+    prev_lon = motion_groups["lon"].shift(1)
     mask = prev_lat.notna() & prev_lon.notna()
 
     step_km = np.zeros(len(df), dtype=np.float32)
@@ -317,7 +352,7 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     pos_speed = (df["step_km"] / df["dt"].clip(lower=1.0)) * (3600.0 / 1.852)
     df["pos_speed_knots"] = pos_speed.clip(0.0, cfg.max_speed_knots).astype("float32")
     df["dpos_speed"] = (
-        df.groupby("mmsi")["pos_speed_knots"].diff().fillna(0).astype("float32")
+        motion_groups["pos_speed_knots"].diff().fillna(0).astype("float32")
     )
 
     # bearing dari perubahan posisi
@@ -334,22 +369,28 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     br = np.deg2rad(pos_bearing.astype(np.float32))
     df["pos_bearing_sin"] = np.sin(br).astype("float32")
     df["pos_bearing_cos"] = np.cos(br).astype("float32")
+    df.loc[~mask, ["pos_bearing_sin", "pos_bearing_cos"]] = 0.0
 
-    berr = (course_deg - pos_bearing) % 360.0
-    berr = ((berr + 180.0) % 360.0) - 180.0
+    berr = np.zeros(len(df), dtype=np.float32)
+    if mask.any():
+        berr_valid = (
+            course_deg.loc[mask].to_numpy(dtype=np.float32)
+            - pos_bearing[mask.to_numpy()]
+        ) % 360.0
+        berr[mask.to_numpy()] = ((berr_valid + 180.0) % 360.0) - 180.0
     df["bearing_error"] = berr.astype("float32")
 
     curv = df["abs_dcourse"] / (df["step_km"] + 1e-3)
     df["curvature"] = curv.clip(0.0, 500.0).astype("float32")
 
     # rolling stats
-    g = df.groupby("mmsi", sort=False)
+    g = df.groupby(motion_group_cols, sort=False)
 
     df["pos_speed_ma5"] = (
         g["pos_speed_knots"]
         .rolling(5, min_periods=1)
         .mean()
-        .reset_index(level=0, drop=True)
+        .reset_index(level=rolling_levels, drop=True)
         .astype("float32")
     )
 
@@ -357,17 +398,20 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
         g["pos_speed_knots"]
         .rolling(5, min_periods=1)
         .std()
-        .reset_index(level=0, drop=True)
+        .reset_index(level=rolling_levels, drop=True)
         .fillna(0.0)
         .astype("float32")
     )
 
     abs_turn = df["turn_rate"].abs().astype("float32")
     df["abs_turn_ma5"] = (
-        abs_turn.groupby(df["mmsi"], sort=False)
+        abs_turn.groupby(
+            [df[c] for c in motion_group_cols],
+            sort=False,
+        )
         .rolling(5, min_periods=1)
         .mean()
-        .reset_index(level=0, drop=True)
+        .reset_index(level=rolling_levels, drop=True)
         .astype("float32")
     )
 
@@ -375,7 +419,7 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
         g["curvature"]
         .rolling(5, min_periods=1)
         .mean()
-        .reset_index(level=0, drop=True)
+        .reset_index(level=rolling_levels, drop=True)
         .astype("float32")
     )
 
@@ -852,7 +896,13 @@ def build_sequences_from_df(
     df = clean_and_derive(df, cfg)
 
     if cfg.apply_jump_filter:
-        df = filter_jumps(df, cfg)
+        filtered = filter_jumps(df, cfg)
+        if len(filtered) != len(df):
+            # Removing a jump changes the predecessor of the following point,
+            # so all derivative and rolling features must be recomputed.
+            df = clean_and_derive(filtered, cfg)
+        else:
+            df = filtered
 
     if cfg.task == "fishing":
         if "is_fishing" not in df.columns:
@@ -911,7 +961,7 @@ def build_sequences_from_df(
     else:
         df["y_point"] = 0
 
-    feat_cols = list(SEQ_FEATURE_COLS)
+    feat_cols = _sequence_feature_cols(cfg)
 
     df = df.dropna(subset=feat_cols).copy()
 
@@ -1148,6 +1198,7 @@ def build_sequences_to_npz(
     use_operational_filter: bool = False,
     op_speed_min: float = 1.0,
     op_speed_max: float = 12.0,
+    use_location_features: bool = True,
     spoofing_window_threshold: float = 0.20,
     transshipment_target: str = "multiclass",
     transshipment_feature_mode: str = "fair",
@@ -1183,6 +1234,7 @@ def build_sequences_to_npz(
         use_operational_filter=bool(use_operational_filter),
         op_speed_min=float(op_speed_min),
         op_speed_max=float(op_speed_max),
+        use_location_features=bool(use_location_features),
         spoofing_window_threshold=float(spoofing_window_threshold),
         transshipment_target=str(transshipment_target),
         transshipment_feature_mode=str(transshipment_feature_mode),
@@ -1248,6 +1300,10 @@ def build_sequences_to_npz(
             "[preprocess] operational_filter enabled: "
             f"speed between {cfg.op_speed_min:g} and {cfg.op_speed_max:g} knots"
         )
+    print(
+        "[preprocess] location features "
+        f"{'enabled' if cfg.use_location_features else 'disabled'}"
+    )
 
     for p in tqdm(csvs, desc="files"):
         stem = infer_label_from_filename(p)
@@ -1409,13 +1465,20 @@ def build_sequences_to_npz(
         feature_cols=np.array(
             _transshipment_feature_cols(cfg.transshipment_feature_mode)
             if task == "transshipment"
-            else list(SEQ_FEATURE_COLS),
+            else _sequence_feature_cols(cfg),
             dtype=object,
         ),
         rule_features=rule_features.astype(np.float32),
         rule_cols=np.array(TRANS_RULE_SCORE_COLS if task == "transshipment" else [], dtype=object),
         transshipment_target=np.array(str(cfg.transshipment_target), dtype=object),
         transshipment_feature_mode=np.array(str(cfg.transshipment_feature_mode), dtype=object),
+        gap_seconds=np.array(int(cfg.gap_seconds), dtype=np.int64),
+        seq_len=np.array(int(cfg.seq_len), dtype=np.int64),
+        stride=np.array(int(cfg.stride), dtype=np.int64),
+        use_operational_filter=np.array(bool(cfg.use_operational_filter)),
+        op_speed_min=np.array(float(cfg.op_speed_min), dtype=np.float32),
+        op_speed_max=np.array(float(cfg.op_speed_max), dtype=np.float32),
+        use_location_features=np.array(bool(cfg.use_location_features)),
         label_map=np.array(list(label_map.items()), dtype=object),
         scaled=np.array(False),
     )

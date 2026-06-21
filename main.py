@@ -73,6 +73,11 @@ def main():
     )
     p.add_argument("--op_speed_min", type=float, default=1.0)
     p.add_argument("--op_speed_max", type=float, default=12.0)
+    p.add_argument(
+        "--exclude_location_features",
+        action="store_true",
+        help="Ablation gear: keluarkan distance_from_shore dan distance_from_port dari fitur model.",
+    )
     p.add_argument("--spoofing_window_threshold", type=float, default=0.20)
     p.add_argument(
         "--transshipment_target",
@@ -143,6 +148,12 @@ def main():
     t.add_argument("--weight_decay", type=float, default=1.3e-3)
     t.add_argument("--sgd_momentum", type=float, default=0.9)
     t.add_argument("--early_stop_patience", type=int, default=90)
+    t.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=1.2,
+        help="Gamma focal loss. Isi 0 untuk setara weighted cross-entropy.",
+    )
     t.add_argument(
         "--non_deterministic",
         action="store_true",
@@ -564,6 +575,7 @@ def main():
             use_operational_filter=bool(args.use_operational_filter),
             op_speed_min=float(args.op_speed_min),
             op_speed_max=float(args.op_speed_max),
+            use_location_features=(not bool(args.exclude_location_features)),
             spoofing_window_threshold=float(args.spoofing_window_threshold),
             transshipment_target=str(args.transshipment_target),
             transshipment_feature_mode=str(args.transshipment_feature_mode),
@@ -602,6 +614,7 @@ def main():
             test_size=float(args.test_size),
             val_size=float(args.val_size),
             early_stop_patience=int(args.early_stop_patience),
+            focal_gamma=float(args.focal_gamma),
             gear_minority_f1_weight=(
                 None if args.gear_minority_f1_weight is None else float(args.gear_minority_f1_weight)
             ),

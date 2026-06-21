@@ -360,6 +360,20 @@ def evaluate(
         eval_split_seed = int(ckpt.get("split_random_state", eval_split_seed))
 
     eval_split_key = str(eval_split).strip().lower()
+    if task_name == "gear" and eval_split_key == "all":
+        present_ids = set(np.unique(y).astype(int).tolist())
+        missing_labels = [
+            labels[i]
+            for i in range(num_classes)
+            if i not in present_ids
+        ]
+        if missing_labels:
+            raise ValueError(
+                "External gear evaluation is missing classes after preprocessing: "
+                + ", ".join(missing_labels)
+                + ". Adjust gap/seq_len/filter settings before evaluating."
+            )
+
     if eval_split_key == "all":
         split_lookup = {
             "all": np.arange(len(y), dtype=np.int64),
@@ -749,6 +763,8 @@ def evaluate(
         sus_df.to_csv(sus_path, index=False)
 
     summary = {
+        "data_npz": str(data_npz),
+        "model_path": str(model_path),
         "task": task_name,
         "primary_metric_scope": metric_scope,
         "num_classes": num_classes,
