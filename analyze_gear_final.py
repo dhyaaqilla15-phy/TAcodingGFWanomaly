@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -22,6 +23,12 @@ ANALYSIS_ROOT = TUNING_ROOT / "final_analysis"
 EXTERNAL_DATA = ROOT / "Dataset_Test_Enriched"
 SEEDS = (42, 43, 44, 45, 46)
 TARGET_MMSI = {"525600095", "525600097", "412510000"}
+CLASS_LABELS = [
+    "drifting_longlines",
+    "fixed_gear",
+    "purse_seines",
+    "trawlers",
+]
 
 
 def read_json(path: Path) -> dict | list:
@@ -89,6 +96,144 @@ def prediction_audit() -> pd.DataFrame:
         )
     return pd.DataFrame(rows).sort_values(
         ["correct_seeds", "true_label", "mmsi"]
+    )
+
+
+def plot_confusion_matrix(
+    matrix: np.ndarray,
+    labels: list[str],
+    title: str,
+    path: Path,
+    *,
+    normalized: bool,
+) -> None:
+    values = matrix.astype(np.float64)
+    if normalized:
+        row_sums = values.sum(axis=1, keepdims=True)
+        values = np.divide(
+            values,
+            row_sums,
+            out=np.zeros_like(values),
+            where=row_sums > 0,
+        )
+
+    fig, ax = plt.subplots(figsize=(8.5, 7))
+    image = ax.imshow(
+        values,
+        interpolation="nearest",
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0 if normalized else None,
+    )
+    fig.colorbar(image, ax=ax)
+    ax.set(
+        xticks=np.arange(len(labels)),
+        yticks=np.arange(len(labels)),
+        xticklabels=labels,
+        yticklabels=labels,
+        xlabel="Predicted label",
+        ylabel="True label",
+        title=title,
+    )
+    plt.setp(ax.get_xticklabels(), rotation=35, ha="right")
+
+    threshold = float(values.max()) / 2.0 if values.size else 0.0
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            text = f"{values[i, j]:.2f}" if normalized else str(int(matrix[i, j]))
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                color="white" if values[i, j] > threshold else "black",
+            )
+    fig.tight_layout()
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def create_final_confusion_matrices() -> None:
+    out_dir = ANALYSIS_ROOT / "final_confusion_matrices"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    seed46_eval = FINAL_EVAL_ROOT / "seed_46" / "external_test_eval"
+    shutil.copy2(
+        seed46_eval / "confusion_matrix.png",
+        out_dir / "FINAL_TEST_confusion_matrix_seed46.png",
+    )
+    shutil.copy2(
+        seed46_eval / "confusion_matrix_normalized.png",
+        out_dir / "FINAL_TEST_confusion_matrix_seed46_normalized.png",
+    )
+
+    votes: dict[str, dict[str, object]] = defaultdict(
+        lambda: {"true_label": "", "predictions": []}
+    )
+    for seed in SEEDS:
+        path = (
+            FINAL_EVAL_ROOT
+            / f"seed_{seed}"
+            / "external_test_eval"
+            / "per_vessel_predictions.csv"
+        )
+        for row in csv.DictReader(path.open(encoding="utf-8-sig")):
+            item = votes[row["mmsi"]]
+            item["true_label"] = row["true_label"]
+            item["predictions"].append(row["pred_label"])
+
+    label_to_id = {label: idx for idx, label in enumerate(CLASS_LABELS)}
+    matrix = np.zeros((len(CLASS_LABELS), len(CLASS_LABELS)), dtype=np.int64)
+    consensus_rows = []
+    for mmsi, item in sorted(votes.items()):
+        counts = Counter(item["predictions"])
+        # Deterministic tie-break by the fixed class order.
+        prediction = max(
+            CLASS_LABELS,
+            key=lambda label: (counts[label], -label_to_id[label]),
+        )
+        true_label = str(item["true_label"])
+        matrix[label_to_id[true_label], label_to_id[prediction]] += 1
+        consensus_rows.append(
+            {
+                "mmsi": mmsi,
+                "true_label": true_label,
+                "consensus_prediction": prediction,
+                "prediction_votes": json.dumps(dict(counts), sort_keys=True),
+                "correct": prediction == true_label,
+            }
+        )
+
+    pd.DataFrame(consensus_rows).to_csv(
+        out_dir / "final_test_consensus_predictions.csv",
+        index=False,
+    )
+    plot_confusion_matrix(
+        matrix,
+        CLASS_LABELS,
+        "External Test Consensus Confusion Matrix (5 seeds, 21 vessels)",
+        out_dir / "FINAL_TEST_confusion_matrix_consensus_5seeds.png",
+        normalized=False,
+    )
+    plot_confusion_matrix(
+        matrix,
+        CLASS_LABELS,
+        "External Test Consensus Confusion Matrix, Row Normalized",
+        out_dir / "FINAL_TEST_confusion_matrix_consensus_5seeds_normalized.png",
+        normalized=True,
+    )
+    (out_dir / "README.md").write_text(
+        """# Final Test Confusion Matrices
+
+- Use `FINAL_TEST_confusion_matrix_seed46_normalized.png` as the main
+  confusion matrix for the representative final checkpoint.
+- Use `FINAL_TEST_confusion_matrix_consensus_5seeds_normalized.png` as
+  supporting evidence of prediction stability across seeds.
+- The consensus matrix contains 21 unique vessels. It does not count the same
+  vessel five times.
+""",
+        encoding="utf-8",
     )
 
 
@@ -386,6 +531,11 @@ lima seed:
 | Balanced accuracy | {external["mean_metrics_vessel"]["balanced_acc"]:.4f} |
 | Weighted F1 | {external["mean_metrics_vessel"]["weighted_f1"]:.4f} |
 
+Confusion matrix utama untuk Bab 5 adalah confusion matrix normalized external
+test seed 46 karena seed tersebut digunakan sebagai checkpoint representatif.
+Confusion matrix konsensus lima seed dapat ditampilkan sebagai analisis
+pendukung kestabilan; matrix konsensus tetap berisi 21 kapal unik.
+
 Performa per kelas menunjukkan bahwa purse seine dan trawler paling konsisten.
 Kelemahan utama terdapat pada drifting longlines dan fixed gear. Tiga kapal
 selalu salah pada kelima seed:
@@ -460,6 +610,7 @@ def main() -> None:
     manifest = write_manifest()
     write_report(manifest, predictions, vessel_audit)
     write_indonesian_summary()
+    create_final_confusion_matrices()
     print(f"[gear-final-analysis] saved: {ANALYSIS_ROOT}")
 
 
