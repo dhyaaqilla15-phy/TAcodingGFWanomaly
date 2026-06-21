@@ -180,6 +180,133 @@ def save_confusion_png(cm: np.ndarray, labels: List[str], out_path: Path, normal
     plt.close(fig)
 
 
+def save_spoofing_detection_png(
+    cm: np.ndarray,
+    out_path: Path,
+    *,
+    normalize: bool = False,
+    attack_name: str | None = None,
+) -> None:
+    """Save an anomaly-first binary matrix: TP/FN on the first row."""
+    import matplotlib.pyplot as plt
+
+    cm = np.asarray(cm, dtype=np.float64)
+    if cm.shape != (2, 2):
+        raise ValueError(f"Spoofing detection matrix must be 2x2; got {cm.shape}.")
+
+    # Standard order is [normal, spoofing]. Reorder both axes so spoofing is
+    # first: [[TP, FN], [FP, TN]].
+    focus_counts = cm[np.ix_([1, 0], [1, 0])]
+    if normalize:
+        row_sum = focus_counts.sum(axis=1, keepdims=True)
+        row_sum[row_sum == 0] = 1.0
+        show = focus_counts / row_sum
+    else:
+        show = focus_counts
+
+    suffix = f" - {attack_name}" if attack_name else ""
+    title = "Spoofing Detection Matrix" + suffix
+    if normalize:
+        title += " (row-normalized)"
+
+    cell_names = np.array(
+        [
+            ["TP\nspoofing detected", "FN\nspoofing missed"],
+            ["FP\nfalse alarm", "TN\nnormal rejected"],
+        ],
+        dtype=object,
+    )
+    fig, ax = plt.subplots(figsize=(9, 7))
+    image = ax.imshow(show, interpolation="nearest", cmap="OrRd", vmin=0.0)
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(title)
+    ax.set_xticks([0, 1], ["spoofing", "normal"])
+    ax.set_yticks([0, 1], ["spoofing", "normal"])
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("Actual class")
+
+    threshold = (float(show.max()) if show.size else 0.0) * 0.55
+    for i in range(2):
+        for j in range(2):
+            if normalize:
+                value_text = f"{show[i, j]:.2f}\n(n={int(focus_counts[i, j])})"
+            else:
+                value_text = f"n={int(focus_counts[i, j])}"
+            ax.text(
+                j,
+                i,
+                f"{cell_names[i, j]}\n{value_text}",
+                ha="center",
+                va="center",
+                fontsize=11,
+                fontweight="semibold" if i == 0 else "normal",
+                color="white" if show[i, j] > threshold else "black",
+            )
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def save_spoofing_focus_reports(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    kinds: np.ndarray,
+    out_dir: Path,
+) -> Dict[str, object]:
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_pred = np.asarray(y_pred, dtype=np.int64)
+    kinds_str = np.char.lower(np.asarray(kinds).astype(str))
+    normal_mask = np.isin(kinds_str, ["normal", "normal_random"])
+
+    reports: Dict[str, object] = {}
+    overall_cm = confusion_matrix_np(y_true, y_pred, 2)
+    overall_raw = out_dir / "confusion_matrix_spoofing_focus.png"
+    overall_norm = out_dir / "confusion_matrix_spoofing_focus_normalized.png"
+    save_spoofing_detection_png(overall_cm, overall_raw)
+    save_spoofing_detection_png(overall_cm, overall_norm, normalize=True)
+    reports["overall"] = {
+        "counts": str(overall_raw),
+        "normalized": str(overall_norm),
+    }
+
+    attack_reports: Dict[str, Dict[str, str]] = {}
+    attack_names = sorted(
+        set(kinds_str.tolist()) - {"", "normal", "normal_random", "unknown"}
+    )
+    for attack in attack_names:
+        subset = normal_mask | (kinds_str == attack)
+        if not subset.any():
+            continue
+        attack_cm = confusion_matrix_np(y_true[subset], y_pred[subset], 2)
+        safe_name = "".join(
+            char if char.isalnum() or char in {"-", "_"} else "_"
+            for char in attack
+        )
+        raw_path = out_dir / f"confusion_matrix_spoofing_{safe_name}.png"
+        norm_path = out_dir / (
+            f"confusion_matrix_spoofing_{safe_name}_normalized.png"
+        )
+        save_spoofing_detection_png(
+            attack_cm,
+            raw_path,
+            attack_name=attack,
+        )
+        save_spoofing_detection_png(
+            attack_cm,
+            norm_path,
+            normalize=True,
+            attack_name=attack,
+        )
+        attack_reports[attack] = {
+            "counts": str(raw_path),
+            "normalized": str(norm_path),
+        }
+    reports["per_attack"] = attack_reports
+    return reports
+
+
 def _per_class_metric_rows(cm: np.ndarray, labels: List[str], scope: str) -> List[Dict[str, object]]:
     cls = per_class_metrics_from_cm(cm)
     known_limitations = set(_known_limitation_labels("gear", labels))
@@ -673,8 +800,31 @@ def evaluate(
                 stale_path.unlink()
     else:
         cm_primary = cm_seq if metric_scope == "sequence" else cm_v
-        save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
-        save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
+        if task_name == "spoofing":
+            save_spoofing_detection_png(
+                cm_primary,
+                out_dir / "confusion_matrix.png",
+            )
+            save_spoofing_detection_png(
+                cm_primary,
+                out_dir / "confusion_matrix_normalized.png",
+                normalize=True,
+            )
+            save_confusion_png(
+                cm_primary,
+                labels,
+                out_dir / "confusion_matrix_standard.png",
+                normalize=False,
+            )
+            save_confusion_png(
+                cm_primary,
+                labels,
+                out_dir / "confusion_matrix_standard_normalized.png",
+                normalize=True,
+            )
+        else:
+            save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
+            save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
         save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence.png", normalize=False)
         save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence_normalized.png", normalize=True)
         save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel.png", normalize=False)
@@ -691,9 +841,16 @@ def evaluate(
     spoofing_sequence_path = None
     spoofing_scenario_path = None
     spoofing_scenario_metrics = None
+    spoofing_focus_reports = None
     spoofing_attack_rows = []
     if task_name == "spoofing" and len(kinds_test) == len(y_np):
         kinds_str = np.asarray(kinds_test).astype(str)
+        spoofing_focus_reports = save_spoofing_focus_reports(
+            y_np,
+            pred_seq,
+            kinds_str,
+            out_dir,
+        )
         normal_mask = np.isin(
             np.char.lower(kinds_str),
             ["normal", "normal_random"],
@@ -819,6 +976,26 @@ def evaluate(
                 "aggregation": "mean_top_10_percent_spoofing_probability",
                 "num_scenarios": int(len(scenario_df)),
             }
+            scenario_raw = out_dir / "confusion_matrix_spoofing_scenario.png"
+            scenario_norm = out_dir / (
+                "confusion_matrix_spoofing_scenario_normalized.png"
+            )
+            save_spoofing_detection_png(
+                scenario_cm,
+                scenario_raw,
+                attack_name="scenario level",
+            )
+            save_spoofing_detection_png(
+                scenario_cm,
+                scenario_norm,
+                normalize=True,
+                attack_name="scenario level",
+            )
+            if spoofing_focus_reports is not None:
+                spoofing_focus_reports["scenario"] = {
+                    "counts": str(scenario_raw),
+                    "normalized": str(scenario_norm),
+                }
 
     pv_name = "per_event_predictions.csv" if task_name == "transshipment" else "per_vessel_predictions.csv"
     pv_path = out_dir / pv_name
@@ -960,6 +1137,7 @@ def evaluate(
             else None
         ),
         "spoofing_scenario_metrics": spoofing_scenario_metrics,
+        "spoofing_focus_confusion_matrices": spoofing_focus_reports,
         "binary_ranking_metrics": binary_ranking_metrics,
         "godark_event_prediction_table": (str(godark_event_path) if godark_event_path is not None else None),
         "godark_event_error_breakdown_table": (

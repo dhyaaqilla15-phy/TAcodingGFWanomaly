@@ -240,6 +240,9 @@ Output penting:
 ```text
 outputs_spoofing/model_spoofing/confusion_matrix.png
 outputs_spoofing/model_spoofing/confusion_matrix_normalized.png
+outputs_spoofing/model_spoofing/confusion_matrix_standard.png
+outputs_spoofing/model_spoofing/confusion_matrix_spoofing_gradual_drift.png
+outputs_spoofing/model_spoofing/confusion_matrix_spoofing_location_jump.png
 outputs_spoofing/model_spoofing/per_vessel_predictions.csv
 outputs_spoofing/model_spoofing/spoofing_sequence_predictions.csv
 outputs_spoofing/model_spoofing/spoofing_attack_metrics.csv

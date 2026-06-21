@@ -16,6 +16,11 @@
 - Preprocess, training, and evaluation assert the fixed binary mapping
   `0=normal`, `1=spoofing`; positive probabilities and true positives always
   refer to the anomaly class.
+- The primary spoofing confusion matrix is anomaly-first: rows/columns are
+  ordered `spoofing, normal` and cells are named TP/FN/FP/TN. Conventional
+  class-order matrices remain available as `confusion_matrix_standard*.png`.
+- Separate anomaly-first matrices are written for gradual drift, location
+  jump, and scenario-level detection.
 - Train/validation splitting is group-disjoint by `original_mmsi` and uses a
   mixed-label group strategy, because each source vessel contains both normal
   and spoofing windows. Both window classes are required in each split.
