@@ -191,7 +191,7 @@ run_step "[4/20] Spoofing generate" \
   --attacks gradual_drift location_jump \
   --limit_rows "$SOURCE_LIMIT_ROWS" \
   --exclude_labels "${source_exclude_labels[@]}" \
-  --normal_keep_frac 0.25 \
+  --normal_keep_frac 0.50 \
   --max_vessels_per_file 20 \
   --points_per_attack 120 \
   --combine_outputs \

@@ -982,6 +982,15 @@ def build_sequences_from_df(
             raise ValueError(
                 "task=spoofing but no 'is_spoofing', 'label', or 'attack_type' column found"
             )
+        if "is_spoofing_event" in df.columns:
+            df["y_spoof_event"] = (
+                pd.to_numeric(df["is_spoofing_event"], errors="coerce")
+                .fillna(0)
+                .astype("int8")
+            )
+        else:
+            # Backward compatibility for previously generated spoofing CSVs.
+            df["y_spoof_event"] = df["y_point"]
 
     elif cfg.task == "godark":
         if "is_go_dark" in df.columns:
@@ -1033,6 +1042,11 @@ def build_sequences_from_df(
 
         ts = g["timestamp"].to_numpy()
         y_point = g["y_point"].to_numpy(dtype=np.int64)
+        spoof_event = (
+            g["y_spoof_event"].to_numpy(dtype=np.int64)
+            if cfg.task == "spoofing"
+            else np.zeros(len(g), dtype=np.int64)
+        )
 
         # Biasanya sequence dipotong ketika ada gap besar.
         # Untuk go-dark, gap besar yang memang diberi label GoDark tidak boleh dipotong.
@@ -1195,10 +1209,25 @@ def build_sequences_from_df(
                     y_win = int(seg_y[i:i + cfg.seq_len].mean() >= 0.5)
 
                 elif cfg.task == "spoofing":
-                    y_win = int(
-                        seg_y[i:i + cfg.seq_len].mean()
-                        >= float(cfg.spoofing_window_threshold)
-                    )
+                    attack_values = spoof_attack_types[
+                        s + i:s + i + cfg.seq_len
+                    ]
+                    attack_kind = str(
+                        pd.Series(attack_values).value_counts().index[0]
+                    ).lower()
+                    if attack_kind == "location_jump":
+                        # With absolute location features disabled, a constant
+                        # post-jump translation is indistinguishable from a
+                        # normal track. Only windows spanning the jump boundary
+                        # carry a motion anomaly.
+                        y_win = int(
+                            spoof_event[s + i:s + i + cfg.seq_len].max() >= 1
+                        )
+                    else:
+                        y_win = int(
+                            seg_y[i:i + cfg.seq_len].mean()
+                            >= float(cfg.spoofing_window_threshold)
+                        )
 
                 elif cfg.task == "godark":
                     # Go-dark adalah event boundary.

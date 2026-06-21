@@ -69,7 +69,12 @@ def acquire_lock() -> None:
 
 def generation_complete(out_dir: Path) -> bool:
     path = out_dir / "spoofed_all.csv"
-    return path.is_file() and path.stat().st_size > 0
+    magnitude_audits = list((out_dir / "summaries").glob("magnitude_*.csv"))
+    return (
+        path.is_file()
+        and path.stat().st_size > 0
+        and bool(magnitude_audits)
+    )
 
 
 def model_complete(model_dir: Path) -> bool:
@@ -133,7 +138,7 @@ def generation_command(
         "--limit_rows",
         str(limit_rows),
         "--normal_keep_frac",
-        "0.25",
+        "0.50",
         "--exclude_labels",
         "pole_and_line",
         "trollers",
@@ -327,6 +332,8 @@ def validate_preprocessed_data() -> None:
     external_features = external["feature_cols"].astype(str).tolist()
     internal_classes = sorted(np.unique(internal["y"]).astype(int).tolist())
     external_classes = sorted(np.unique(external["y"]).astype(int).tolist())
+    internal_positive_ratio = float(np.mean(internal["y"] == 1))
+    external_positive_ratio = float(np.mean(external["y"] == 1))
     internal_attacks = sorted(
         set(internal["window_kinds"].astype(str).tolist()) - {"normal"}
     )
@@ -342,6 +349,16 @@ def validate_preprocessed_data() -> None:
         problems.append(
             f"both classes required; internal={internal_classes} "
             f"external={external_classes}"
+        )
+    if not 0.10 <= internal_positive_ratio <= 0.90:
+        problems.append(
+            "internal positive-window ratio unhealthy: "
+            f"{internal_positive_ratio:.3f}"
+        )
+    if not 0.10 <= external_positive_ratio <= 0.90:
+        problems.append(
+            "external positive-window ratio unhealthy: "
+            f"{external_positive_ratio:.3f}"
         )
     expected_attacks = {"gradual_drift", "location_jump"}
     if not expected_attacks.issubset(internal_attacks):
@@ -361,6 +378,8 @@ def validate_preprocessed_data() -> None:
         "external_class_counts": np.bincount(
             external["y"].astype(np.int64), minlength=2
         ).astype(int).tolist(),
+        "internal_positive_ratio": internal_positive_ratio,
+        "external_positive_ratio": external_positive_ratio,
         "internal_attacks": internal_attacks,
         "external_attacks": external_attacks,
         "feature_count": len(internal_features),

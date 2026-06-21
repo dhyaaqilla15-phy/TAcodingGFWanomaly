@@ -166,7 +166,7 @@ python3 main.py make_spoofing \
   --attacks gradual_drift location_jump \
   --limit_rows 300000 \
   --exclude_labels pole_and_line trollers \
-  --normal_keep_frac 0.25 \
+  --normal_keep_frac 0.50 \
   --max_vessels_per_file 20 \
   --points_per_attack 120 \
   --combine_outputs \
@@ -251,6 +251,13 @@ external test:
 
 ```bash
 python3 run_spoofing_multiseed.py run
+```
+
+Sebelum multiseed final, jalankan sensitivity study magnitude jump yang hanya
+memakai validation internal:
+
+```bash
+python3 run_spoofing_jump_sensitivity.py run
 ```
 
 Pipeline spoofing otomatis menonaktifkan fitur jarak pantai/pelabuhan dan

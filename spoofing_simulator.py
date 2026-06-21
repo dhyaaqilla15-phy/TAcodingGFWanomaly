@@ -231,6 +231,8 @@ def _finish_attack(
     scenario_id: str,
     scenario_mmsi: int,
     spoof_mask: np.ndarray | None = None,
+    event_mask: np.ndarray | None = None,
+    magnitude: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if seg.empty:
         return seg
@@ -244,7 +246,13 @@ def _finish_attack(
     spoof_mask = np.asarray(spoof_mask, dtype=bool)
     if spoof_mask.shape[0] != len(seg):
         raise ValueError("spoof_mask length must match attack segment length.")
+    if event_mask is None:
+        event_mask = spoof_mask
+    event_mask = np.asarray(event_mask, dtype=bool)
+    if event_mask.shape[0] != len(seg):
+        raise ValueError("event_mask length must match attack segment length.")
     seg["is_spoofing"] = spoof_mask.astype("int8")
+    seg["is_spoofing_event"] = event_mask.astype("int8")
     seg["label"] = np.where(spoof_mask, "Spoofed", "Normal")
     seg["attack_type"] = attack
     seg["original_mmsi"] = str(original_mmsi)
@@ -255,6 +263,8 @@ def _finish_attack(
         if attack in CONTEXT_REQUIRED_ATTACKS
         else "single_window_kinematic"
     )
+    for key, value in (magnitude or {}).items():
+        seg[key] = float(value)
     return seg
 
 
@@ -283,6 +293,8 @@ def _attack_gradual_drift(
     if seg.empty:
         return seg
     frac = np.linspace(0.0, 1.0, len(seg), dtype=float)
+    original_end_lat = float(seg["lat"].iloc[-1])
+    original_end_lon = float(seg["lon"].iloc[-1])
     lat_offset = _signed_offset(rng, cfg.drift_lat_deg)
     lon_offset = _signed_offset(rng, cfg.drift_lon_deg)
     seg["lat"] = _clip_lat(seg["lat"].to_numpy(dtype=float) + frac * lat_offset)
@@ -294,6 +306,20 @@ def _attack_gradual_drift(
         sid,
         scenario_mmsi,
         spoof_mask=frac > 0.0,
+        magnitude={
+            "attack_nominal_lat_deg": cfg.drift_lat_deg,
+            "attack_nominal_lon_deg": cfg.drift_lon_deg,
+            "attack_applied_lat_deg": lat_offset,
+            "attack_applied_lon_deg": lon_offset,
+            "attack_displacement_km": float(
+                haversine_km_np(
+                    np.array([original_end_lat]),
+                    np.array([original_end_lon]),
+                    np.array([float(seg["lat"].iloc[-1])]),
+                    np.array([float(seg["lon"].iloc[-1])]),
+                )[0]
+            ),
+        },
     )
 
 
@@ -313,12 +339,18 @@ def _attack_location_jump(
     cut = int(rng.randint(cut_lo, cut_hi))
     lat = seg["lat"].to_numpy(dtype=float, copy=True)
     lon = seg["lon"].to_numpy(dtype=float, copy=True)
-    lat[cut:] = _clip_lat(lat[cut:] + _signed_offset(rng, cfg.jump_lat_deg))
-    lon[cut:] = _wrap_lon(lon[cut:] + _signed_offset(rng, cfg.jump_lon_deg))
+    original_cut_lat = float(lat[cut])
+    original_cut_lon = float(lon[cut])
+    lat_offset = _signed_offset(rng, cfg.jump_lat_deg)
+    lon_offset = _signed_offset(rng, cfg.jump_lon_deg)
+    lat[cut:] = _clip_lat(lat[cut:] + lat_offset)
+    lon[cut:] = _wrap_lon(lon[cut:] + lon_offset)
     seg["lat"] = lat
     seg["lon"] = lon
     spoof_mask = np.zeros(len(seg), dtype=bool)
     spoof_mask[cut:] = True
+    event_mask = np.zeros(len(seg), dtype=bool)
+    event_mask[cut] = True
     return _finish_attack(
         seg,
         "location_jump",
@@ -326,6 +358,21 @@ def _attack_location_jump(
         sid,
         scenario_mmsi,
         spoof_mask=spoof_mask,
+        event_mask=event_mask,
+        magnitude={
+            "attack_nominal_lat_deg": cfg.jump_lat_deg,
+            "attack_nominal_lon_deg": cfg.jump_lon_deg,
+            "attack_applied_lat_deg": lat_offset,
+            "attack_applied_lon_deg": lon_offset,
+            "attack_displacement_km": float(
+                haversine_km_np(
+                    np.array([original_cut_lat]),
+                    np.array([original_cut_lon]),
+                    np.array([float(lat[cut])]),
+                    np.array([float(lon[cut])]),
+                )[0]
+            ),
+        },
     )
 
 
@@ -469,12 +516,18 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
     )
 
     normal["is_spoofing"] = 0
+    normal["is_spoofing_event"] = 0
     normal["label"] = "Normal"
     normal["attack_type"] = "normal"
     normal["original_mmsi"] = normal["mmsi"].astype(str)
     normal["scenario_id"] = "normal::" + normal["original_mmsi"]
     normal["note"] = "original_ais"
     normal["identifiability"] = "normal"
+    normal["attack_nominal_lat_deg"] = 0.0
+    normal["attack_nominal_lon_deg"] = 0.0
+    normal["attack_applied_lat_deg"] = 0.0
+    normal["attack_applied_lon_deg"] = 0.0
+    normal["attack_displacement_km"] = 0.0
 
     vessels = _choose_vessels(df, cfg, rng)
     if not vessels:
@@ -527,8 +580,27 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
     summary_path = summary_dir / f"summary_{csv_path.stem}.csv"
     summary.to_csv(summary_path, index=False)
 
+    magnitude_cols = [
+        "scenario_id",
+        "original_mmsi",
+        "attack_type",
+        "attack_nominal_lat_deg",
+        "attack_nominal_lon_deg",
+        "attack_applied_lat_deg",
+        "attack_applied_lon_deg",
+        "attack_displacement_km",
+    ]
+    magnitude_summary = (
+        merged.loc[merged["attack_type"] != "normal", magnitude_cols]
+        .drop_duplicates(subset=["scenario_id"])
+        .sort_values(["attack_type", "scenario_id"])
+    )
+    magnitude_path = summary_dir / f"magnitude_{csv_path.stem}.csv"
+    magnitude_summary.to_csv(magnitude_path, index=False)
+
     print(f"[spoof] Saved dataset: {out_path}")
     print(f"[spoof] Saved summary: {summary_path}")
+    print(f"[spoof] Saved magnitude audit: {magnitude_path}")
     print(summary.to_string(index=False))
     return out_path
 
