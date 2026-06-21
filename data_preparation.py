@@ -173,6 +173,20 @@ def _select_spoofing_cap_indices(
         int(positive_idx.size),
         max(1, int(round(max_count * 0.50))),
     )
+    if positive_idx.size <= positive_budget:
+        normal_budget = max_count - int(positive_idx.size)
+        if normal_idx.size > normal_budget:
+            normal_idx = rng.choice(
+                normal_idx,
+                size=normal_budget,
+                replace=False,
+            )
+        keep = np.concatenate(
+            [positive_idx.astype(np.int64), normal_idx.astype(np.int64)]
+        )
+        rng.shuffle(keep)
+        return keep
+
     selected_positive: List[np.ndarray] = []
     attack_names = sorted(np.unique(kinds[positive_idx]).tolist())
     remaining_budget = positive_budget

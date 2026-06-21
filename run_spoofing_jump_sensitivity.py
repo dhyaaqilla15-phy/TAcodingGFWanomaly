@@ -301,7 +301,9 @@ def eval_command(npz_path: Path, model_path: Path, eval_dir: Path) -> list[str]:
 
 def validate_npz(npz_path: Path) -> None:
     data = np.load(npz_path, allow_pickle=True)
-    classes = sorted(np.unique(data["y"]).astype(int).tolist())
+    y = data["y"].astype(np.int64)
+    groups = data["groups"].astype(str)
+    classes = sorted(np.unique(y).astype(int).tolist())
     kinds = set(data["window_kinds"].astype(str).tolist())
     features = set(data["feature_cols"].astype(str).tolist())
     if classes != [0, 1]:
@@ -310,11 +312,29 @@ def validate_npz(npz_path: Path) -> None:
         raise RuntimeError(f"Jenis serangan tidak lengkap: {sorted(kinds)}.")
     if {"distance_from_shore", "distance_from_port"} & features:
         raise RuntimeError("Fitur lokasi absolut tidak boleh masuk spoofing.")
-    positive_ratio = float(np.mean(data["y"] == 1))
-    if not 0.10 <= positive_ratio <= 0.90:
+    positive_count = int(np.sum(y == 1))
+    positive_ratio = float(np.mean(y == 1))
+    positive_groups = int(np.unique(groups[y == 1]).size)
+    if positive_count < 200 or positive_groups < 5:
         raise RuntimeError(
-            f"Rasio window positif tidak sehat: {positive_ratio:.3f}."
+            "Window spoofing tidak cukup: "
+            f"count={positive_count}, source_groups={positive_groups}."
         )
+    if not 0.01 <= positive_ratio <= 0.20:
+        raise RuntimeError(
+            "Prevalensi validation tidak sesuai desain sensitivity study: "
+            f"{positive_ratio:.3f}."
+        )
+
+
+def preprocessed_complete(npz_path: Path) -> bool:
+    if not npz_path.is_file() or npz_path.stat().st_size <= 0:
+        return False
+    try:
+        validate_npz(npz_path)
+        return True
+    except (OSError, KeyError, ValueError, RuntimeError):
+        return False
 
 
 def prepare_one(name: str, jump_deg: float) -> tuple[Path, Path, Path, Path]:
@@ -333,7 +353,7 @@ def prepare_one(name: str, jump_deg: float) -> tuple[Path, Path, Path, Path]:
     ensure_artifact(
         preprocess_command(generated_dir, prep_dir),
         f"{name} preprocess",
-        lambda: npz_path.is_file() and npz_path.stat().st_size > 0,
+        lambda: preprocessed_complete(npz_path),
     )
     validate_npz(npz_path)
     return npz_path, model_dir, eval_dir, generated_dir

@@ -10,6 +10,9 @@
 - Generator seeds are stable across Python processes.
 - Location-distance features and geo auxiliary loss are disabled for spoofing.
 - Positive windows are preserved when the preprocessing cap is applied.
+- Natural validation prevalence is retained. Training handles imbalance with
+  class weights, focal loss, and a weighted sampler; validation is not
+  artificially balanced, so precision and PR-AUC remain interpretable.
 - Normal trajectory retention is 50%, so a 300-point eligible source still
   has enough contiguous normal points for a 120-point window.
 - Location-jump state and detectable jump-boundary labels are stored

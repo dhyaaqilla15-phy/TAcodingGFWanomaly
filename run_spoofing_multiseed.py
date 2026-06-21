@@ -350,12 +350,12 @@ def validate_preprocessed_data() -> None:
             f"both classes required; internal={internal_classes} "
             f"external={external_classes}"
         )
-    if not 0.10 <= internal_positive_ratio <= 0.90:
+    if not 0.01 <= internal_positive_ratio <= 0.50:
         problems.append(
             "internal positive-window ratio unhealthy: "
             f"{internal_positive_ratio:.3f}"
         )
-    if not 0.10 <= external_positive_ratio <= 0.90:
+    if not 0.01 <= external_positive_ratio <= 0.50:
         problems.append(
             "external positive-window ratio unhealthy: "
             f"{external_positive_ratio:.3f}"
