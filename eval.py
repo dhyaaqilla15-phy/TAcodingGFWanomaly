@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Dict, List
 
+import joblib
 import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
@@ -25,6 +26,7 @@ from agg_utils import (
     per_class_metrics_from_cm,
 )
 from transshipment_ml import predict_transshipment_tabular_and_hybrid
+from godark_context_ml import apply_godark_hardnegative_hybrid
 from godark_event import (
     DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD,
     DEFAULT_GODARK_EVENT_MIN_PRECISION,
@@ -67,6 +69,13 @@ def load_npz(npz_path: Path):
     if "scaled" not in data.files:
         print("[eval] WARNING: NPZ has no 'scaled' metadata. Prefer rerunning preprocess with the train-only scaler pipeline.")
     return X, y, groups, label_map
+
+
+def _load_feature_cols(npz_path: Path) -> List[str]:
+    data = np.load(npz_path, allow_pickle=True)
+    if "feature_cols" not in data.files:
+        return []
+    return [str(x) for x in data["feature_cols"].tolist()]
 
 
 def _label_map_from_checkpoint(ckpt: dict) -> Dict[int, str] | None:
@@ -125,6 +134,50 @@ def _load_window_metadata(npz_path: Path):
     event_ids = data["window_event_ids"] if "window_event_ids" in data.files else np.array([""] * n, dtype=object)
     kinds = data["window_kinds"] if "window_kinds" in data.files else np.array(["unknown"] * n, dtype=object)
     return event_ids.astype(object), kinds.astype(object)
+
+
+def _load_window_source_labels(npz_path: Path) -> np.ndarray:
+    data = np.load(npz_path, allow_pickle=True)
+    n = int(data["y"].shape[0])
+    if "window_source_labels" not in data.files:
+        return np.array(["unknown"] * n, dtype=object)
+    labels = data["window_source_labels"].astype(object)
+    if int(labels.shape[0]) != n:
+        return np.array(["unknown"] * n, dtype=object)
+    return labels
+
+
+def _load_transshipment_protocol_metadata(npz_path: Path):
+    with np.load(npz_path, allow_pickle=True) as data:
+        required = {"window_is_synthetic", "window_mmsi_a", "window_mmsi_b"}
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise ValueError(
+                "Transshipment NPZ lacks leakage-audit metadata; rerun prepare. "
+                f"missing={missing}"
+            )
+        n = int(len(data["y"]))
+        synthetic = data["window_is_synthetic"].astype(np.int8)
+        mmsi_a = data["window_mmsi_a"].astype(object)
+        mmsi_b = data["window_mmsi_b"].astype(object)
+        if any(int(arr.shape[0]) != n for arr in (synthetic, mmsi_a, mmsi_b)):
+            raise ValueError("Transshipment protocol metadata is not aligned with y.")
+        protocol = (
+            str(np.asarray(data["transshipment_data_protocol"]).item())
+            if "transshipment_data_protocol" in data.files
+            else ""
+        )
+    return synthetic, mmsi_a, mmsi_b, protocol
+
+
+def _transshipment_mmsi_set(indices, mmsi_a, mmsi_b) -> set[str]:
+    values: set[str] = set()
+    for arr in (mmsi_a, mmsi_b):
+        for raw in arr[indices].astype(str).tolist():
+            value = str(raw).strip()
+            if value and value.lower() not in {"none", "nan", "-1"}:
+                values.add(value)
+    return values
 
 
 class AisSeqDataset(Dataset):
@@ -249,62 +302,137 @@ def save_spoofing_detection_png(
     plt.close(fig)
 
 
-def save_spoofing_focus_reports(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    kinds: np.ndarray,
-    out_dir: Path,
-) -> Dict[str, object]:
-    y_true = np.asarray(y_true, dtype=np.int64)
-    y_pred = np.asarray(y_pred, dtype=np.int64)
-    kinds_str = np.char.lower(np.asarray(kinds).astype(str))
-    normal_mask = np.isin(kinds_str, ["normal", "normal_random"])
+def save_godark_detection_png(
+    cm: np.ndarray,
+    out_path: Path,
+    *,
+    scope: str = "sequence",
+) -> None:
+    """Save a report-ready, anomaly-first Go-Dark confusion matrix.
 
-    reports: Dict[str, object] = {}
-    overall_cm = confusion_matrix_np(y_true, y_pred, 2)
-    overall_raw = out_dir / "confusion_matrix_spoofing_focus.png"
-    overall_norm = out_dir / "confusion_matrix_spoofing_focus_normalized.png"
-    save_spoofing_detection_png(overall_cm, overall_raw)
-    save_spoofing_detection_png(overall_cm, overall_norm, normalize=True)
-    reports["overall"] = {
-        "counts": str(overall_raw),
-        "normalized": str(overall_norm),
-    }
+    The input follows the standard class order [normal, go_dark].  The plot
+    puts the positive class first so the cells read [[TP, FN], [FP, TN]], and
+    row-normalizes the values while retaining the raw count in every cell.
+    """
+    import matplotlib.pyplot as plt
 
-    attack_reports: Dict[str, Dict[str, str]] = {}
-    attack_names = sorted(
-        set(kinds_str.tolist()) - {"", "normal", "normal_random", "unknown"}
+    cm = np.asarray(cm, dtype=np.float64)
+    if cm.shape != (2, 2):
+        raise ValueError(f"Go-Dark detection matrix must be 2x2; got {cm.shape}.")
+
+    focus_counts = cm[np.ix_([1, 0], [1, 0])]
+    row_sum = focus_counts.sum(axis=1, keepdims=True)
+    row_sum[row_sum == 0] = 1.0
+    show = focus_counts / row_sum
+
+    scope_label = "event" if str(scope).lower() == "event" else "sequence"
+    cell_names = np.array(
+        [
+            ["TP\ngo-dark detected", "FN\ngo-dark missed"],
+            ["FP\nfalse alarm", "TN\nnormal rejected"],
+        ],
+        dtype=object,
     )
-    for attack in attack_names:
-        subset = normal_mask | (kinds_str == attack)
-        if not subset.any():
-            continue
-        attack_cm = confusion_matrix_np(y_true[subset], y_pred[subset], 2)
-        safe_name = "".join(
-            char if char.isalnum() or char in {"-", "_"} else "_"
-            for char in attack
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    image = ax.imshow(
+        show,
+        interpolation="nearest",
+        cmap="OrRd",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(f"Go-Dark Detection Matrix ({scope_label}, row-normalized)")
+    ax.set_xticks([0, 1], ["go_dark", "normal"])
+    ax.set_yticks([0, 1], ["go_dark", "normal"])
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("Actual class")
+
+    threshold = 0.55
+    for i in range(2):
+        for j in range(2):
+            ax.text(
+                j,
+                i,
+                f"{cell_names[i, j]}\n{show[i, j]:.2f}\n(n={int(focus_counts[i, j])})",
+                ha="center",
+                va="center",
+                fontsize=11,
+                fontweight="semibold" if i == 0 else "normal",
+                color="white" if show[i, j] > threshold else "black",
+            )
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def save_transshipment_detection_png(
+    cm: np.ndarray,
+    out_path: Path,
+) -> None:
+    """Save an anomaly-first, event-level transshipment candidate matrix."""
+    import matplotlib.pyplot as plt
+
+    cm = np.asarray(cm, dtype=np.float64)
+    if cm.shape != (2, 2):
+        raise ValueError(
+            f"Transshipment detection matrix must be 2x2; got {cm.shape}."
         )
-        raw_path = out_dir / f"confusion_matrix_spoofing_{safe_name}.png"
-        norm_path = out_dir / (
-            f"confusion_matrix_spoofing_{safe_name}_normalized.png"
-        )
-        save_spoofing_detection_png(
-            attack_cm,
-            raw_path,
-            attack_name=attack,
-        )
-        save_spoofing_detection_png(
-            attack_cm,
-            norm_path,
-            normalize=True,
-            attack_name=attack,
-        )
-        attack_reports[attack] = {
-            "counts": str(raw_path),
-            "normalized": str(norm_path),
-        }
-    reports["per_attack"] = attack_reports
-    return reports
+
+    # Input class order is [normal, potential_transshipment]. Reorder to the
+    # report-facing layout [[TP, FN], [FP, TN]].
+    focus_counts = cm[np.ix_([1, 0], [1, 0])]
+    row_sum = focus_counts.sum(axis=1, keepdims=True)
+    row_sum[row_sum == 0] = 1.0
+    show = focus_counts / row_sum
+    cell_names = np.array(
+        [
+            [
+                "TP\ncandidate detected",
+                "FN\ncandidate missed",
+            ],
+            ["FP\nfalse alarm", "TN\nnormal rejected"],
+        ],
+        dtype=object,
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    image = ax.imshow(
+        show,
+        interpolation="nearest",
+        cmap="OrRd",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(
+        "Transshipment Candidate Detection Matrix (event, row-normalized)"
+    )
+    ax.set_xticks([0, 1], ["potential_transshipment", "normal"])
+    ax.set_yticks([0, 1], ["potential_transshipment", "normal"])
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("Actual class")
+
+    for i in range(2):
+        for j in range(2):
+            ax.text(
+                j,
+                i,
+                f"{cell_names[i, j]}\n{show[i, j]:.2f}\n(n={int(focus_counts[i, j])})",
+                ha="center",
+                va="center",
+                fontsize=11,
+                fontweight="semibold" if i == 0 else "normal",
+                color="white" if show[i, j] > 0.55 else "black",
+            )
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
 
 
 def _per_class_metric_rows(cm: np.ndarray, labels: List[str], scope: str) -> List[Dict[str, object]]:
@@ -440,7 +568,9 @@ def _task_name_from_label_map(label_map: Dict[int, str]) -> str:
 
 
 def _primary_metric_scope(task_name: str) -> str:
-    return "sequence" if task_name in {"spoofing", "godark", "transshipment"} else "vessel"
+    # For transshipment, groups are event IDs; "vessel" metrics therefore
+    # represent the required event-level evaluation.
+    return "sequence" if task_name in {"spoofing", "godark"} else "vessel"
 
 
 def evaluate(
@@ -459,12 +589,14 @@ def evaluate(
     godark_event_min_positive_ratio: float | None = None,
     godark_event_short_min_positive_ratio: float | None = None,
     godark_event_use_short_rescue: bool | None = None,
+    godark_calibrator_path: str | Path | None = None,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = Path(model_path)
 
     X, y, groups, label_map = load_npz(Path(data_npz))
+    data_feature_cols = _load_feature_cols(Path(data_npz))
     rule_features, rule_cols = _load_rule_features(Path(data_npz))
     window_event_ids, window_kinds = _load_window_metadata(Path(data_npz))
     ckpt = _torch_load_compat(model_path, map_location="cpu")
@@ -476,6 +608,54 @@ def evaluate(
     num_classes = int(len(label_map))
     labels = [label_map.get(i, str(i)) for i in range(num_classes)]
     task_name = _task_name_from_label_map(label_map)
+    window_source_labels = (
+        _load_window_source_labels(Path(data_npz))
+        if task_name in {"godark", "transshipment"}
+        else np.array(["unknown"] * len(y), dtype=object)
+    )
+    transshipment_is_synthetic = np.zeros(len(y), dtype=np.int8)
+    transshipment_mmsi_a = np.full(len(y), "", dtype=object)
+    transshipment_mmsi_b = np.full(len(y), "", dtype=object)
+    transshipment_protocol = ""
+    if task_name == "transshipment":
+        (
+            transshipment_is_synthetic,
+            transshipment_mmsi_a,
+            transshipment_mmsi_b,
+            transshipment_protocol,
+        ) = _load_transshipment_protocol_metadata(Path(data_npz))
+        expected_protocol = "synthetic_train_only_vessel_disjoint_external_real_v1"
+        if transshipment_protocol != expected_protocol:
+            raise ValueError(
+                "Transshipment evaluation requires the leakage-safe protocol; "
+                f"expected={expected_protocol}, got={transshipment_protocol or 'missing'}."
+            )
+        checkpoint_protocol = str(ckpt.get("transshipment_data_protocol", ""))
+        if checkpoint_protocol != expected_protocol:
+            raise ValueError(
+                "Checkpoint was not trained with the locked transshipment protocol."
+            )
+    if task_name == "godark":
+        checkpoint_feature_cols = [str(x) for x in ckpt.get("feature_cols", [])]
+        if checkpoint_feature_cols and data_feature_cols != checkpoint_feature_cols:
+            raise ValueError(
+                "Go-Dark external feature schema differs from the internal training schema. "
+                f"train={checkpoint_feature_cols}, eval={data_feature_cols}"
+            )
+        if int(X.shape[-1]) != int(ckpt["input_size"]):
+            raise ValueError(
+                "Go-Dark external input width differs from the trained model: "
+                f"train={int(ckpt['input_size'])}, eval={int(X.shape[-1])}."
+            )
+    if task_name == "transshipment":
+        checkpoint_feature_cols = [str(x) for x in ckpt.get("feature_cols", [])]
+        if checkpoint_feature_cols and data_feature_cols != checkpoint_feature_cols:
+            raise ValueError(
+                "Transshipment evaluation feature schema differs from training: "
+                f"train={checkpoint_feature_cols}, eval={data_feature_cols}"
+            )
+        if int(X.shape[-1]) != int(ckpt["input_size"]):
+            raise ValueError("Transshipment input width differs from the trained model.")
     if task_name == "spoofing":
         normalized_label_map = {
             int(key): str(value).strip().lower()
@@ -549,10 +729,41 @@ def evaluate(
     if len(test_idx) == 0:
         raise ValueError(f"Selected eval split '{eval_split_name}' is empty.")
 
+    transshipment_eval_mmsi: set[str] = set()
+    if task_name == "transshipment":
+        synthetic_eval = int(transshipment_is_synthetic[test_idx].sum())
+        if eval_split_key != "train" and synthetic_eval > 0:
+            raise RuntimeError(
+                f"Synthetic encounter leaked into transshipment {eval_split_name} evaluation: "
+                f"windows={synthetic_eval}."
+            )
+        transshipment_eval_mmsi = _transshipment_mmsi_set(
+            test_idx, transshipment_mmsi_a, transshipment_mmsi_b
+        )
+        checkpoint_train_mmsi = {
+            str(v) for v in ckpt.get("transshipment_train_mmsi", []) if str(v).strip()
+        }
+        overlap = checkpoint_train_mmsi & transshipment_eval_mmsi
+        if eval_split_key != "train" and overlap:
+            raise RuntimeError(
+                "Transshipment evaluation leaks training MMSI: "
+                f"{sorted(overlap)[:10]}"
+            )
+        print(
+            "[eval] transshipment protocol valid: "
+            f"split={eval_split_name} synthetic_windows={synthetic_eval} "
+            f"vessels={len(transshipment_eval_mmsi)} train_overlap={len(overlap)}"
+        )
+
     y_test = y[test_idx]
     g_test = groups[test_idx]
     event_ids_test = window_event_ids[test_idx] if len(window_event_ids) == len(y) else np.array([""] * len(test_idx), dtype=object)
     kinds_test = window_kinds[test_idx] if len(window_kinds) == len(y) else np.array(["unknown"] * len(test_idx), dtype=object)
+    sources_test = (
+        window_source_labels[test_idx]
+        if len(window_source_labels) == len(y)
+        else np.array(["unknown"] * len(test_idx), dtype=object)
+    )
 
     scaler, scaler_path = _load_eval_scaler(model_path, out_dir, ckpt)
     if scaler is None:
@@ -575,6 +786,7 @@ def evaluate(
             attention_heads=int(ckpt.get("attention_heads", 0)),
             attention_layers=int(ckpt.get("attention_layers", 0)),
             predict_coords=bool(ckpt.get("predict_coords", False)),
+            context_summary=bool(ckpt.get("context_summary", False)),
         )
 
     model = _build_model()
@@ -712,8 +924,40 @@ def evaluate(
 
     adj_logits = logits_np - (float(best_tau) * log_pi.reshape(1, -1))
     probs = softmax_np(adj_logits)
+    godark_hybrid_path = model_path.parent / "godark_hardnegative_hybrid.joblib"
+    godark_hybrid_used = False
+    godark_calibrator_used = False
+    if task_name == "godark" and godark_hybrid_path.exists():
+        hybrid_positive_prob, hybrid_artifact = apply_godark_hardnegative_hybrid(
+            godark_hybrid_path,
+            X[test_idx],
+            probs[:, 1],
+        )
+        probs = np.column_stack([1.0 - hybrid_positive_prob, hybrid_positive_prob])
+        godark_hybrid_used = True
+        if godark_event_prob_threshold is None:
+            godark_prob_threshold = float(hybrid_artifact["prob_threshold"])
+        print(
+            "[eval] godark hard-negative hybrid enabled "
+            f"blend_neural={float(hybrid_artifact.get('blend_weight_neural', 0.5)):.2f} "
+            f"threshold={godark_prob_threshold:.3f}"
+        )
+    if task_name == "godark" and godark_calibrator_path is not None:
+        calibrator_path = Path(godark_calibrator_path)
+        artifact = joblib.load(calibrator_path)
+        estimator = artifact["estimator"]
+        positive = np.clip(probs[:, 1].astype(np.float64), 1e-6, 1.0 - 1e-6)
+        transformed = np.log(positive / (1.0 - positive)).reshape(-1, 1)
+        calibrated = estimator.predict_proba(transformed)[:, 1]
+        probs = np.column_stack([1.0 - calibrated, calibrated])
+        godark_calibrator_used = True
+        print(f"[eval] pooled-OOF Platt calibration enabled -> {calibrator_path}")
     confs = conf_score_from_probs(probs, mode=best_agg.conf_mode)
-    pred_seq = np.argmax(probs, axis=1).astype(np.int64)
+    pred_seq = (
+        (probs[:, 1] >= godark_prob_threshold).astype(np.int64)
+        if task_name == "godark"
+        else np.argmax(probs, axis=1).astype(np.int64)
+    )
 
     binary_ranking_metrics = None
     if num_classes == 2 and np.unique(y_np).size == 2:
@@ -751,8 +995,7 @@ def evaluate(
         vote = np.bincount(pred_seq[idxs], minlength=num_classes)
         maj_ratio = float(vote.max() / max(int(vote.sum()), 1))
 
-        pv_rows.append(
-            {
+        prediction_row = {
                 group_id_col: str(vid),
                 "true_id": yt,
                 "true_label": label_map.get(yt, str(yt)),
@@ -761,8 +1004,30 @@ def evaluate(
                 "confidence": float(conf_v),
                 "n_sequences": int(len(idxs)),
                 "n_used_for_vessel": int(n_used),
-            }
-        )
+        }
+        if num_classes == 2:
+            prediction_row["positive_probability"] = float(avg[1])
+        if task_name == "transshipment":
+            source_values = sources_test[idxs].astype(str)
+            source_unique, source_counts = np.unique(
+                source_values, return_counts=True
+            )
+            prediction_row["source_label"] = str(
+                source_unique[int(np.argmax(source_counts))]
+            )
+            kind_values = kinds_test[idxs].astype(str)
+            prediction_row["event_kind"] = (
+                "encounter"
+                if any("encounter" in value.lower() for value in kind_values)
+                else "loitering"
+                if any("loitering" in value.lower() for value in kind_values)
+                else "unknown"
+            )
+            mmsi_a_values = transshipment_mmsi_a[test_idx][idxs].astype(str)
+            mmsi_b_values = transshipment_mmsi_b[test_idx][idxs].astype(str)
+            prediction_row["mmsi_a"] = str(mmsi_a_values[0])
+            prediction_row["mmsi_b"] = str(mmsi_b_values[0])
+        pv_rows.append(prediction_row)
 
         vessel_details.append(
             {
@@ -801,39 +1066,45 @@ def evaluate(
     else:
         cm_primary = cm_seq if metric_scope == "sequence" else cm_v
         if task_name == "spoofing":
+            # Keep one report-ready matrix. It is row-normalized for class
+            # comparability and also prints n in every cell, so separate raw,
+            # standard-order, sequence, and vessel images are redundant.
+            for stale_path in out_dir.glob("confusion_matrix*.png"):
+                stale_path.unlink()
             save_spoofing_detection_png(
                 cm_primary,
                 out_dir / "confusion_matrix.png",
-            )
-            save_spoofing_detection_png(
-                cm_primary,
-                out_dir / "confusion_matrix_normalized.png",
                 normalize=True,
             )
-            save_confusion_png(
+        elif task_name == "godark" and cm_primary.shape == (2, 2):
+            # The report-ready Go-Dark matrix is written after event decisions
+            # are available. Do not emit redundant sequence/vessel matrices.
+            pass
+        elif task_name == "transshipment" and cm_primary.shape == (2, 2):
+            # Transshipment's primary unit is an event. Keep one report-ready
+            # anomaly-first matrix instead of six redundant blue matrices.
+            for stale_path in out_dir.glob("confusion_matrix*.png"):
+                stale_path.unlink()
+            save_transshipment_detection_png(
                 cm_primary,
-                labels,
-                out_dir / "confusion_matrix_standard.png",
-                normalize=False,
-            )
-            save_confusion_png(
-                cm_primary,
-                labels,
-                out_dir / "confusion_matrix_standard_normalized.png",
-                normalize=True,
+                out_dir / "confusion_matrix.png",
             )
         else:
             save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix.png", normalize=False)
             save_confusion_png(cm_primary, labels, out_dir / "confusion_matrix_normalized.png", normalize=True)
-        save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence.png", normalize=False)
-        save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence_normalized.png", normalize=True)
-        save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel.png", normalize=False)
-        save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel_normalized.png", normalize=True)
+            save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence.png", normalize=False)
+            save_confusion_png(cm_seq, labels, out_dir / "confusion_matrix_sequence_normalized.png", normalize=True)
+            save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel.png", normalize=False)
+            save_confusion_png(cm_v, labels, out_dir / "confusion_matrix_vessel_normalized.png", normalize=True)
 
     per_class_path = out_dir / "per_class_metrics.csv"
     per_class_rows = (
         _per_class_metric_rows(cm_seq, labels, "sequence")
-        + _per_class_metric_rows(cm_v, labels, "vessel")
+        + _per_class_metric_rows(
+            cm_v,
+            labels,
+            "event" if task_name == "transshipment" else "vessel",
+        )
     )
     pd.DataFrame(per_class_rows).to_csv(per_class_path, index=False)
 
@@ -841,16 +1112,11 @@ def evaluate(
     spoofing_sequence_path = None
     spoofing_scenario_path = None
     spoofing_scenario_metrics = None
-    spoofing_focus_reports = None
+    spoofing_primary_confusion_matrix = None
     spoofing_attack_rows = []
     if task_name == "spoofing" and len(kinds_test) == len(y_np):
         kinds_str = np.asarray(kinds_test).astype(str)
-        spoofing_focus_reports = save_spoofing_focus_reports(
-            y_np,
-            pred_seq,
-            kinds_str,
-            out_dir,
-        )
+        spoofing_primary_confusion_matrix = str(out_dir / "confusion_matrix.png")
         normal_mask = np.isin(
             np.char.lower(kinds_str),
             ["normal", "normal_random"],
@@ -976,26 +1242,6 @@ def evaluate(
                 "aggregation": "mean_top_10_percent_spoofing_probability",
                 "num_scenarios": int(len(scenario_df)),
             }
-            scenario_raw = out_dir / "confusion_matrix_spoofing_scenario.png"
-            scenario_norm = out_dir / (
-                "confusion_matrix_spoofing_scenario_normalized.png"
-            )
-            save_spoofing_detection_png(
-                scenario_cm,
-                scenario_raw,
-                attack_name="scenario level",
-            )
-            save_spoofing_detection_png(
-                scenario_cm,
-                scenario_norm,
-                normalize=True,
-                attack_name="scenario level",
-            )
-            if spoofing_focus_reports is not None:
-                spoofing_focus_reports["scenario"] = {
-                    "counts": str(scenario_raw),
-                    "normalized": str(scenario_norm),
-                }
 
     pv_name = "per_event_predictions.csv" if task_name == "transshipment" else "per_vessel_predictions.csv"
     pv_path = out_dir / pv_name
@@ -1016,6 +1262,8 @@ def evaluate(
     godark_event_metrics = None
     godark_event_path = None
     godark_event_breakdown_path = None
+    godark_source_metrics_path = None
+    godark_source_metrics_rows = None
     if task_name == "godark":
         godark_event_metrics, godark_rows = godark_event_report(
             event_ids=event_ids_test,
@@ -1034,6 +1282,14 @@ def evaluate(
         godark_event_metrics = dict(godark_event_metrics)
         godark_event_metrics["godark_score"] = godark_score(m_seq, godark_event_metrics)
         godark_event_path = out_dir / "per_godark_event_predictions.csv"
+        event_source_map = {
+            str(event_id): str(source)
+            for event_id, source in zip(event_ids_test, sources_test)
+        }
+        for row in godark_rows:
+            row["source_class"] = event_source_map.get(
+                str(row.get("event_id", "")), "unknown"
+            )
         godark_df = pd.DataFrame(godark_rows)
         if not godark_df.empty:
             godark_df = godark_df.sort_values(
@@ -1049,6 +1305,54 @@ def evaluate(
                 ascending=[False, False, True],
             )
         godark_breakdown_df.to_csv(godark_event_breakdown_path, index=False)
+        godark_source_metrics_rows = []
+        if not godark_df.empty:
+            for source_class, source_df in godark_df.groupby("source_class"):
+                counts = source_df["error_type"].value_counts().to_dict()
+                tp = int(counts.get("TP", 0))
+                fp = int(counts.get("FP", 0))
+                fn = int(counts.get("FN", 0))
+                tn = int(counts.get("TN", 0))
+                precision = tp / max(tp + fp, 1)
+                recall = tp / max(tp + fn, 1)
+                f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+                godark_source_metrics_rows.append(
+                    {
+                        "source_class": str(source_class),
+                        "events": int(len(source_df)),
+                        "tp": tp,
+                        "fp": fp,
+                        "fn": fn,
+                        "tn": tn,
+                        "precision": float(precision),
+                        "recall": float(recall),
+                        "f1": float(f1),
+                    }
+                )
+        godark_source_metrics_path = out_dir / "godark_source_metrics.csv"
+        pd.DataFrame(godark_source_metrics_rows).to_csv(
+            godark_source_metrics_path, index=False
+        )
+        godark_event_cm = np.array(
+            [
+                [
+                    int(godark_event_metrics.get("event_tn", 0)),
+                    int(godark_event_metrics.get("event_fp", 0)),
+                ],
+                [
+                    int(godark_event_metrics.get("event_fn", 0)),
+                    int(godark_event_metrics.get("event_tp", 0)),
+                ],
+            ],
+            dtype=np.int64,
+        )
+        for stale_path in out_dir.glob("confusion_matrix*.png"):
+            stale_path.unlink()
+        save_godark_detection_png(
+            godark_event_cm,
+            out_dir / "confusion_matrix.png",
+            scope="event",
+        )
 
     tx_extra = None
     tx_extra_path = None
@@ -1104,6 +1408,7 @@ def evaluate(
         "known_limitation_labels": known_limitation_labels,
         "metrics_seq": m_seq,
         "metrics_vessel": m_v,
+        "metrics_event": (m_v if task_name == "transshipment" else None),
         "metrics_seq_viable": m_seq_viable,
         "metrics_vessel_viable": m_v_viable,
         "metrics_godark_event": godark_event_metrics,
@@ -1111,8 +1416,21 @@ def evaluate(
         "metrics_hybrid": (tx_extra.get("metrics_hybrid") if tx_extra is not None else None),
         "metrics": (m_seq if metric_scope == "sequence" else m_v),
         "test_sequences": int(len(y_np)),
-        "test_vessels": int(len(v2idx)),
+        "test_vessels": (None if task_name == "transshipment" else int(len(v2idx))),
         "test_events": int(len(v2idx)) if task_name == "transshipment" else None,
+        "transshipment_data_protocol": (
+            transshipment_protocol if task_name == "transshipment" else None
+        ),
+        "transshipment_synthetic_windows": (
+            int(transshipment_is_synthetic[test_idx].sum())
+            if task_name == "transshipment"
+            else None
+        ),
+        "transshipment_eval_vessels": (
+            int(len(transshipment_eval_mmsi))
+            if task_name == "transshipment"
+            else None
+        ),
         "prediction_table": str(pv_path),
         "per_class_metrics_table": str(per_class_path),
         "wrong_high_confidence_table": str(wrong_high_conf_path),
@@ -1137,12 +1455,18 @@ def evaluate(
             else None
         ),
         "spoofing_scenario_metrics": spoofing_scenario_metrics,
-        "spoofing_focus_confusion_matrices": spoofing_focus_reports,
+        "spoofing_primary_confusion_matrix": spoofing_primary_confusion_matrix,
         "binary_ranking_metrics": binary_ranking_metrics,
         "godark_event_prediction_table": (str(godark_event_path) if godark_event_path is not None else None),
         "godark_event_error_breakdown_table": (
             str(godark_event_breakdown_path) if godark_event_breakdown_path is not None else None
         ),
+        "godark_source_metrics_table": (
+            str(godark_source_metrics_path)
+            if godark_source_metrics_path is not None
+            else None
+        ),
+        "godark_source_metrics": godark_source_metrics_rows,
         "godark_event_decision": (
             {
                 "prob_threshold": float(godark_prob_threshold),
@@ -1181,6 +1505,14 @@ def evaluate(
         ),
         "deterministic": ckpt.get("deterministic", None),
         "logit_adjust_used": True,
+        "godark_hardnegative_hybrid_used": bool(godark_hybrid_used),
+        "godark_oof_calibrator_used": bool(godark_calibrator_used),
+        "godark_oof_calibrator_path": (
+            str(godark_calibrator_path) if godark_calibrator_used else None
+        ),
+        "godark_hardnegative_hybrid_model": (
+            str(godark_hybrid_path) if godark_hybrid_used else None
+        ),
         "tau": float(best_tau),
         "keep_frac": float(best_agg.keep_frac),
         "min_keep": int(best_agg.min_keep),
@@ -1203,7 +1535,12 @@ def evaluate(
                 f"thr={godark_prob_threshold:.2f} min_win={godark_min_windows}"
             )
     else:
-        print(f"[eval][VESSEL] acc={m_v['accuracy']:.4f} macro_f1={m_v['macro_f1']:.4f} bal_acc={m_v['balanced_acc']:.4f}")
+        aggregate_label = "EVENT" if task_name == "transshipment" else "VESSEL"
+        print(
+            f"[eval][{aggregate_label}] acc={m_v['accuracy']:.4f} "
+            f"macro_f1={m_v['macro_f1']:.4f} "
+            f"bal_acc={m_v['balanced_acc']:.4f}"
+        )
         if known_limitation_labels:
             print(
                 f"[eval][VESSEL-VIABLE] acc={m_v_viable['accuracy']:.4f} "

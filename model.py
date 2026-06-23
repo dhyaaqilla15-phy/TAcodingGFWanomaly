@@ -85,6 +85,7 @@ class LSTMClassifier(nn.Module):
         attention_heads: int = 0,
         attention_layers: int = 0,
         predict_coords: bool = False,
+        context_summary: bool = False,
     ):
         super().__init__()
 
@@ -126,7 +127,22 @@ class LSTMClassifier(nn.Module):
         )
         self.attn = AttentionPool(out_dim, dropout=dropout)
 
-        pooled_dim = out_dim * 4
+        self.context_summary = bool(context_summary)
+        if self.context_summary:
+            # Go-Dark samples are constructed with the observable gap boundary
+            # at T//2.  Preserve that local signal alongside global temporal
+            # pooling; no labels or simulator-only metadata enter this branch.
+            context_in_dim = input_size * 5
+            self.context_proj = nn.Sequential(
+                nn.LayerNorm(context_in_dim),
+                nn.Linear(context_in_dim, out_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.context_proj = None
+
+        pooled_dim = out_dim * (5 if self.context_summary else 4)
         self.norm = nn.LayerNorm(pooled_dim)
         self.pooled_dropout = nn.Dropout(dropout)
 
@@ -157,14 +173,31 @@ class LSTMClassifier(nn.Module):
             self.geo_head = None
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.in_proj(x)
+        raw_x = x
+        x = self.in_proj(raw_x)
         out, _ = self.lstm(x)
         out = self.self_attn(out)
         last = out[:, -1, :]
         mean = out.mean(dim=1)
         mx = out.max(dim=1).values
         att = self.attn(out)
-        feat = torch.cat([att, mean, mx, last], dim=1)
+        pooled = [att, mean, mx, last]
+        if self.context_proj is not None:
+            center = max(1, int(raw_x.shape[1] // 2))
+            pre = raw_x[:, :center, :]
+            post = raw_x[:, center:, :]
+            context = torch.cat(
+                [
+                    raw_x[:, center, :],
+                    pre.mean(dim=1),
+                    post.mean(dim=1),
+                    pre.std(dim=1, unbiased=False),
+                    post.std(dim=1, unbiased=False),
+                ],
+                dim=1,
+            )
+            pooled.append(self.context_proj(context))
+        feat = torch.cat(pooled, dim=1)
         feat = self.norm(feat)
         feat = self.pooled_dropout(feat)
         emb = self.embed(feat)

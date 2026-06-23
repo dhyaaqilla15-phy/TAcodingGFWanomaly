@@ -9,10 +9,11 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = ROOT / "Outputs" / "spoofing_baseline01_identifiable_multiseed"
+OUTPUT_ROOT = ROOT / "Outputs" / "spoofing_baseline04_paired_position_only_multiseed"
 INTERNAL_GENERATED = OUTPUT_ROOT / "_generated_internal"
 EXTERNAL_GENERATED = OUTPUT_ROOT / "_generated_external"
 INTERNAL_PREP = OUTPUT_ROOT / "_data_internal_trainval"
@@ -21,9 +22,19 @@ INTERNAL_NPZ = INTERNAL_PREP / "processed_spoofing.npz"
 EXTERNAL_NPZ = EXTERNAL_PREP / "processed_spoofing.npz"
 LOCK_PATH = OUTPUT_ROOT / ".spoofing_multiseed.lock"
 DATA_AUDIT_PATH = OUTPUT_ROOT / "spoofing_data_audit.json"
+SPLIT_AUDIT_PATH = OUTPUT_ROOT / "spoofing_split_audit.json"
+SEMANTICS_AUDIT_PATH = OUTPUT_ROOT / "spoofing_generation_semantics_audit.json"
 
 SEEDS = (42, 43, 44, 45, 46)
 EPOCHS = 50
+FINAL_DRIFT_DEG = 0.01
+FINAL_JUMP_DEG = 0.50
+FINAL_DRIFT_RATE_KMH = 0.033
+FINAL_DRIFT_RATE_JITTER_FRAC = 0.50
+SCENARIOS_PER_ATTACK = 2
+REPORTED_MOTION_MODE = "preserve"
+MIXED_RECOMPUTE_PROBABILITY = 0.0
+INCLUDE_MATCHED_NORMAL_CONTROLS = True
 
 
 def run(command: list[str], label: str) -> int:
@@ -91,11 +102,17 @@ def model_complete(model_dir: Path) -> bool:
     try:
         history = json.loads((model_dir / "history.json").read_text())
         config = json.loads((model_dir / "train_config.json").read_text())
-        return (
-            bool(history)
-            and int(history[-1]["epoch"]) >= EPOCHS
-            and int(config["epochs"]) == EPOCHS
+        best = json.loads((model_dir / "best_epoch.json").read_text())
+        if not history or int(config["epochs"]) != EPOCHS:
+            return False
+        completed_epoch = int(history[-1]["epoch"])
+        patience = int(config.get("early_stop_patience", 0))
+        best_epoch = int(best["best_epoch"])
+        reached_configured_end = completed_epoch >= EPOCHS
+        completed_valid_early_stop = (
+            patience > 0 and completed_epoch >= best_epoch + patience
         )
+        return reached_configured_end or completed_valid_early_stop
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
@@ -106,7 +123,6 @@ def eval_complete(eval_dir: Path) -> bool:
         for name in (
             "eval_summary.json",
             "confusion_matrix.png",
-            "confusion_matrix_normalized.png",
             "spoofing_attack_metrics.csv",
             "spoofing_sequence_predictions.csv",
             "spoofing_scenario_predictions.csv",
@@ -148,14 +164,25 @@ def generation_command(
         "300",
         "--points_per_attack",
         "240",
+        "--scenarios_per_attack",
+        str(SCENARIOS_PER_ATTACK),
         "--drift_lat_deg",
-        "0.08",
+        str(FINAL_DRIFT_DEG),
         "--drift_lon_deg",
-        "0.08",
+        str(FINAL_DRIFT_DEG),
+        "--drift_rate_kmh",
+        str(FINAL_DRIFT_RATE_KMH),
+        "--drift_rate_jitter_frac",
+        str(FINAL_DRIFT_RATE_JITTER_FRAC),
         "--jump_lat_deg",
-        "0.70",
+        str(FINAL_JUMP_DEG),
         "--jump_lon_deg",
-        "0.70",
+        str(FINAL_JUMP_DEG),
+        "--reported_motion_mode",
+        REPORTED_MOTION_MODE,
+        "--mixed_recompute_probability",
+        str(MIXED_RECOMPUTE_PROBABILITY),
+        "--include_matched_normal_controls",
         "--combine_outputs",
     ]
 
@@ -237,7 +264,7 @@ def train_command(seed: int, model_dir: Path) -> list[str]:
         "--focal_gamma",
         "1.2",
         "--early_stop_patience",
-        "90",
+        "10",
         "--geo_aux_weight",
         "0",
     ]
@@ -309,6 +336,7 @@ def prepare() -> None:
         "generate external spoofing",
         lambda: generation_complete(EXTERNAL_GENERATED),
     )
+    validate_generation_semantics()
     ensure_artifact(
         preprocess_command(INTERNAL_GENERATED, INTERNAL_PREP),
         "preprocess internal spoofing",
@@ -320,6 +348,101 @@ def prepare() -> None:
         lambda: EXTERNAL_NPZ.is_file(),
     )
     validate_preprocessed_data()
+
+
+def _read_magnitude_audits(generated_dir: Path) -> pd.DataFrame:
+    paths = sorted((generated_dir / "summaries").glob("magnitude_*.csv"))
+    if not paths:
+        raise RuntimeError(f"No magnitude audits found in {generated_dir}")
+    return pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
+
+
+def validate_generation_semantics() -> None:
+    expected_modes = (
+        {"preserve", "recompute"}
+        if REPORTED_MOTION_MODE == "mixed"
+        else {REPORTED_MOTION_MODE}
+    )
+    expected_attacks = {"gradual_drift", "location_jump"}
+    lower_rate = FINAL_DRIFT_RATE_KMH * (1.0 - FINAL_DRIFT_RATE_JITTER_FRAC)
+    upper_rate = FINAL_DRIFT_RATE_KMH * (1.0 + FINAL_DRIFT_RATE_JITTER_FRAC)
+    audit: dict[str, object] = {
+        "reported_motion_mode": REPORTED_MOTION_MODE,
+        "expected_modes_per_attack": sorted(expected_modes),
+        "scenarios_per_attack": SCENARIOS_PER_ATTACK,
+        "target_drift_rate_kmh": FINAL_DRIFT_RATE_KMH,
+        "allowed_drift_rate_kmh": [lower_rate, upper_rate],
+        "datasets": {},
+        "problems": [],
+    }
+    problems: list[str] = []
+    for name, generated_dir in (
+        ("internal", INTERNAL_GENERATED),
+        ("external", EXTERNAL_GENERATED),
+    ):
+        data = _read_magnitude_audits(generated_dir)
+        combined_path = generated_dir / "spoofed_all.csv"
+        controls = pd.read_csv(
+            combined_path,
+            usecols=["scenario_id", "note", "normal_control_for_attack"],
+            low_memory=False,
+        )
+        controls = controls[
+            controls["note"].astype(str).eq("matched_unmodified_control")
+        ]
+        control_scenarios = int(controls["scenario_id"].astype(str).nunique())
+        attack_scenarios = int(
+            data[data["attack_type"].astype(str).isin(expected_attacks)][
+                "scenario_id"
+            ].astype(str).nunique()
+        )
+        dataset_rows: dict[str, object] = {}
+        dataset_rows["matched_controls"] = {
+            "attack_scenarios": attack_scenarios,
+            "control_scenarios": control_scenarios,
+        }
+        if INCLUDE_MATCHED_NORMAL_CONTROLS and control_scenarios != attack_scenarios:
+            problems.append(
+                f"{name} matched controls={control_scenarios}, attacks={attack_scenarios}"
+            )
+        for attack in sorted(expected_attacks):
+            subset = data[data["attack_type"].astype(str).eq(attack)].copy()
+            modes = set(subset["reported_motion_mode"].astype(str).tolist())
+            mode_counts = {
+                str(key): int(value)
+                for key, value in subset["reported_motion_mode"].value_counts().items()
+            }
+            dataset_rows[attack] = {
+                "scenarios": int(len(subset)),
+                "reported_motion_mode_counts": mode_counts,
+            }
+            if modes != expected_modes:
+                problems.append(
+                    f"{name}/{attack} modes={sorted(modes)}, expected={sorted(expected_modes)}"
+                )
+            if attack == "gradual_drift":
+                rates = pd.to_numeric(
+                    subset["attack_drift_rate_kmh"], errors="coerce"
+                ).dropna()
+                dataset_rows[attack]["drift_rate_kmh_min"] = float(rates.min())
+                dataset_rows[attack]["drift_rate_kmh_median"] = float(rates.median())
+                dataset_rows[attack]["drift_rate_kmh_max"] = float(rates.max())
+                tolerance = 1e-6
+                if (
+                    rates.empty
+                    or float(rates.min()) < lower_rate - tolerance
+                    or float(rates.max()) > upper_rate + tolerance
+                ):
+                    problems.append(
+                        f"{name}/gradual_drift rate outside frozen range"
+                    )
+        audit["datasets"][name] = dataset_rows
+    audit["problems"] = problems
+    audit["valid"] = not problems
+    SEMANTICS_AUDIT_PATH.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    print("[spoofing-runner] generation semantics audit passed")
 
 
 def validate_preprocessed_data() -> None:
@@ -380,6 +503,13 @@ def validate_preprocessed_data() -> None:
         ).astype(int).tolist(),
         "internal_positive_ratio": internal_positive_ratio,
         "external_positive_ratio": external_positive_ratio,
+        "drift_rate_kmh": FINAL_DRIFT_RATE_KMH,
+        "drift_rate_jitter_frac": FINAL_DRIFT_RATE_JITTER_FRAC,
+        "jump_nominal_deg": FINAL_JUMP_DEG,
+        "scenarios_per_attack": SCENARIOS_PER_ATTACK,
+        "reported_motion_mode": REPORTED_MOTION_MODE,
+        "mixed_recompute_probability": MIXED_RECOMPUTE_PROBABILITY,
+        "include_matched_normal_controls": INCLUDE_MATCHED_NORMAL_CONTROLS,
         "internal_attacks": internal_attacks,
         "external_attacks": external_attacks,
         "feature_count": len(internal_features),
@@ -400,6 +530,55 @@ def validate_preprocessed_data() -> None:
     )
 
 
+def validate_multiseed_split_diversity() -> None:
+    data = np.load(INTERNAL_NPZ, allow_pickle=True)
+    groups = data["groups"].astype(str)
+    rows = []
+    validation_sets: list[tuple[str, ...]] = []
+    for seed in SEEDS:
+        split_path = OUTPUT_ROOT / f"seed_{seed}" / "model_spoofing" / "split_indices.npz"
+        split = np.load(split_path, allow_pickle=True)
+        train_idx = split["train_idx"].astype(np.int64)
+        val_idx = split["val_idx"].astype(np.int64)
+        train_groups = set(groups[train_idx].tolist())
+        val_groups = set(groups[val_idx].tolist())
+        overlap = sorted(train_groups & val_groups)
+        validation_sets.append(tuple(sorted(val_groups)))
+        rows.append(
+            {
+                "seed": int(seed),
+                "train_groups": sorted(train_groups),
+                "validation_groups": sorted(val_groups),
+                "group_overlap": overlap,
+                "train_windows": int(train_idx.size),
+                "validation_windows": int(val_idx.size),
+            }
+        )
+
+    unique_sets = len(set(validation_sets))
+    problems = []
+    if any(row["group_overlap"] for row in rows):
+        problems.append("train/validation source-group overlap detected")
+    if unique_sets != len(SEEDS):
+        problems.append(
+            f"expected {len(SEEDS)} distinct validation group sets, got {unique_sets}"
+        )
+    audit = {
+        "requested_seeds": list(SEEDS),
+        "unique_validation_group_sets": unique_sets,
+        "valid": not problems,
+        "problems": problems,
+        "splits": rows,
+    }
+    SPLIT_AUDIT_PATH.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    print(
+        "[spoofing-runner] split audit passed: "
+        f"distinct_validation_sets={unique_sets}/{len(SEEDS)}"
+    )
+
+
 def train_and_evaluate() -> None:
     prepare()
     for seed in SEEDS:
@@ -407,7 +586,6 @@ def train_and_evaluate() -> None:
         model_dir = run_dir / "model_spoofing"
         model_path = model_dir / "model.pt"
         val_dir = run_dir / "validation_eval"
-        external_dir = run_dir / "external_test_eval"
         ensure_artifact(
             train_command(seed, model_dir),
             f"seed={seed} train",
@@ -418,6 +596,13 @@ def train_and_evaluate() -> None:
             f"seed={seed} validation",
             lambda val_dir=val_dir: eval_complete(val_dir),
         )
+
+    validate_multiseed_split_diversity()
+
+    for seed in SEEDS:
+        run_dir = OUTPUT_ROOT / f"seed_{seed}"
+        model_path = run_dir / "model_spoofing" / "model.pt"
+        external_dir = run_dir / "external_test_eval"
         ensure_artifact(
             eval_command(EXTERNAL_NPZ, model_path, external_dir, "all"),
             f"seed={seed} external",
@@ -432,6 +617,8 @@ def status() -> None:
     print(f"internal_preprocessed: {INTERNAL_NPZ.is_file()}")
     print(f"external_preprocessed: {EXTERNAL_NPZ.is_file()}")
     print(f"data_audit: {DATA_AUDIT_PATH.is_file()}")
+    print(f"split_audit: {SPLIT_AUDIT_PATH.is_file()}")
+    print(f"generation_semantics_audit: {SEMANTICS_AUDIT_PATH.is_file()}")
     for seed in SEEDS:
         run_dir = OUTPUT_ROOT / f"seed_{seed}"
         print(

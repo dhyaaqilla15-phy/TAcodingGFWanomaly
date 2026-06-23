@@ -5,16 +5,16 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 
 
-DEFAULT_GODARK_EVENT_PROB_THRESHOLD = 0.80
-DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS = 2
-DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO = 0.0
+DEFAULT_GODARK_EVENT_PROB_THRESHOLD = 0.65
+DEFAULT_GODARK_EVENT_MIN_POSITIVE_WINDOWS = 1
+DEFAULT_GODARK_EVENT_MIN_POSITIVE_RATIO = 1.0
 DEFAULT_GODARK_EVENT_MIN_RECALL = 0.70
 DEFAULT_GODARK_EVENT_MIN_PRECISION = 0.30
-DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD = 0.50
-DEFAULT_GODARK_EVENT_PROB_THRESHOLDS = (0.80, 0.90, 0.95)
-DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLDS = (0.50, 0.60, 0.70)
-DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID = (3, 5, 8, 10)
-DEFAULT_GODARK_EVENT_MIN_RATIO_GRID = (0.5, 0.6, 0.8, 1.0)
+DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLD = 0.0
+DEFAULT_GODARK_EVENT_PROB_THRESHOLDS = (0.50, 0.65, 0.80)
+DEFAULT_GODARK_EVENT_MEAN_PROB_THRESHOLDS = (0.0,)
+DEFAULT_GODARK_EVENT_MIN_WINDOWS_GRID = (1,)
+DEFAULT_GODARK_EVENT_MIN_RATIO_GRID = (1.0,)
 DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO = 0.85
 DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE = False
 
@@ -249,16 +249,11 @@ def godark_score(seq_metrics: Dict[str, float], event_metrics: Dict[str, float])
         + (0.15 * float(event_metrics.get("event_precision", 0.0)))
         + (0.15 * float(event_metrics.get("event_recall", 0.0)))
     )
-    fp_penalty = (
-        (0.0020 * float(event_metrics.get("event_fp", 0.0)))
-        + (0.0030 * float(event_metrics.get("hard_negative_gap_fp", 0.0)))
-        + (0.0025 * float(event_metrics.get("hard_negative_feature_fp", 0.0)))
-        + (0.0010 * float(event_metrics.get("normal_random_fp", 0.0)))
-    )
-    rule_penalty = (
-        (0.0400 if int(event_metrics.get("godark_event_min_positive_windows", 1)) <= 1 else 0.0)
-        + (0.0250 if float(event_metrics.get("godark_event_min_positive_ratio", 0.0)) <= 0.0 else 0.0)
-    )
+    # Rate-based penalty tetap comparable saat jumlah kandidat berubah.
+    fp_penalty = 0.20 * float(event_metrics.get("event_fp_rate", 0.0))
+    # Satu candidate gap sengaja direpresentasikan sebagai satu context window,
+    # jadi min_positive_windows=1 bukan rule yang terlalu longgar.
+    rule_penalty = 0.0
     return float(max(0.0, base - fp_penalty - rule_penalty))
 
 

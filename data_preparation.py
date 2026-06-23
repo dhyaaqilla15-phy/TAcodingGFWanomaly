@@ -13,6 +13,15 @@ from dataload import read_ais_csv, infer_label_from_filename
 
 DEFAULT_SOURCE_EXCLUDE_LABELS = ("pole_and_line", "trollers")
 DEFAULT_GEAR_EXCLUDE_LABELS = ("unknown", *DEFAULT_SOURCE_EXCLUDE_LABELS)
+DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS = (
+    "drifting_longlines",
+    "fixed_gear",
+    "purse_seines",
+    "trawlers",
+)
+TRANSSHIPMENT_GEAR_TO_ID = {
+    label: idx for idx, label in enumerate(DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS)
+}
 
 
 SEQ_FEATURE_COLS = [
@@ -83,6 +92,11 @@ class PreprocessCfg:
 
     # khusus task=spoofing
     spoofing_window_threshold: float = 0.20
+
+    # khusus task=godark: rule-based candidate filter sebelum BiLSTM.
+    godark_min_distance_from_shore_nm: float = 50.0
+    godark_ping_window_seconds: int = 12 * 3600
+    godark_min_ping_count_prev_window: int = 14
 
     # khusus task=transshipment
     transshipment_target: str = "multiclass"
@@ -650,14 +664,6 @@ def _infer_transshipment_auto_target(csvs: List[Path], limit_rows: int = 0, chun
     return _target_from_present_transshipment_classes(classes)
 
 
-def _mode_text(values: np.ndarray, default: str = "normal") -> str:
-    vals = [str(v) for v in values.tolist() if str(v) and str(v).lower() not in {"normal", "nan", "none"}]
-    if not vals:
-        return default
-    uniq, cnt = np.unique(np.asarray(vals, dtype=object), return_counts=True)
-    return str(uniq[int(np.argmax(cnt))])
-
-
 def _stable_random_state(key: str, seed: int = 42) -> np.random.RandomState:
     h = 2166136261
     for ch in str(key):
@@ -666,79 +672,29 @@ def _stable_random_state(key: str, seed: int = 42) -> np.random.RandomState:
     return np.random.RandomState((h + int(seed)) & 0xFFFFFFFF)
 
 
-def _is_godark_hard_negative(window: np.ndarray, feat_cols: List[str], cfg: PreprocessCfg) -> bool:
-    if window.size == 0:
-        return False
-    col = {name: i for i, name in enumerate(feat_cols)}
-    gap_thr = max(1800.0, min(float(cfg.gap_seconds), 24.0 * 3600.0))
-
-    dt_idx = col.get("dt_raw_seconds")
-    if dt_idx is not None and float(np.nanmax(window[:, dt_idx])) >= gap_thr:
-        return True
-
-    step_idx = col.get("step_km_raw")
-    if step_idx is not None and float(np.nanmax(window[:, step_idx])) >= 5.0:
-        return True
-
-    implied_idx = col.get("implied_speed_knots_raw")
-    if implied_idx is not None and float(np.nanmax(window[:, implied_idx])) >= 20.0:
-        return True
-
-    return False
-
-
 def _select_godark_windows(
     candidates: List[dict],
     max_windows: int,
     rng: np.random.RandomState,
 ) -> List[dict]:
-    if max_windows <= 0 or len(candidates) <= int(max_windows):
-        return candidates
-
     positives = [c for c in candidates if int(c["y"]) == 1]
-    hard_feature = [c for c in candidates if int(c["y"]) == 0 and str(c.get("kind", "")).startswith("hard_negative_feature")]
-    hard_gap = [c for c in candidates if int(c["y"]) == 0 and str(c.get("kind", "")).startswith("hard_negative_gap")]
-    hard_other = [
-        c for c in candidates
-        if int(c["y"]) == 0
-        and str(c.get("kind", "")).startswith("hard_negative")
-        and not str(c.get("kind", "")).startswith(("hard_negative_feature", "hard_negative_gap"))
-    ]
-    normal = [c for c in candidates if int(c["y"]) == 0 and not str(c.get("kind", "")).startswith("hard_negative")]
-
-    keep: List[dict] = []
-    keep.extend(positives)
-
-    remaining = int(max_windows) - len(keep)
-    if remaining <= 0:
-        idx = rng.choice(len(positives), size=int(max_windows), replace=False)
-        return [positives[int(i)] for i in sorted(idx.tolist(), key=lambda j: positives[j]["order"])]
-
-    hard_limit = max(remaining // 2, min(remaining, len(positives) * 3 if positives else remaining // 2))
-    hard_limit = min(remaining, hard_limit)
-    if hard_limit > 0:
-        feature_limit = min(len(hard_feature), max(1, int(round(hard_limit * 0.70))))
-        if feature_limit > 0:
-            idx = (
-                rng.choice(len(hard_feature), size=feature_limit, replace=False)
-                if len(hard_feature) > feature_limit else np.arange(len(hard_feature))
-            )
-            keep.extend([hard_feature[int(i)] for i in idx.tolist()])
-
-        hard_remaining = int(max(0, hard_limit - feature_limit))
-        gap_pool = hard_gap + hard_other
-        if hard_remaining > 0 and gap_pool:
-            idx = (
-                rng.choice(len(gap_pool), size=min(hard_remaining, len(gap_pool)), replace=False)
-                if len(gap_pool) > hard_remaining else np.arange(len(gap_pool))
-            )
-            keep.extend([gap_pool[int(i)] for i in idx.tolist()])
-
-    remaining = int(max_windows) - len(keep)
-    if remaining > 0 and normal:
-        idx = rng.choice(len(normal), size=min(remaining, len(normal)), replace=False)
-        keep.extend([normal[int(i)] for i in idx.tolist()])
-
+    negatives = [c for c in candidates if int(c["y"]) == 0]
+    cap = len(candidates) if max_windows <= 0 else int(max_windows)
+    if len(positives) > cap:
+        idx = rng.choice(len(positives), size=cap, replace=False)
+        positives = [positives[int(i)] for i in idx.tolist()]
+    remaining = max(0, cap - len(positives))
+    # Maksimal 3 gap alami per positif; vessel tanpa positif tetap menyumbang
+    # sedikit hard negatives untuk menguji false alarm.
+    negative_budget = min(
+        len(negatives),
+        remaining,
+        max(10, 3 * len(positives)) if positives else min(20, remaining),
+    )
+    if len(negatives) > negative_budget:
+        idx = rng.choice(len(negatives), size=negative_budget, replace=False)
+        negatives = [negatives[int(i)] for i in idx.tolist()]
+    keep = positives + negatives
     return sorted(keep, key=lambda c: int(c["order"]))
 
 
@@ -788,49 +744,164 @@ def _select_godark_indices(y: np.ndarray, kinds: np.ndarray, max_windows: int, r
     return np.sort(np.asarray(keep, dtype=np.int64))
 
 
-def _append_godark_candidate(
-    out: List[dict],
-    *,
-    order: int,
+def _build_godark_event_candidates(
+    g: pd.DataFrame,
     feat: np.ndarray,
     coords: np.ndarray,
-    y_vals: np.ndarray,
-    event_ids: np.ndarray,
-    kind: str,
+    feat_cols: List[str],
+    cfg: PreprocessCfg,
     vessel_id: str,
-) -> None:
-    y_win = int(np.max(y_vals) >= 1)
-    if y_win:
-        event_id = _mode_text(event_ids[y_vals > 0], default=f"normal::{vessel_id}")
-    elif str(kind).startswith("hard_negative"):
-        event_id = f"{kind}::{vessel_id}"
-    else:
-        event_id = f"normal::{vessel_id}"
-    if y_win:
-        kind = "positive_event"
-    out.append(
-        {
-            "order": int(order),
-            "X": feat.astype(np.float32, copy=False),
-            "coords": coords.astype(np.float64, copy=False),
-            "y": int(y_win),
-            "event_id": str(event_id),
-            "kind": str(kind),
-        }
+) -> List[dict]:
+    """Bentuk tepat satu context window untuk setiap gap yang dapat diamati."""
+    ts = g["timestamp"].to_numpy(dtype=np.int64)
+    event_ids = (
+        g.get("go_dark_event_id", pd.Series("normal", index=g.index))
+        .astype(str)
+        .to_numpy()
     )
+    y_point = g["y_point"].to_numpy(dtype=np.int64)
+    source_class = str(
+        g.get(
+            "godark_source_class",
+            pd.Series("unknown", index=g.index),
+        ).iloc[0]
+    ).strip().lower()
+    shore_km = pd.to_numeric(
+        g.get(
+            "distance_from_shore_km_normalized",
+            pd.Series(np.nan, index=g.index),
+        ),
+        errors="coerce",
+    ).to_numpy(dtype=np.float64)
+
+    seq_len = int(cfg.seq_len)
+    pre_len = seq_len // 2
+    post_len = seq_len - pre_len
+    min_shore_km = float(cfg.godark_min_distance_from_shore_nm) * 1.852
+    min_ping = max(0, int(cfg.godark_min_ping_count_prev_window))
+    ping_window = max(1, int(cfg.godark_ping_window_seconds))
+    gap_idx = np.where(np.diff(ts) >= int(cfg.gap_seconds))[0]
+    out: List[dict] = []
+
+    for order, x_raw in enumerate(gap_idx.tolist()):
+        x = int(x_raw)
+        pre_start = x - pre_len + 1
+        post_end = x + 1 + post_len
+        if pre_start < 0 or post_end > len(g):
+            continue
+
+        # Aturan kandidat diterapkan sama pada positif dan negatif. Missing
+        # shore context tidak boleh diam-diam dianggap lolos.
+        if min_shore_km > 0.0:
+            boundary_shore = shore_km[[x, x + 1]]
+            if (not np.all(np.isfinite(boundary_shore))) or float(np.min(boundary_shore)) < min_shore_km:
+                continue
+
+        left_t = int(ts[x])
+        ping_lo = int(np.searchsorted(ts, left_t - ping_window, side="left"))
+        ping_count = max(0, x - ping_lo)
+        if min_ping > 0 and ping_count < min_ping:
+            continue
+
+        left_event = str(event_ids[x])
+        right_event = str(event_ids[x + 1])
+        true_event = bool(
+            left_event not in {"", "normal", "nan", "none"}
+            and left_event == right_event
+            and (int(y_point[x]) == 1 or int(y_point[x + 1]) == 1)
+        )
+
+        window = np.concatenate(
+            [feat[pre_start:x + 1], feat[x + 1:post_end]],
+            axis=0,
+        )
+        coord_window = np.concatenate(
+            [coords[pre_start:x + 1], coords[x + 1:post_end]],
+            axis=0,
+        ).copy()
+        coord_window[:, 3] = 0.0
+        coord_window[pre_len, 3] = float(true_event)
+
+        # ID berasal dari boundary yang terlihat, bukan go_dark_event_id label.
+        observable_event_id = (
+            f"gap::{source_class}::{vessel_id}::{int(ts[x])}::{int(ts[x + 1])}"
+        )
+        trajectory_position_fraction = float((x + 0.5) / max(len(g) - 1, 1))
+        trajectory_position_stratum = int(
+            np.digitize(trajectory_position_fraction, [1.0 / 3.0, 2.0 / 3.0])
+        )
+        event_order = 0
+        if true_event:
+            try:
+                event_order = int(left_event.rsplit("_", 1)[-1])
+            except (TypeError, ValueError):
+                event_order = 1
+        out.append(
+            {
+                "order": int(order),
+                "X": window.astype(np.float32, copy=False),
+                "coords": coord_window.astype(np.float64, copy=False),
+                "y": int(true_event),
+                "event_id": observable_event_id,
+                "kind": "positive_event" if true_event else "hard_negative_gap",
+                "source_class": source_class,
+                "event_order": int(event_order),
+                "trajectory_position_stratum": int(trajectory_position_stratum),
+                "ping_count_prev_window": int(ping_count),
+            }
+        )
+
+    return out
 
 
 def build_transshipment_sequences_from_df(
     df: pd.DataFrame,
     cfg: PreprocessCfg,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     feat_cols = _transshipment_feature_cols(cfg.transshipment_feature_mode)
-    need = ["event_id", "timestamp", "lat_mid", "lon_mid"]
+    need = [
+        "event_id",
+        "timestamp",
+        "lat_mid",
+        "lon_mid",
+        "gear_a_label",
+        "gear_b_label",
+        "gear_a_id",
+        "gear_b_id",
+        "event_kind",
+        "is_synthetic",
+        "mmsi_a",
+        "mmsi_b",
+    ]
     for c in need:
         if c not in df.columns:
             raise ValueError(f"task=transshipment but required column '{c}' not found")
 
     df = df.copy()
+    allowed_sources = set(DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS)
+    gear_a = df["gear_a_label"].astype(str).str.strip().str.lower()
+    gear_b = df["gear_b_label"].astype(str).str.strip().str.lower()
+    invalid_a = sorted(set(gear_a.unique()) - allowed_sources)
+    invalid_b = sorted(set(gear_b.unique()) - allowed_sources - {"", "none", "nan"})
+    if invalid_a or invalid_b:
+        raise ValueError(
+            "task=transshipment only accepts source gear labels "
+            f"{sorted(allowed_sources)}; invalid gear_a={invalid_a}, gear_b={invalid_b}"
+        )
+    df["gear_a_label"] = gear_a
+    df["gear_b_label"] = gear_b
+    gear_a_id = pd.to_numeric(df["gear_a_id"], errors="coerce")
+    gear_b_id = pd.to_numeric(df["gear_b_id"], errors="coerce")
+    expected_a_id = gear_a.map(TRANSSHIPMENT_GEAR_TO_ID).astype(float)
+    expected_b_id = gear_b.map(TRANSSHIPMENT_GEAR_TO_ID).fillna(-1).astype(float)
+    bad_a_id = gear_a_id.isna() | gear_a_id.ne(expected_a_id)
+    bad_b_id = gear_b_id.isna() | gear_b_id.ne(expected_b_id)
+    if bool(bad_a_id.any()) or bool(bad_b_id.any()):
+        raise ValueError(
+            "task=transshipment gear IDs do not match the locked mapping "
+            f"{TRANSSHIPMENT_GEAR_TO_ID}; bad gear_a rows={int(bad_a_id.sum())}, "
+            f"bad gear_b rows={int(bad_b_id.sum())}"
+        )
     df["event_id"] = df["event_id"].astype(str)
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
     df["lat_mid"] = pd.to_numeric(df["lat_mid"], errors="coerce")
@@ -843,6 +914,13 @@ def build_transshipment_sequences_from_df(
             np.zeros((0,), dtype=object),
             np.zeros((0, cfg.seq_len, 4), dtype=np.float64),
             np.zeros((0, cfg.seq_len, len(TRANS_RULE_SCORE_COLS)), dtype=np.float32),
+            {
+                "window_is_synthetic": np.zeros((0,), dtype=np.int8),
+                "window_mmsi_a": np.zeros((0,), dtype=object),
+                "window_mmsi_b": np.zeros((0,), dtype=object),
+                "window_source_labels": np.zeros((0,), dtype=object),
+                "window_kinds": np.zeros((0,), dtype=object),
+            },
         )
 
     if "class_id" not in df.columns:
@@ -863,16 +941,19 @@ def build_transshipment_sequences_from_df(
 
     df["valid_point"] = pd.to_numeric(df["valid_point"], errors="coerce").fillna(1.0)
     df[TRANS_FEATURE_COLS] = df[TRANS_FEATURE_COLS].fillna(0.0)
-    rule_df = df[TRANS_RULE_SCORE_COLS].copy()
     df = _stabilize_transshipment_features(df)
-    df = df.sort_values(["event_id", "timestamp"])
-    rule_df = rule_df.loc[df.index].fillna(0.0)
+    df = df.sort_values(["event_id", "timestamp"]).reset_index(drop=True)
 
     X_list: List[np.ndarray] = []
     y_list: List[int] = []
     g_list: List[str] = []
     coord_list: List[np.ndarray] = []
     rule_list: List[np.ndarray] = []
+    synthetic_list: List[int] = []
+    mmsi_a_list: List[str] = []
+    mmsi_b_list: List[str] = []
+    source_list: List[str] = []
+    kind_list: List[str] = []
 
     min_points = max(1, int(cfg.min_points_per_vessel))
     seq_len = int(cfg.seq_len)
@@ -883,7 +964,10 @@ def build_transshipment_sequences_from_df(
         if len(g) < min_points:
             continue
 
-        rule_g = rule_df.loc[g.index, TRANS_RULE_SCORE_COLS].to_numpy(dtype=np.float32)
+        # Read rule scores from the current event itself. Using the reset
+        # per-event index against a global DataFrame can silently mix scores
+        # from different events.
+        rule_g = g[TRANS_RULE_SCORE_COLS].to_numpy(dtype=np.float32)
         feat = g[feat_cols].to_numpy(dtype=np.float32)
         class_ids = g["class_id"].to_numpy(dtype=np.int64)
         y_mapped = _map_transshipment_y(class_ids, target)
@@ -897,6 +981,40 @@ def build_transshipment_sequences_from_df(
             ]
         )
         y_event = int(np.bincount(y_mapped, minlength=3).argmax())
+        is_synthetic = int(
+            pd.to_numeric(g["is_synthetic"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+            .max()
+            > 0
+        )
+        event_kind = str(g["event_kind"].iloc[0]).strip().lower()
+        gear_a_label = str(g["gear_a_label"].iloc[0]).strip().lower()
+        gear_b_label = str(g["gear_b_label"].iloc[0]).strip().lower()
+        source_label = (
+            gear_a_label
+            if gear_b_label in {"", "none", "nan"}
+            else "__".join(sorted([gear_a_label, gear_b_label]))
+        )
+
+        def mmsi_text(value: object) -> str:
+            numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+            return "" if pd.isna(numeric) else str(int(round(float(numeric))))
+
+        mmsi_a = mmsi_text(g["mmsi_a"].iloc[0])
+        mmsi_b = mmsi_text(g["mmsi_b"].iloc[0])
+        window_kind = (
+            "synthetic_encounter"
+            if is_synthetic
+            else f"real_{event_kind}_{'positive' if y_event > 0 else 'negative'}"
+        )
+
+        def append_event_metadata() -> None:
+            synthetic_list.append(is_synthetic)
+            mmsi_a_list.append(mmsi_a)
+            mmsi_b_list.append(mmsi_b)
+            source_list.append(source_label)
+            kind_list.append(window_kind)
 
         windows_made = 0
         if len(g) < seq_len:
@@ -916,6 +1034,7 @@ def build_transshipment_sequences_from_df(
             coord_list.append(np.concatenate([coords, coord_pad], axis=0))
             y_list.append(y_event)
             g_list.append(str(event_id))
+            append_event_metadata()
             continue
 
         for i in range(0, len(g) - seq_len + 1, stride):
@@ -934,6 +1053,7 @@ def build_transshipment_sequences_from_df(
             coord_list.append(coord_window)
             y_list.append(y_win)
             g_list.append(str(event_id))
+            append_event_metadata()
             windows_made += 1
             if cfg.max_windows_per_vessel > 0 and windows_made >= int(cfg.max_windows_per_vessel):
                 break
@@ -945,6 +1065,13 @@ def build_transshipment_sequences_from_df(
             np.zeros((0,), dtype=object),
             np.zeros((0, seq_len, 4), dtype=np.float64),
             np.zeros((0, seq_len, len(TRANS_RULE_SCORE_COLS)), dtype=np.float32),
+            {
+                "window_is_synthetic": np.zeros((0,), dtype=np.int8),
+                "window_mmsi_a": np.zeros((0,), dtype=object),
+                "window_mmsi_b": np.zeros((0,), dtype=object),
+                "window_source_labels": np.zeros((0,), dtype=object),
+                "window_kinds": np.zeros((0,), dtype=object),
+            },
         )
 
     return (
@@ -953,13 +1080,23 @@ def build_transshipment_sequences_from_df(
         np.array(g_list, dtype=object),
         np.stack(coord_list).astype(np.float64),
         np.stack(rule_list).astype(np.float32),
+        {
+            "window_is_synthetic": np.asarray(synthetic_list, dtype=np.int8),
+            "window_mmsi_a": np.asarray(mmsi_a_list, dtype=object),
+            "window_mmsi_b": np.asarray(mmsi_b_list, dtype=object),
+            "window_source_labels": np.asarray(source_list, dtype=object),
+            "window_kinds": np.asarray(kind_list, dtype=object),
+        },
     )
 
 
 def build_sequences_from_df(
     df: pd.DataFrame,
     cfg: PreprocessCfg,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+]:
     df = clean_and_derive(df, cfg)
 
     if cfg.apply_jump_filter:
@@ -1047,6 +1184,9 @@ def build_sequences_from_df(
     coord_list: List[np.ndarray] = []
     event_id_list: List[str] = []
     kind_list: List[str] = []
+    source_list: List[str] = []
+    event_order_list: List[int] = []
+    position_stratum_list: List[int] = []
 
     for vessel_id, g in df.groupby("mmsi", sort=False):
         g = g.sort_values("timestamp")
@@ -1062,38 +1202,10 @@ def build_sequences_from_df(
             else np.zeros(len(g), dtype=np.int64)
         )
 
-        # Biasanya sequence dipotong ketika ada gap besar.
-        # Untuk go-dark, gap besar yang memang diberi label GoDark tidak boleh dipotong.
-        # Alasannya, model perlu melihat titik sebelum blackout dan titik reappearance.
+        # Task umum memotong trajectory pada gap. GoDark membentuk context
+        # event khusus di bawah dan tidak menggunakan segment ini.
         raw_gaps = np.where((ts[1:] - ts[:-1]) > cfg.gap_seconds)[0]
-
-        if cfg.task == "godark" and len(raw_gaps) > 0:
-            event_ids = (
-                g.get("go_dark_event_id", pd.Series("normal", index=g.index))
-                .astype(str)
-                .to_numpy()
-            )
-
-            keep_gap = []
-
-            for x in raw_gaps:
-                left_is_event = y_point[x] == 1
-                right_is_event = y_point[x + 1] == 1
-                same_event = (
-                    (event_ids[x] != "normal")
-                    and (event_ids[x] == event_ids[x + 1])
-                )
-
-                # keep_gap=True artinya gap ini adalah synthetic go-dark.
-                # Jadi gap ini tidak dipakai untuk memecah sequence.
-                keep_gap.append(bool(left_is_event or right_is_event or same_event))
-
-            gaps = np.array(
-                [x for x, keep in zip(raw_gaps, keep_gap) if not keep],
-                dtype=int,
-            )
-        else:
-            gaps = raw_gaps
+        gaps = raw_gaps
 
         starts = [0] + [int(x + 1) for x in gaps]
         ends = [int(x + 1) for x in gaps] + [len(g)]
@@ -1125,75 +1237,14 @@ def build_sequences_from_df(
         )
 
         if cfg.task == "godark":
-            keep_gap = []
-            for x in raw_gaps:
-                left_is_event = y_point[x] == 1
-                right_is_event = y_point[x + 1] == 1
-                same_event = (
-                    (event_ids[x] != "normal")
-                    and (event_ids[x] == event_ids[x + 1])
-                )
-                keep_gap.append(bool(left_is_event or right_is_event or same_event))
-
-            gaps = np.array(
-                [x for x, keep in zip(raw_gaps, keep_gap) if not keep],
-                dtype=int,
+            candidates = _build_godark_event_candidates(
+                g=g,
+                feat=feat,
+                coords=coords,
+                feat_cols=feat_cols,
+                cfg=cfg,
+                vessel_id=str(vessel_id),
             )
-            starts = [0] + [int(x + 1) for x in gaps]
-            ends = [int(x + 1) for x in gaps] + [len(g)]
-
-            candidates: List[dict] = []
-            order = 0
-            for s, e in zip(starts, ends):
-                if e - s < cfg.seq_len:
-                    continue
-                for i in range(s, e - cfg.seq_len + 1, cfg.stride):
-                    window = feat[i:i + cfg.seq_len]
-                    coord_window = coords[i:i + cfg.seq_len]
-                    y_vals = y_point[i:i + cfg.seq_len]
-                    event_vals = event_ids[i:i + cfg.seq_len]
-                    kind = "hard_negative_feature" if (
-                        int(np.max(y_vals) >= 1) == 0 and _is_godark_hard_negative(window, feat_cols, cfg)
-                    ) else "normal_random"
-                    _append_godark_candidate(
-                        candidates,
-                        order=order,
-                        feat=window,
-                        coords=coord_window,
-                        y_vals=y_vals,
-                        event_ids=event_vals,
-                        kind=kind,
-                        vessel_id=str(vessel_id),
-                    )
-                    order += 1
-
-            non_event_gap_idx = [int(x) for x, keep in zip(raw_gaps, keep_gap) if not keep]
-            for gap_no, x in enumerate(non_event_gap_idx):
-                lo = max(0, int(x) - cfg.seq_len + 2)
-                hi = min(int(x) + 1, len(g) - cfg.seq_len)
-                if hi < lo:
-                    continue
-                starts_gap = list(range(lo, hi + 1, max(1, cfg.stride)))
-                if hi not in starts_gap:
-                    starts_gap.append(hi)
-                for i in starts_gap:
-                    window = feat[i:i + cfg.seq_len]
-                    coord_window = coords[i:i + cfg.seq_len]
-                    y_vals = y_point[i:i + cfg.seq_len]
-                    if int(np.max(y_vals) >= 1) == 1:
-                        continue
-                    event_vals = event_ids[i:i + cfg.seq_len]
-                    _append_godark_candidate(
-                        candidates,
-                        order=order,
-                        feat=window,
-                        coords=coord_window,
-                        y_vals=y_vals,
-                        event_ids=event_vals,
-                        kind=f"hard_negative_gap::{gap_no}",
-                        vessel_id=str(vessel_id),
-                    )
-                    order += 1
 
             rng = _stable_random_state(str(vessel_id))
             selected = _select_godark_windows(candidates, int(cfg.max_windows_per_vessel), rng)
@@ -1204,6 +1255,11 @@ def build_sequences_from_df(
                 coord_list.append(item["coords"])
                 event_id_list.append(str(item["event_id"]))
                 kind_list.append(str(item["kind"]))
+                source_list.append(str(item.get("source_class", "unknown")))
+                event_order_list.append(int(item.get("event_order", 0)))
+                position_stratum_list.append(
+                    int(item.get("trajectory_position_stratum", -1))
+                )
             continue
 
         win_count = 0
@@ -1270,6 +1326,9 @@ def build_sequences_from_df(
                     kind_list.append(
                         "positive_event" if y_win else "normal_random"
                     )
+                source_list.append("unknown")
+                event_order_list.append(0)
+                position_stratum_list.append(-1)
                 win_count += 1
 
                 if (
@@ -1294,6 +1353,9 @@ def build_sequences_from_df(
             np.zeros((0, cfg.seq_len, 4), dtype=np.float64),
             np.zeros((0,), dtype=object),
             np.zeros((0,), dtype=object),
+            np.zeros((0,), dtype=object),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
         )
 
     return (
@@ -1303,6 +1365,9 @@ def build_sequences_from_df(
         np.stack(coord_list).astype(np.float64),
         np.array(event_id_list, dtype=object),
         np.array(kind_list, dtype=object),
+        np.array(source_list, dtype=object),
+        np.array(event_order_list, dtype=np.int64),
+        np.array(position_stratum_list, dtype=np.int64),
     )
 
 
@@ -1327,6 +1392,9 @@ def build_sequences_to_npz(
     op_speed_max: float = 12.0,
     use_location_features: bool = True,
     spoofing_window_threshold: float = 0.20,
+    godark_min_distance_from_shore_nm: float = 50.0,
+    godark_ping_window_seconds: int = 12 * 3600,
+    godark_min_ping_count_prev_window: int = 14,
     transshipment_target: str = "multiclass",
     transshipment_feature_mode: str = "fair",
     apply_jump_filter: Optional[bool] = None,
@@ -1342,6 +1410,13 @@ def build_sequences_to_npz(
             "[preprocess] WARNING: disabling distance_from_shore and "
             "distance_from_port for spoofing. Synthetic coordinate attacks do "
             "not have recomputed geospatial distance rasters."
+        )
+        use_location_features = False
+
+    if str(task) == "godark" and bool(use_location_features):
+        print(
+            "[preprocess] GoDark location features disabled. Shore distance "
+            "is used only as an equal candidate filter to prevent label shortcut."
         )
         use_location_features = False
 
@@ -1371,6 +1446,9 @@ def build_sequences_to_npz(
         op_speed_max=float(op_speed_max),
         use_location_features=bool(use_location_features),
         spoofing_window_threshold=float(spoofing_window_threshold),
+        godark_min_distance_from_shore_nm=float(godark_min_distance_from_shore_nm),
+        godark_ping_window_seconds=int(godark_ping_window_seconds),
+        godark_min_ping_count_prev_window=int(godark_min_ping_count_prev_window),
         transshipment_target=str(transshipment_target),
         transshipment_feature_mode=str(transshipment_feature_mode),
         apply_jump_filter=bool(apply_jump_filter),
@@ -1413,7 +1491,9 @@ def build_sequences_to_npz(
         print(f"[preprocess] transshipment_target auto -> {cfg.transshipment_target}")
 
     all_X, all_y, all_groups, all_coords = [], [], [], []
-    all_window_event_ids, all_window_kinds = [], []
+    all_window_event_ids, all_window_kinds, all_window_source_labels = [], [], []
+    all_window_event_orders, all_window_position_strata = [], []
+    all_window_is_synthetic, all_window_mmsi_a, all_window_mmsi_b = [], [], []
     all_rule_features = []
     gear_to_id: Dict[str, int] = {}
     next_id = 0
@@ -1439,6 +1519,13 @@ def build_sequences_to_npz(
         "[preprocess] location features "
         f"{'enabled' if cfg.use_location_features else 'disabled'}"
     )
+    if task == "godark":
+        print(
+            "[preprocess] GoDark event candidates: "
+            f"gap>={cfg.gap_seconds}s shore>={cfg.godark_min_distance_from_shore_nm:g}nm "
+            f"pre_gap_pings>={cfg.godark_min_ping_count_prev_window} "
+            f"within={cfg.godark_ping_window_seconds}s; one context window/event"
+        )
 
     for p in tqdm(csvs, desc="files"):
         stem = infer_label_from_filename(p)
@@ -1450,12 +1537,33 @@ def build_sequences_to_npz(
 
         try:
             if task == "transshipment":
-                X, y, groups, coords, rule_features = build_transshipment_sequences_from_df(df, cfg)
+                X, y, groups, coords, rule_features, trans_meta = (
+                    build_transshipment_sequences_from_df(df, cfg)
+                )
                 window_event_ids = groups.astype(object)
-                window_kinds = np.array(["positive_event" if int(v) > 0 else "normal_random" for v in y], dtype=object)
+                window_kinds = trans_meta["window_kinds"]
+                window_source_labels = trans_meta["window_source_labels"]
+                window_is_synthetic = trans_meta["window_is_synthetic"]
+                window_mmsi_a = trans_meta["window_mmsi_a"]
+                window_mmsi_b = trans_meta["window_mmsi_b"]
+                window_event_orders = np.zeros(len(y), dtype=np.int64)
+                window_position_strata = np.full(len(y), -1, dtype=np.int64)
             else:
-                X, y, groups, coords, window_event_ids, window_kinds = build_sequences_from_df(df, cfg)
+                (
+                    X,
+                    y,
+                    groups,
+                    coords,
+                    window_event_ids,
+                    window_kinds,
+                    window_source_labels,
+                    window_event_orders,
+                    window_position_strata,
+                ) = build_sequences_from_df(df, cfg)
                 rule_features = None
+                window_is_synthetic = np.zeros(len(y), dtype=np.int8)
+                window_mmsi_a = np.full(len(y), "", dtype=object)
+                window_mmsi_b = np.full(len(y), "", dtype=object)
         except ValueError as exc:
             if task in ["spoofing", "godark", "transshipment"]:
                 print(f"[preprocess] skip {p.name}: {exc}")
@@ -1495,6 +1603,12 @@ def build_sequences_to_npz(
             coords = coords[idx]
             window_event_ids = window_event_ids[idx]
             window_kinds = window_kinds[idx]
+            window_source_labels = window_source_labels[idx]
+            window_event_orders = window_event_orders[idx]
+            window_position_strata = window_position_strata[idx]
+            window_is_synthetic = window_is_synthetic[idx]
+            window_mmsi_a = window_mmsi_a[idx]
+            window_mmsi_b = window_mmsi_b[idx]
             if rule_features is not None:
                 rule_features = rule_features[idx]
 
@@ -1504,6 +1618,12 @@ def build_sequences_to_npz(
         all_coords.append(coords)
         all_window_event_ids.append(window_event_ids)
         all_window_kinds.append(window_kinds)
+        all_window_source_labels.append(window_source_labels)
+        all_window_event_orders.append(window_event_orders)
+        all_window_position_strata.append(window_position_strata)
+        all_window_is_synthetic.append(window_is_synthetic)
+        all_window_mmsi_a.append(window_mmsi_a)
+        all_window_mmsi_b.append(window_mmsi_b)
         if rule_features is not None:
             all_rule_features.append(rule_features)
 
@@ -1516,6 +1636,36 @@ def build_sequences_to_npz(
     coords = np.concatenate(all_coords, axis=0)
     window_event_ids = np.concatenate(all_window_event_ids, axis=0) if all_window_event_ids else np.array([], dtype=object)
     window_kinds = np.concatenate(all_window_kinds, axis=0) if all_window_kinds else np.array([], dtype=object)
+    window_source_labels = (
+        np.concatenate(all_window_source_labels, axis=0)
+        if all_window_source_labels
+        else np.array([], dtype=object)
+    )
+    window_event_orders = (
+        np.concatenate(all_window_event_orders, axis=0)
+        if all_window_event_orders
+        else np.array([], dtype=np.int64)
+    )
+    window_position_strata = (
+        np.concatenate(all_window_position_strata, axis=0)
+        if all_window_position_strata
+        else np.array([], dtype=np.int64)
+    )
+    window_is_synthetic = (
+        np.concatenate(all_window_is_synthetic, axis=0)
+        if all_window_is_synthetic
+        else np.zeros((len(X),), dtype=np.int8)
+    )
+    window_mmsi_a = (
+        np.concatenate(all_window_mmsi_a, axis=0)
+        if all_window_mmsi_a
+        else np.full((len(X),), "", dtype=object)
+    )
+    window_mmsi_b = (
+        np.concatenate(all_window_mmsi_b, axis=0)
+        if all_window_mmsi_b
+        else np.full((len(X),), "", dtype=object)
+    )
     rule_features = (
         np.concatenate(all_rule_features, axis=0)
         if all_rule_features
@@ -1540,6 +1690,12 @@ def build_sequences_to_npz(
             coords = coords[keep_mask]
             window_event_ids = window_event_ids[keep_mask]
             window_kinds = window_kinds[keep_mask]
+            window_source_labels = window_source_labels[keep_mask]
+            window_event_orders = window_event_orders[keep_mask]
+            window_position_strata = window_position_strata[keep_mask]
+            window_is_synthetic = window_is_synthetic[keep_mask]
+            window_mmsi_a = window_mmsi_a[keep_mask]
+            window_mmsi_b = window_mmsi_b[keep_mask]
             if rule_features.shape[-1] > 0:
                 rule_features = rule_features[keep_mask]
 
@@ -1568,6 +1724,12 @@ def build_sequences_to_npz(
                 coords = coords[keep_idx]
                 window_event_ids = window_event_ids[keep_idx]
                 window_kinds = window_kinds[keep_idx]
+                window_source_labels = window_source_labels[keep_idx]
+                window_event_orders = window_event_orders[keep_idx]
+                window_position_strata = window_position_strata[keep_idx]
+                window_is_synthetic = window_is_synthetic[keep_idx]
+                window_mmsi_a = window_mmsi_a[keep_idx]
+                window_mmsi_b = window_mmsi_b[keep_idx]
                 if rule_features.shape[-1] > 0:
                     rule_features = rule_features[keep_idx]
 
@@ -1595,35 +1757,81 @@ def build_sequences_to_npz(
 
     out_path = out_dir / f"processed_{task}.npz"
 
-    np.savez_compressed(
-        out_path,
-        X=X.astype(np.float32),
-        y=y,
-        groups=groups,
-        coords=coords,
-        coord_cols=np.array(["timestamp", "lat", "lon", "y_point"], dtype=object),
-        window_event_ids=window_event_ids.astype(object),
-        window_kinds=window_kinds.astype(object),
-        feature_cols=np.array(
+    save_payload = {
+        "X": X.astype(np.float32),
+        "y": y,
+        "groups": groups,
+        "coords": coords,
+        "coord_cols": np.array(
+            ["timestamp", "lat", "lon", "y_point"], dtype=object
+        ),
+        "window_event_ids": window_event_ids.astype(object),
+        "window_kinds": window_kinds.astype(object),
+        "feature_cols": np.array(
             _transshipment_feature_cols(cfg.transshipment_feature_mode)
             if task == "transshipment"
             else _sequence_feature_cols(cfg),
             dtype=object,
         ),
-        rule_features=rule_features.astype(np.float32),
-        rule_cols=np.array(TRANS_RULE_SCORE_COLS if task == "transshipment" else [], dtype=object),
-        transshipment_target=np.array(str(cfg.transshipment_target), dtype=object),
-        transshipment_feature_mode=np.array(str(cfg.transshipment_feature_mode), dtype=object),
-        gap_seconds=np.array(int(cfg.gap_seconds), dtype=np.int64),
-        seq_len=np.array(int(cfg.seq_len), dtype=np.int64),
-        stride=np.array(int(cfg.stride), dtype=np.int64),
-        use_operational_filter=np.array(bool(cfg.use_operational_filter)),
-        op_speed_min=np.array(float(cfg.op_speed_min), dtype=np.float32),
-        op_speed_max=np.array(float(cfg.op_speed_max), dtype=np.float32),
-        use_location_features=np.array(bool(cfg.use_location_features)),
-        label_map=np.array(list(label_map.items()), dtype=object),
-        scaled=np.array(False),
-    )
+        "rule_features": rule_features.astype(np.float32),
+        "rule_cols": np.array(
+            TRANS_RULE_SCORE_COLS if task == "transshipment" else [],
+            dtype=object,
+        ),
+        "transshipment_target": np.array(
+            str(cfg.transshipment_target), dtype=object
+        ),
+        "transshipment_feature_mode": np.array(
+            str(cfg.transshipment_feature_mode), dtype=object
+        ),
+        "gap_seconds": np.array(int(cfg.gap_seconds), dtype=np.int64),
+        "seq_len": np.array(int(cfg.seq_len), dtype=np.int64),
+        "stride": np.array(int(cfg.stride), dtype=np.int64),
+        "use_operational_filter": np.array(bool(cfg.use_operational_filter)),
+        "op_speed_min": np.array(float(cfg.op_speed_min), dtype=np.float32),
+        "op_speed_max": np.array(float(cfg.op_speed_max), dtype=np.float32),
+        "use_location_features": np.array(bool(cfg.use_location_features)),
+        "label_map": np.array(list(label_map.items()), dtype=object),
+        "scaled": np.array(False),
+    }
+    if task == "godark":
+        save_payload.update(
+            {
+                "window_source_labels": window_source_labels.astype(object),
+                "window_event_orders": window_event_orders.astype(np.int64),
+                "window_position_strata": window_position_strata.astype(np.int64),
+                "godark_sample_scope": np.array(
+                    "one_observable_gap_context_window_per_event", dtype=object
+                ),
+                "godark_min_distance_from_shore_nm": np.array(
+                    float(cfg.godark_min_distance_from_shore_nm),
+                    dtype=np.float32,
+                ),
+                "godark_ping_window_seconds": np.array(
+                    int(cfg.godark_ping_window_seconds), dtype=np.int64
+                ),
+                "godark_min_ping_count_prev_window": np.array(
+                    int(cfg.godark_min_ping_count_prev_window), dtype=np.int64
+                ),
+                "godark_diversity_protocol": np.array(
+                    "source_label_duration_cadence_distance_position_v2", dtype=object
+                ),
+            }
+        )
+    if task == "transshipment":
+        save_payload.update(
+            {
+                "window_source_labels": window_source_labels.astype(object),
+                "window_is_synthetic": window_is_synthetic.astype(np.int8),
+                "window_mmsi_a": window_mmsi_a.astype(object),
+                "window_mmsi_b": window_mmsi_b.astype(object),
+                "transshipment_data_protocol": np.array(
+                    "synthetic_train_only_vessel_disjoint_external_real_v1",
+                    dtype=object,
+                ),
+            }
+        )
+    np.savez_compressed(out_path, **save_payload)
 
     print(f"[preprocess] Saved: {out_path}")
     print(f"[preprocess] X={X.shape} y={y.shape} classes={len(set(y.tolist()))}")

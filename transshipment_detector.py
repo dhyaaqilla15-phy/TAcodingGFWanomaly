@@ -8,7 +8,12 @@ import numpy as np
 import pandas as pd
 
 from dataload import read_ais_csv
-from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, haversine_km_np
+from data_preparation import (
+    DEFAULT_SOURCE_EXCLUDE_LABELS,
+    DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS,
+    TRANSSHIPMENT_GEAR_TO_ID,
+    haversine_km_np,
+)
 
 try:
     from sklearn.neighbors import BallTree
@@ -59,6 +64,7 @@ TRANS_OUTPUT_COLUMNS = [
     "label",
     "class_id",
     "is_transshipment",
+    "is_synthetic",
     "timestamp",
     "mmsi_a",
     "mmsi_b",
@@ -90,7 +96,9 @@ class TransshipmentCfg:
     limit_rows: int = 0
     chunksize: int = 0
     sample_frac: float = 0.0
+    include_labels: Sequence[str] = DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS
     exclude_labels: Sequence[str] = DEFAULT_SOURCE_EXCLUDE_LABELS
+    include_mmsi_path: str = ""
 
     max_vessels_per_file: int = 60
     min_points_per_vessel: int = 40
@@ -116,6 +124,14 @@ class TransshipmentCfg:
     max_loitering_events_per_file: int = 250
     max_normal_events_per_file: int = 500
     synthetic_encounters_per_file: int = 0
+    synthetic_min_distance_km: float = 0.05
+    synthetic_max_distance_km: float = 0.48
+    synthetic_min_duration_hours: float = 2.0
+    synthetic_max_duration_hours: float = 6.0
+    synthetic_min_speed_knots: float = 0.2
+    synthetic_max_speed_knots: float = 1.9
+    synthetic_course_jitter_deg: float = 30.0
+    synthetic_balance_gear_pairs: bool = True
 
     combine_outputs: bool = False
 
@@ -128,12 +144,52 @@ def _label_set(labels: Sequence[str] | None) -> set[str]:
     return {str(label).strip().lower() for label in (labels or []) if str(label).strip()}
 
 
-def _input_csvs(input_path: Path, exclude_labels: Sequence[str] | None) -> List[Path]:
+def _read_mmsi_allowlist(path: str | Path | None) -> set[int] | None:
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if not p.exists():
+        raise FileNotFoundError(f"MMSI allowlist not found: {p}")
+    if p.suffix.lower() == ".csv":
+        manifest = pd.read_csv(p)
+        if "mmsi" not in manifest.columns:
+            raise ValueError(f"MMSI allowlist CSV requires a 'mmsi' column: {p}")
+        values = manifest["mmsi"]
+    else:
+        values = pd.Series(p.read_text(encoding="utf-8").splitlines())
+    numeric = pd.to_numeric(values, errors="coerce").dropna().round().astype("int64")
+    allowed = {int(v) for v in numeric.tolist()}
+    if not allowed:
+        raise ValueError(f"MMSI allowlist is empty: {p}")
+    return allowed
+
+
+def _input_csvs(
+    input_path: Path,
+    include_labels: Sequence[str] | None,
+    exclude_labels: Sequence[str] | None,
+) -> List[Path]:
+    permanently_allowed = set(DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS)
+    included = _label_set(include_labels) or permanently_allowed
+    unsupported = sorted(included - permanently_allowed)
+    if unsupported:
+        raise ValueError(
+            "Transshipment source allowlist is restricted to "
+            f"{sorted(permanently_allowed)}; unsupported labels={unsupported}"
+        )
+
     excluded = _label_set(exclude_labels)
     if input_path.is_dir():
         csvs = sorted(input_path.glob("*.csv"))
     else:
         csvs = [input_path]
+
+    skipped = [p for p in csvs if p.stem.strip().lower() not in included]
+    csvs = [p for p in csvs if p.stem.strip().lower() in included]
+    if skipped:
+        names = ", ".join(p.name for p in skipped)
+        print(f"[transshipment] include source labels={sorted(included)} skipped={names}")
 
     if excluded:
         skipped = [p for p in csvs if p.stem.strip().lower() in excluded]
@@ -207,19 +263,20 @@ def _prep_base_df(df: pd.DataFrame, gear_label: str, gear_id: int) -> pd.DataFra
 
 def _read_input_path(input_path: Path, cfg: TransshipmentCfg) -> pd.DataFrame:
     input_path = Path(input_path)
-    csvs = _input_csvs(input_path, cfg.exclude_labels)
+    csvs = _input_csvs(input_path, cfg.include_labels, cfg.exclude_labels)
     if not csvs:
         raise FileNotFoundError(f"No CSV found in {input_path}")
-
-    gear_labels = sorted({p.stem.strip().lower() for p in csvs})
-    gear_to_id = {g: i for i, g in enumerate(gear_labels)}
 
     parts: List[pd.DataFrame] = []
     for p in csvs:
         gear = p.stem.strip().lower()
         print(f"[transshipment] read: {p}")
         df = read_ais_csv(p, limit_rows=int(cfg.limit_rows), chunksize=int(cfg.chunksize))
-        df = _prep_base_df(df, gear_label=gear, gear_id=gear_to_id[gear])
+        df = _prep_base_df(
+            df,
+            gear_label=gear,
+            gear_id=TRANSSHIPMENT_GEAR_TO_ID[gear],
+        )
         if not df.empty:
             parts.append(df)
 
@@ -227,21 +284,82 @@ def _read_input_path(input_path: Path, cfg: TransshipmentCfg) -> pd.DataFrame:
         raise RuntimeError(f"No valid AIS rows in {input_path}")
 
     df_all = pd.concat(parts, ignore_index=True, sort=False)
+    allowed_mmsi = _read_mmsi_allowlist(cfg.include_mmsi_path)
+    if allowed_mmsi is not None:
+        before_rows = int(len(df_all))
+        before_vessels = int(df_all["mmsi"].nunique())
+        df_all = df_all[df_all["mmsi"].isin(allowed_mmsi)].copy()
+        print(
+            "[transshipment] MMSI allowlist "
+            f"rows={before_rows}->{len(df_all)} "
+            f"vessels={before_vessels}->{df_all['mmsi'].nunique()}"
+        )
+        if df_all.empty:
+            raise RuntimeError(
+                f"No AIS rows remain after applying MMSI allowlist: {cfg.include_mmsi_path}"
+            )
+    source_counts = (
+        df_all.groupby("gear_label", sort=True)
+        .agg(rows=("mmsi", "size"), vessels=("mmsi", "nunique"))
+        .reset_index()
+    )
+    invalid_sources = sorted(
+        set(source_counts["gear_label"].astype(str))
+        - set(DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS)
+    )
+    if invalid_sources:
+        raise RuntimeError(f"Unexpected transshipment source labels after loading: {invalid_sources}")
+
+    mixed_mmsi = df_all.groupby("mmsi")["gear_label"].nunique()
+    mixed_mmsi = mixed_mmsi[mixed_mmsi > 1]
+    if not mixed_mmsi.empty:
+        examples = [int(x) for x in mixed_mmsi.index[:10]]
+        raise RuntimeError(
+            "The same MMSI occurs under multiple input gear labels; this would "
+            f"contaminate source identity. Example MMSI={examples}"
+        )
+
+    print("[transshipment] accepted input source audit:\n" + source_counts.to_string(index=False))
     if cfg.sample_frac and 0.0 < float(cfg.sample_frac) < 1.0:
-        df_all = df_all.sample(frac=float(cfg.sample_frac), random_state=int(cfg.seed)).copy()
+        # Preserve temporal continuity: sample complete vessels within every
+        # source, never independent AIS rows.
+        rng = np.random.RandomState(int(cfg.seed))
+        keep_vessels: List[int] = []
+        for source in DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS:
+            vessels = np.sort(
+                df_all.loc[df_all["gear_label"] == source, "mmsi"].unique()
+            )
+            if vessels.size == 0:
+                continue
+            keep_n = max(1, int(round(vessels.size * float(cfg.sample_frac))))
+            chosen = rng.choice(
+                vessels,
+                size=min(keep_n, vessels.size),
+                replace=False,
+            )
+            keep_vessels.extend(int(x) for x in chosen.tolist())
+        df_all = df_all[df_all["mmsi"].isin(keep_vessels)].copy()
     df_all = df_all.sort_values(["mmsi", "timestamp"]).reset_index(drop=True)
     return df_all
 
 
 def _choose_vessels(df: pd.DataFrame, cfg: TransshipmentCfg, rng: np.random.RandomState) -> List[int]:
-    counts = df.groupby("mmsi").size()
-    eligible = counts[counts >= int(cfg.min_points_per_vessel)].index.to_numpy(dtype=np.int64)
-    if eligible.size == 0:
-        return []
+    selected: List[int] = []
     max_v = int(cfg.max_vessels_per_file)
-    if max_v > 0 and eligible.size > max_v:
-        eligible = rng.choice(eligible, size=max_v, replace=False)
-    return [int(x) for x in eligible.tolist()]
+    for source in DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS:
+        source_df = df[df["gear_label"] == source]
+        counts = source_df.groupby("mmsi").size()
+        eligible = counts[
+            counts >= int(cfg.min_points_per_vessel)
+        ].index.to_numpy(dtype=np.int64)
+        if max_v > 0 and eligible.size > max_v:
+            eligible = rng.choice(eligible, size=max_v, replace=False)
+        selected.extend(int(x) for x in eligible.tolist())
+        print(
+            f"[transshipment] eligible source={source} vessels={len(eligible)} "
+            f"cap_per_source={max_v}"
+        )
+    return selected
 
 
 def _interp_angle_deg(vals: np.ndarray, lo: np.ndarray, hi: np.ndarray, frac: np.ndarray) -> np.ndarray:
@@ -430,6 +548,7 @@ def _base_feature_row(
         "label": "Normal",
         "class_id": 0,
         "is_transshipment": 0,
+        "is_synthetic": 0,
         "timestamp": int(timestamp),
         "mmsi_a": int(mmsi_a),
         "mmsi_b": "" if mmsi_b is None else int(mmsi_b),
@@ -737,7 +856,12 @@ def _synthetic_partner_point(
     cfg: TransshipmentCfg,
     rng: np.random.RandomState,
 ) -> Tuple[float, float, float]:
-    radius = float(rng.uniform(0.08, max(0.09, float(cfg.encounter_distance_km) * 0.85)))
+    lower = max(0.001, float(cfg.synthetic_min_distance_km))
+    upper = min(
+        float(cfg.encounter_distance_km) * 0.999,
+        max(lower + 1e-6, float(cfg.synthetic_max_distance_km)),
+    )
+    radius = float(rng.uniform(lower, upper))
     bearing = float(rng.uniform(0.0, 2.0 * np.pi))
     dlat = (radius * np.cos(bearing)) / 111.32
     cos_lat = max(0.15, abs(float(np.cos(np.deg2rad(lat)))))
@@ -771,11 +895,19 @@ def _build_synthetic_encounter_events(
         return [], []
 
     grid_minutes = max(1, int(cfg.grid_minutes))
-    ticks = max(2, int(np.ceil(float(cfg.encounter_min_hours) * 60.0 / float(grid_minutes))))
-    vessel_groups: List[Tuple[int, pd.DataFrame]] = []
+    min_duration = max(
+        float(cfg.encounter_min_hours), float(cfg.synthetic_min_duration_hours)
+    )
+    max_duration = max(min_duration, float(cfg.synthetic_max_duration_hours))
+    min_ticks = max(2, int(np.ceil(min_duration * 60.0 / float(grid_minutes))))
+    max_ticks = max(min_ticks, int(np.ceil(max_duration * 60.0 / float(grid_minutes))))
+    vessel_groups: List[Tuple[int, str, pd.DataFrame]] = []
     for v, g in reg.groupby("mmsi", sort=False):
-        for seg in _contiguous_track_segments(g, grid_minutes=grid_minutes, min_ticks=ticks):
-            vessel_groups.append((int(v), seg))
+        source = str(g["gear_label"].iloc[0])
+        for seg in _contiguous_track_segments(
+            g, grid_minutes=grid_minutes, min_ticks=min_ticks
+        ):
+            vessel_groups.append((int(v), source, seg))
     if len(vessel_groups) < 1:
         return [], []
 
@@ -783,9 +915,34 @@ def _build_synthetic_encounter_events(
     summaries: List[dict] = []
     min_port = float(cfg.encounter_min_port_km)
     event_no = 0
+    groups_by_source = {
+        source: [item for item in vessel_groups if item[1] == source]
+        for source in DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS
+    }
+    active_sources = [source for source, items in groups_by_source.items() if items]
+    source_pairs = [
+        (left, right)
+        for i, left in enumerate(active_sources)
+        for right in active_sources[i:]
+    ]
 
-    for _ in range(n_events):
-        vessel_a, ga = vessel_groups[int(rng.randint(0, len(vessel_groups)))]
+    for synthetic_index in range(n_events):
+        if cfg.synthetic_balance_gear_pairs and source_pairs:
+            source_a, source_b = source_pairs[synthetic_index % len(source_pairs)]
+            pool_a = groups_by_source[source_a]
+            pool_b = groups_by_source[source_b]
+            vessel_a, _, ga = pool_a[int(rng.randint(0, len(pool_a)))]
+            partner_pool = [item for item in pool_b if int(item[0]) != int(vessel_a)]
+        else:
+            vessel_a, _, ga = vessel_groups[int(rng.randint(0, len(vessel_groups)))]
+            partner_pool = [item for item in vessel_groups if int(item[0]) != int(vessel_a)]
+
+        ticks = (
+            int(rng.randint(min_ticks, max_ticks + 1))
+            if max_ticks > min_ticks
+            else min_ticks
+        )
+        ticks = min(ticks, len(ga))
         start_max = len(ga) - ticks
         if start_max < 0:
             continue
@@ -794,16 +951,16 @@ def _build_synthetic_encounter_events(
         if seg_a.empty:
             continue
 
-        if len(vessel_groups) >= 2:
-            pool = [(v, g) for v, g in vessel_groups if int(v) != int(vessel_a)]
-            vessel_b, gb = pool[int(rng.randint(0, len(pool)))] if pool else vessel_groups[int(rng.randint(0, len(vessel_groups)))]
+        if partner_pool:
+            vessel_b, _, gb = partner_pool[int(rng.randint(0, len(partner_pool)))]
             if len(gb) >= ticks:
                 start_b_max = len(gb) - ticks
                 start_b = int(rng.randint(0, start_b_max + 1)) if start_b_max > 0 else 0
                 seg_b = gb.iloc[start_b:start_b + ticks].copy().reset_index(drop=True)
             else:
-                vessel_b = 900_000_000_000 + int(rng.randint(0, 99_999_999))
-                seg_b = seg_a.copy()
+                # Keep the selected partner/source and hold its last observed
+                # state when its contiguous segment is shorter than A.
+                seg_b = gb.copy().reset_index(drop=True)
         else:
             vessel_b = 900_000_000_000 + int(rng.randint(0, 99_999_999))
             seg_b = seg_a.copy()
@@ -817,9 +974,17 @@ def _build_synthetic_encounter_events(
         for k, (_, a) in enumerate(seg_a.iterrows()):
             b = seg_b.iloc[min(k, len(seg_b) - 1)] if len(seg_b) else a
             lat_b, lon_b, d_km = _synthetic_partner_point(float(a["lat"]), float(a["lon"]), cfg, rng)
-            speed_a = float(min(float(a["speed"]), max(0.1, float(cfg.encounter_max_speed_knots) * 0.75)))
-            speed_b = float(min(float(b["speed"]), max(0.1, float(cfg.encounter_max_speed_knots) * 0.75)))
-            course_b = (float(a["course"]) + float(rng.uniform(-12.0, 12.0))) % 360.0
+            speed_low = max(0.0, float(cfg.synthetic_min_speed_knots))
+            speed_high = min(
+                float(cfg.encounter_max_speed_knots) * 0.999,
+                max(speed_low + 1e-6, float(cfg.synthetic_max_speed_knots)),
+            )
+            speed_a = float(rng.uniform(speed_low, speed_high))
+            speed_b = float(rng.uniform(speed_low, speed_high))
+            jitter = max(0.0, float(cfg.synthetic_course_jitter_deg))
+            course_b = (
+                float(a["course"]) + float(rng.uniform(-jitter, jitter))
+            ) % 360.0
             port_a = _safe_offshore_value(float(a.get("port_km", np.nan)), min_port)
             port_b = _safe_offshore_value(float(b.get("port_km", np.nan)), min_port)
             shore_a = _safe_offshore_value(float(a.get("shore_km", np.nan)), 0.0)
@@ -863,6 +1028,7 @@ def _build_synthetic_encounter_events(
         seg["label"] = "Encounter"
         seg["class_id"] = 1
         seg["is_transshipment"] = 1
+        seg["is_synthetic"] = 1
         seg["duration_nearby_minutes"] = float(duration)
         seg["event_duration_minutes"] = float(duration)
         seg["both_slow"] = 1
@@ -878,6 +1044,7 @@ def _build_synthetic_encounter_events(
                 "event_kind": "encounter",
                 "label": "Encounter",
                 "class_id": 1,
+                "is_synthetic": 1,
                 "pair_id": str(seg["pair_id"].iloc[0]),
                 "mmsi_a": str(int(vessel_a)),
                 "mmsi_b": str(int(vessel_b)),
@@ -1081,6 +1248,13 @@ def generate_transshipment_dataset(input_path: Path, out_dir: Path, cfg: Transsh
 
     rng = np.random.RandomState(int(cfg.seed))
     df = _read_input_path(input_path, cfg)
+    source_audit = (
+        df.groupby(["gear_label", "gear_id"], sort=True)
+        .agg(rows=("mmsi", "size"), vessels=("mmsi", "nunique"))
+        .reset_index()
+    )
+    source_audit["allowed"] = True
+    source_audit.to_csv(summaries_dir / "source_input_audit.csv", index=False)
     reg = _regularize_all(df, cfg)
 
     run_stem = "all" if input_path.is_dir() else input_path.stem

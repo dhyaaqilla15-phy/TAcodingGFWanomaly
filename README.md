@@ -239,10 +239,6 @@ Output penting:
 
 ```text
 outputs_spoofing/model_spoofing/confusion_matrix.png
-outputs_spoofing/model_spoofing/confusion_matrix_normalized.png
-outputs_spoofing/model_spoofing/confusion_matrix_standard.png
-outputs_spoofing/model_spoofing/confusion_matrix_spoofing_gradual_drift.png
-outputs_spoofing/model_spoofing/confusion_matrix_spoofing_location_jump.png
 outputs_spoofing/model_spoofing/per_vessel_predictions.csv
 outputs_spoofing/model_spoofing/spoofing_sequence_predictions.csv
 outputs_spoofing/model_spoofing/spoofing_attack_metrics.csv
@@ -272,125 +268,93 @@ ID trajectory sintetis.
 
 # 3. Go-dark pipeline
 
-Go-dark berarti kapal menghilang dari AIS/GPS selama periode tertentu, lalu muncul lagi. Modul ini membuat gap sintetis dengan menghapus segmen trajectory dan menyimpan segmen tersembunyi sebagai ground truth.
+Pipeline ini mendeteksi **suspected AIS transmission gap**, bukan membuktikan
+niat ilegal. Rule-based stage mencari gap yang memenuhi konteks penerimaan,
+jarak pantai, dan ping sebelum gap. BiLSTM kemudian mengklasifikasikan satu
+event dari konteks lintasan sebelum dan sesudah gap. Desain candidate-gap
+mengikuti prinsip Welch et al. (2022), DOI `10.1126/sciadv.abq2109`.
 
-## Generate go-dark
+## Protokol permanen Go-Dark
 
-Generator go-dark default-nya tidak memakai sumber `pole_and_line` dan `trollers`.
-
-```bash
-python3 main.py make_godark \
-  --input_path "Dataset" \
-  --out_dir outputs_godark \
-  --limit_rows 300000 \
-  --exclude_labels pole_and_line trollers \
-  --max_vessels_per_file 20 \
-  --min_points_per_vessel 120 \
-  --events_per_vessel 1 \
-  --min_hidden_points 20 \
-  --max_hidden_points 120 \
-  --min_dark_seconds 3600 \
-  --max_dark_seconds 604800 \
-  --min_hidden_distance_km 0.5 \
-  --label_after_points 30 \
-  --combine_outputs \
-  --seed 42
-```
-
-Output:
+Go-Dark tidak memakai internal test. Domain dibentuk sebagai berikut:
 
 ```text
-outputs_godark/godark_all.csv
-outputs_godark/events/events_godark_<nama_file>.csv
-outputs_godark/hidden_truth/hidden_truth_godark_<nama_file>.csv
-outputs_godark/summaries/summary_godark_<nama_file>.csv
+Dataset                     -> generate/preprocess -> train + validation
+Dataset_Test_Enriched       -> generate/preprocess -> pure external test
 ```
 
-## Plot go-dark
+Berdasarkan hasil EDA, kedua domain dikunci dengan allowlist yang sama dan
+hanya memakai `drifting_longlines`, `fixed_gear`, `purse_seines`, dan
+`trawlers`. `unknown`, `pole_and_line`, `trollers`, serta kelas baru lain tidak
+akan ikut kecuali allowlist diubah secara eksplisit.
+
+Filter pantai pipeline ditetapkan sama pada kedua domain sebesar 5 nautical
+miles. Ambang 50 nm tidak dipakai karena seluruh purse seiner external berada
+di bawah 50 nm dan akan terhapus total. Karena itu ruang lingkup klaim adalah
+deteksi `suspected AIS gap`, bukan khusus high-seas AIS disabling.
+
+Model, scaler, hard-negative classifier, dan threshold hanya dipelajari dari
+internal train/validation. Seluruh external NPZ dievaluasi memakai
+`--eval_split all`. Pipeline akan gagal jika MMSI overlap, skema fitur berbeda,
+internal test tidak kosong, atau external evaluation melakukan tuning.
+
+Persiapan data saja, tanpa training:
 
 ```bash
-python3 main.py plot_godark \
-  --csv_path outputs_godark/godark_all.csv \
-  --out_dir outputs_godark/plots
+bash run_godark_external_test_pipeline.sh prepare
 ```
 
-## Heatmap go-dark
+Training internal train/validation selama tepat 50 epoch tanpa early stopping.
+Setelah training selesai, validation dan pure external evaluation otomatis
+langsung dijalankan:
 
 ```bash
-python3 main.py heatmap_godark \
-  --csv_path outputs_godark/godark_all.csv \
-  --out_dir outputs_godark/heatmaps \
-  --log_scale
+DEVICE=cuda bash run_godark_external_test_pipeline.sh train
 ```
 
-## Preprocess go-dark
+Untuk mengulang evaluation saja tanpa training:
 
 ```bash
-python3 main.py preprocess \
-  --data_dir outputs_godark \
-  --out_dir outputs_godark \
-  --task godark \
-  --seq_len 120 \
-  --stride 6 \
-  --gap_seconds 86400 \
-  --max_implied_knots 1000 \
-  --min_points_per_vessel 80 \
-  --spoofing_window_threshold 0.05
+DEVICE=cuda bash run_godark_external_test_pipeline.sh evaluate
 ```
 
-## Plot trajectory go-dark setelah preprocess
+Jalankan seluruh tahap sekaligus hanya jika memang ingin training langsung:
 
 ```bash
-python3 main.py plot_preprocessed \
-  --npz_path outputs_godark/processed_godark.npz \
-  --out_dir outputs_godark/plots/preprocessed \
-  --task godark
+DEVICE=cuda bash run_godark_external_test_pipeline.sh all
 ```
 
-## Train go-dark
-
-```bash
-python3 main.py train \
-  --data_npz outputs_godark/processed_godark.npz \
-  --out_dir outputs_godark/model_godark \
-  --device auto \
-  --random_state 42
-```
-
-## Evaluate go-dark
-
-```bash
-python3 main.py eval \
-  --data_npz outputs_godark/processed_godark.npz \
-  --model_path outputs_godark/model_godark/model.pt \
-  --out_dir outputs_godark/model_godark \
-  --device auto
-```
-
-Output penting:
+Output final:
 
 ```text
-outputs_godark/model_godark/confusion_matrix.png
-outputs_godark/model_godark/confusion_matrix_normalized.png
-outputs_godark/model_godark/per_vessel_predictions.csv
-outputs_godark/model_godark/per_godark_event_predictions.csv
-outputs_godark/model_godark/godark_event_error_breakdown.csv
-outputs_godark/model_godark/eval_summary.json
+Outputs/godark_external01/data_internal_trainval/processed_godark.npz
+Outputs/godark_external01/data_external_test/processed_godark.npz
+Outputs/godark_external01/model_godark/model.pt
+Outputs/godark_external01/validation_eval/eval_summary.json
+Outputs/godark_external01/external_test_eval/eval_summary.json
+Outputs/godark_external01/external_test_eval/confusion_matrix.png
+Outputs/godark_external01/external_protocol_audit.json
 ```
 
-Untuk Go-Dark, metrik utama yang perlu dibaca adalah `macro_f1`, `balanced_acc`, dan `metrics_godark_event` di `eval_summary.json`. Accuracy bisa sangat tinggi saat window normal jauh lebih banyak daripada window go-dark.
+Hanya satu confusion matrix Go-Dark dibuat per evaluasi, yaitu matrix event
+anomaly-first `confusion_matrix.png`. Untuk laporan external gunakan file dari
+folder `external_test_eval`.
 
-Evaluasi Go-Dark sekarang memakai decision rule event-level yang disimpan dari validation set:
+Setiap kandidat gap memiliki ID yang dibentuk dari MMSI serta timestamp dua
+boundary yang terlihat. Ground-truth `go_dark_event_id` hanya dipakai untuk
+menentukan target saat membuat dataset, bukan untuk membentuk grup evaluasi.
+Karena satu gap adalah satu context window, evaluasi event memakai:
 
 ```text
 event positif jika:
-max_go_dark_probability >= godark_event_prob_threshold
-DAN mean_go_dark_probability >= godark_event_mean_prob_threshold
-DAN windows_over_threshold >= godark_event_min_positive_windows
-DAN positive_window_ratio >= godark_event_min_positive_ratio
+go_dark_probability >= godark_event_prob_threshold
 ```
 
-Saat training Go-Dark, pipeline menyapu beberapa threshold validation dan menyimpan kombinasi terbaik ke checkpoint berdasarkan `godark_score` yang sudah diberi penalti false-positive. Seleksi sekarang memakai guardrail `godark_event_min_recall` dan `godark_event_min_precision`, grid mean probability, serta tau Go-Dark yang dibatasi. Short-event rescue default-nya mati; aktifkan hanya untuk ablation dengan `--godark_event_use_short_rescue`. Checkpoint Go-Dark juga menulis `checkpoint_status`, sehingga model dengan precision/recall/F1 event yang tidak memenuhi batas minimum tidak dianggap valid walaupun artefaknya tetap tersimpan untuk diagnosis. Saat eval test, threshold tersebut dipakai apa adanya agar tidak ada tuning di test set. Untuk diagnosis, baca `per_godark_event_predictions.csv` dan `godark_event_error_breakdown.csv`, terutama false positive dari `hard_negative_gap`, `hard_negative_feature`, dan `normal_random`.
+Threshold dipilih hanya dari validation lalu dibekukan pada test. Grid sengaja
+dibatasi menjadi tiga probability threshold agar runtime lebih ringan dan
+mengurangi multiple-comparison overfitting. Untuk diagnosis, baca
+`per_godark_event_predictions.csv` dan `godark_event_error_breakdown.csv`,
+terutama false positive pada `hard_negative_gap`.
 
 ---
 
@@ -403,9 +367,110 @@ Transshipment di AIS tidak bisa membuktikan transfer ikan/barang secara langsung
 - Untuk akurasi yang lebih stabil, pipeline juga menyimpan `encounter_rule_score`, `loitering_rule_score`, dan `risk_score`, lalu evaluasi transshipment memakai pembanding LSTM, tabular Random Forest, dan hybrid rule+ML.
 - Target default yang disarankan untuk eksperimen awal adalah binary `--transshipment_target any` = `normal` vs `potential_transshipment`. Gunakan `encounter`, `loitering`, atau `multiclass` kalau data positifnya sudah cukup.
 
+## Protokol training/evaluasi transshipment
+
+Pipeline resmi memisahkan domain sebelum event dibuat:
+
+```text
+Dataset / internal train      -> real + synthetic encounter
+Dataset / internal validation -> real event saja, MMSI disjoint
+Dataset_Test_Enriched          -> pure external real event, tanpa synthetic
+```
+
+Keempat sumber dikunci ke `drifting_longlines`, `fixed_gear`, `purse_seines`,
+dan `trawlers`. Split internal source-stratified dilakukan pada MMSI sebelum
+generator berjalan. Checkpoint dipilih dengan metrik event-level; synthetic
+dilarang masuk validation maupun external test.
+
+Persiapan seluruh data tanpa training:
+
+```bash
+bash run_transshipment_external_test_pipeline.sh prepare
+```
+
+Smoke test lima epoch, hanya membuka internal validation:
+
+```bash
+DEVICE=cuda bash run_transshipment_external_test_pipeline.sh smoke
+```
+
+Training 50 epoch tanpa early stopping, kemudian validation dan pure external
+evaluation otomatis:
+
+```bash
+DEVICE=cuda bash run_transshipment_external_test_pipeline.sh train
+```
+
+Evaluasi ulang tanpa training:
+
+```bash
+DEVICE=cuda bash run_transshipment_external_test_pipeline.sh evaluate
+```
+
+Setelah baseline, tuning resmi dilakukan hanya dari internal real-event OOF.
+Generator synthetic train mencakup variasi jarak `0.05-0.48 km`, durasi
+`2-6 jam`, kecepatan `0.2-1.9 knot`, course jitter `+-30 derajat`, dan
+penyeimbangan pasangan empat gear. Jumlah synthetic dibandingkan pada level
+50, 125, dan seluruh event aman yang tersedia per fold.
+
+```bash
+# Setelah perubahan generator, siapkan ulang data lebih dahulu.
+bash run_transshipment_external_test_pipeline.sh prepare
+
+# Hanya membuat 3 fold vessel/pair-disjoint; tidak training.
+python run_transshipment_oof_tuning.py prepare
+
+# 3 synthetic-count variants x seeds 42/43/44 x 3 folds, 50 epoch.
+DEVICE=cuda python run_transshipment_oof_tuning.py search
+```
+
+Mode `search` tidak membaca external. Ia melakukan cross-fitted Platt
+calibration, memilih threshold dari pooled OOF dengan precision/recall floor,
+dan menilai macro performance per event-kind serta source-pair. External yang
+sudah pernah dilihat hanya boleh dibuka sebagai development benchmark:
+
+```bash
+DEVICE=cuda python run_transshipment_oof_tuning.py external
+```
+
+Output internal utama:
+
+```text
+Outputs/transshipment_tuning01_internal_oof/fold_audit.csv
+Outputs/transshipment_tuning01_internal_oof/internal_oof_variant_ranking.csv
+Outputs/transshipment_tuning01_internal_oof/winner_internal_only.json
+Outputs/transshipment_tuning01_internal_oof/calibrators/
+```
+
+Checkpoint, history, scaler, dan validation output setiap training trial sengaja
+dipisahkan dari data/laporan dan disimpan di:
+
+```text
+Outputs/transshipment_training01_internal_oof/runs/<variant>/seed_<seed>/fold_<fold>/
+```
+
+Lokasi ini dapat diganti tanpa mengubah folder data melalui environment
+variable `TRANS_TRAIN_ROOT`.
+
+Audit utama tersimpan di:
+
+```text
+Outputs/transshipment_external01/manifests/mmsi_split_audit.json
+Outputs/transshipment_external01/data_internal_trainval/transshipment_protocol_audit.json
+Outputs/transshipment_external01/validation_eval/eval_summary.json
+Outputs/transshipment_external01/external_test_eval/eval_summary.json
+```
+
+Perintah manual di bawah hanya untuk eksplorasi generator. Jangan memakai satu
+NPZ campuran untuk klaim validation/final karena synthetic dapat tercampur.
+
 ## Generate transshipment candidates
 
-Generator transshipment default-nya tidak memakai sumber `pole_and_line` dan `trollers`.
+Generator transshipment memakai allowlist permanen hasil EDA: hanya
+`drifting_longlines`, `fixed_gear`, `purse_seines`, dan `trawlers`.
+`unknown`, `pole_and_line`, `trollers`, maupun file kelas baru lain otomatis
+ditolak. Audit sumber tersimpan di
+`outputs_transshipment/summaries/source_input_audit.csv`.
 
 ```bash
 python3 main.py make_transshipment \
@@ -413,6 +478,7 @@ python3 main.py make_transshipment \
   --out_dir outputs_transshipment \
   --mode both \
   --limit_rows 300000 \
+  --include_labels drifting_longlines fixed_gear purse_seines trawlers \
   --exclude_labels pole_and_line trollers \
   --max_vessels_per_file 60 \
   --grid_minutes 10 \
@@ -627,3 +693,104 @@ Di `summary.csv` akan ada:
 - balanced accuracy
 - accuracy
 - Go-Dark event precision/recall/F1 jika task yang dievaluasi adalah Go-Dark
+
+---
+
+# 7. Go-Dark: tuning internal dan external test terkunci
+
+Workflow Go-Dark terbaru memakai empat sumber kapal hasil EDA saja:
+`drifting_longlines`, `fixed_gear`, `purse_seines`, dan `trawlers`.
+Setiap window menyimpan metadata sumber kapal, lalu training menyeimbangkan
+gabungan `source_class x label`. Metadata sumber tidak dipakai sebagai fitur
+model.
+
+Karena format NPZ bertambah, siapkan ulang data terlebih dahulu:
+
+```bash
+bash run_godark_external_test_pipeline.sh prepare
+```
+
+Jalankan pencarian hyperparameter hanya pada internal train/validation:
+
+```bash
+DEVICE=cuda python run_godark_hparam_tuning.py search
+```
+
+Tahap ini menjalankan model compact selama 50 epoch tanpa early stopping pada
+seed 42, 43, dan 44. Ketiga validation fold bersifat disjoint, vessel-level,
+source-stratified, dan bersama-sama mencakup seluruh data internal tepat satu
+kali. Probabilitas dikalibrasi dengan Platt scaling dari pooled OOF internal.
+Threshold serta konfigurasi dipilih memakai macro-F1 antar-source dengan
+minimum source recall sebagai constraint, bukan overall F1 yang dapat
+didominasi satu jenis kapal. Hasil utamanya:
+
+```text
+Outputs/godark_tuning01_internal_oof/internal_multiseed_ranking.csv
+Outputs/godark_tuning01_internal_oof/pooled_oof_threshold_sweep.csv
+Outputs/godark_tuning01_internal_oof/winner_internal_only.json
+Outputs/godark_tuning01_internal_oof/source_stratified_folds/fold_source_audit.csv
+Outputs/godark_tuning01_internal_oof/oof_calibrators/
+```
+
+Data external tidak dibaca oleh mode `search`. Setelah winner internal sudah
+terkunci, buka external test tepat satu tahap dengan:
+
+```bash
+DEVICE=cuda python run_godark_hparam_tuning.py external
+```
+
+Untuk final holdout baru yang belum pernah diperiksa:
+
+```bash
+DEVICE=cuda \
+GODARK_EXTERNAL_NPZ=Outputs/godark_final_holdout/data_external_test/processed_godark.npz \
+python run_godark_hparam_tuning.py external
+```
+
+Threshold pada external test selalu berasal dari pooled internal validation;
+external test tidak melakukan threshold tuning atau pemilihan model. Ringkasan
+akhir disimpan di:
+
+```text
+Outputs/godark_tuning01_internal_oof/final_external_summary.json
+Outputs/godark_tuning01_internal_oof/final_external_winner_results.csv
+Outputs/godark_tuning01_internal_oof/final_external_ensemble/ensemble_summary.json
+Outputs/godark_tuning01_internal_oof/final_external_ensemble/confusion_matrix.png
+```
+
+Ensemble memakai mean calibrated probability seluruh fold model dan kebijakan
+ini dikunci sebelum external dibuka. Laporan ensemble menyertakan 95% bootstrap
+confidence interval dari 2.000 resampling cluster kapal yang distratifikasi
+per source.
+
+## Go-Dark manipulation-point sensitivity
+
+Eksperimen ini menjawab pengaruh jumlah dan posisi titik manipulasi tanpa
+memakai external test. Satu master NPZ yang sama disubset menjadi enam varian:
+
+```text
+event count: 1, 2, 3 per vessel
+trajectory position: early, middle, late
+```
+
+Posisi didefinisikan dari fraksi temporal relatif di trajectory setiap vessel:
+`[0,1/3)`, `[1/3,2/3)`, dan `[2/3,1]`. Semua varian memakai model pemenang
+`compact_h128`, tiga source-stratified OOF folds, dan hard-negative pool yang
+sama agar hanya faktor manipulasi yang berubah.
+
+```bash
+bash run_godark_external_test_pipeline.sh prepare
+python run_godark_manipulation_tuning.py prepare
+DEVICE=cuda python run_godark_manipulation_tuning.py search
+```
+
+Rekap untuk laporan dosen:
+
+```text
+Outputs/godark_manipulation_tuning01/variant_data_audit.csv
+Outputs/godark_manipulation_tuning01/manipulation_sensitivity_summary.csv
+Outputs/godark_manipulation_tuning01/manipulation_sensitivity_best_internal.json
+```
+
+Eksperimen ini adalah sensitivity/ablation internal, bukan alasan membuka atau
+menyetel ulang external test.

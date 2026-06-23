@@ -1,0 +1,28 @@
+{
+  "status": "LOCKED",
+  "locked_on": "2026-06-23",
+  "scope": "GoDark only",
+  "selection_rule": "internal pooled source-stratified OOF only",
+  "external_used_for_selection": false,
+  "data_variant": "count_3",
+  "model_config": "compact_h128",
+  "decision_threshold": 0.32500000000000007,
+  "calibration": "Platt scaling fitted from pooled internal OOF",
+  "representative_seed": 44,
+  "representative_seed_selection": "selected from internal validation only",
+  "official_inference_policy": "mean calibrated probability ensemble of seeds 42, 43, and 44",
+  "representative_model": {
+    "path": "Outputs/godark_manipulation_tuning01/runs/count_3/trials/compact_h128/seed_44/model_godark/model.pt",
+    "sha256": "C37798565A61A7BF26276F8E82F524127BC5DFBA5127BF432DCB19C5D41E0BF5"
+  },
+  "official_validation": {
+    "path": "Outputs/godark_manipulation_tuning01/best_selected/validation_oof/validation_summary.json",
+    "sha256": "2EDB7540FE100164319C7D86B44D517EACBB74873AF9A3B2A2A2253E8C06233F"
+  },
+  "official_test": {
+    "path": "Outputs/godark_manipulation_tuning01/best_selected/test_external_ensemble/test_summary.json",
+    "sha256": "A046AA20A379146D7D2F851F61060DC903FE9CB5D9601DF961FE2CEE7BCE62FB"
+  },
+  "change_policy": "Do not retrain, retune, recalibrate, or change the threshold using the current external test. Any future development must create a new version and use a new untouched external holdout.",
+  "unrelated_pipelines_modified_by_this_lock": []
+}

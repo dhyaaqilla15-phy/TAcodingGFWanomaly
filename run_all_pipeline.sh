@@ -33,6 +33,7 @@ TRANS_TARGET="${TRANS_TARGET:-any}"
 TRANS_FEATURE_MODE="${TRANS_FEATURE_MODE:-fair}"
 TRANS_GEO_AUX_WEIGHT="${TRANS_GEO_AUX_WEIGHT:-0}"
 TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE="${TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE:-250}"
+TRANS_INCLUDE_LABELS="${TRANS_INCLUDE_LABELS:-drifting_longlines fixed_gear purse_seines trawlers}"
 
 usage() {
   cat <<EOF
@@ -72,6 +73,7 @@ Optional environment variables:
   TRANS_FEATURE_MODE=fair|full
   TRANS_GEO_AUX_WEIGHT=0
   TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE=250
+  TRANS_INCLUDE_LABELS="drifting_longlines fixed_gear purse_seines trawlers"
 
 Example:
   bash run_all_pipeline.sh
@@ -100,6 +102,7 @@ mkdir -p "$OUT_GEAR" "$OUT_SPOOF" "$OUT_GODARK" "$OUT_TRANS"
 
 read -r -a gear_exclude_labels <<< "$GEAR_EXCLUDE_LABELS"
 read -r -a source_exclude_labels <<< "$SOURCE_EXCLUDE_LABELS"
+read -r -a trans_include_labels <<< "$TRANS_INCLUDE_LABELS"
 gear_operational_filter_args=()
 if [[ "$GEAR_USE_OPERATIONAL_FILTER" == "1" ]]; then
   gear_operational_filter_args+=(
@@ -146,6 +149,7 @@ echo "[pipeline] trans_target = $TRANS_TARGET"
 echo "[pipeline] trans_feature_mode = $TRANS_FEATURE_MODE"
 echo "[pipeline] trans_geo_aux_weight = $TRANS_GEO_AUX_WEIGHT"
 echo "[pipeline] trans_synthetic_encounters_per_file = $TRANS_SYNTHETIC_ENCOUNTERS_PER_FILE"
+echo "[pipeline] trans_include_labels = $TRANS_INCLUDE_LABELS"
 
 run_step "[1/20] Gear preprocess" \
   python3 "$MAIN_PY" preprocess \
@@ -320,6 +324,7 @@ run_step "[16/20] Transshipment candidate generate" \
   --out_dir "$OUT_TRANS" \
   --mode both \
   --limit_rows "$SOURCE_LIMIT_ROWS" \
+  --include_labels "${trans_include_labels[@]}" \
   --exclude_labels "${source_exclude_labels[@]}" \
   --max_vessels_per_file 60 \
   --min_points_per_vessel 40 \

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
 from model import LSTMClassifier
-from split import group_train_val_test_split
+from split import Split3Result, group_train_val_test_split
 from standardize import fit_robust_scaler, apply_scaler
 from agg_utils import (
     AggParams,
@@ -38,6 +38,7 @@ from godark_event import (
     DEFAULT_GODARK_EVENT_PROB_THRESHOLDS,
     DEFAULT_GODARK_EVENT_SHORT_MIN_RATIO,
     DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
+    godark_event_report,
     godark_selection_key,
     pick_best_godark_event_setting,
 )
@@ -122,6 +123,55 @@ def _load_window_metadata(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, bool]
     if int(event_ids.shape[0]) != n or int(kinds.shape[0]) != n:
         return np.array([""] * n, dtype=object), np.array(["unknown"] * n, dtype=object), False
     return event_ids, kinds, True
+
+
+def _load_window_source_labels(npz_path: Path) -> Tuple[np.ndarray, bool]:
+    data = np.load(npz_path, allow_pickle=True)
+    n = int(data["y"].shape[0])
+    if "window_source_labels" not in data.files:
+        return np.array(["unknown"] * n, dtype=object), False
+    labels = data["window_source_labels"].astype(object)
+    valid = int(labels.shape[0]) == n and len(set(labels.astype(str))) >= 2
+    return labels, bool(valid)
+
+
+def _load_transshipment_protocol_metadata(
+    npz_path: Path,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    with np.load(npz_path, allow_pickle=True) as data:
+        required = {"window_is_synthetic", "window_mmsi_a", "window_mmsi_b"}
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise ValueError(
+                "Transshipment NPZ lacks leakage-audit metadata. Rerun the "
+                f"dedicated prepare pipeline; missing={missing}."
+            )
+        n = int(len(data["y"]))
+        synthetic = data["window_is_synthetic"].astype(np.int8)
+        mmsi_a = data["window_mmsi_a"].astype(object)
+        mmsi_b = data["window_mmsi_b"].astype(object)
+        if any(int(arr.shape[0]) != n for arr in (synthetic, mmsi_a, mmsi_b)):
+            raise ValueError("Transshipment protocol metadata is not aligned with y.")
+        protocol = (
+            str(np.asarray(data["transshipment_data_protocol"]).item())
+            if "transshipment_data_protocol" in data.files
+            else ""
+        )
+    return synthetic, mmsi_a, mmsi_b, protocol
+
+
+def _transshipment_mmsi_set(
+    indices: np.ndarray,
+    mmsi_a: np.ndarray,
+    mmsi_b: np.ndarray,
+) -> set[str]:
+    values: set[str] = set()
+    for arr in (mmsi_a, mmsi_b):
+        for raw in arr[indices].astype(str).tolist():
+            value = str(raw).strip()
+            if value and value.lower() not in {"none", "nan", "-1"}:
+                values.add(value)
+    return values
 
 
 def pick_device(device: str) -> torch.device:
@@ -225,7 +275,10 @@ def _task_name_from_label_map(label_map: Dict[int, str]) -> str:
 
 
 def _primary_metric_scope(task_name: str) -> str:
-    return "sequence" if task_name in {"spoofing", "godark", "transshipment"} else "vessel"
+    # Transshipment groups are event IDs, so the historical "vessel" scope is
+    # event-level aggregation for this task. Selecting on windows would let
+    # long events dominate checkpoint choice.
+    return "sequence" if task_name in {"spoofing", "godark"} else "vessel"
 
 
 def _save_history_plot(history: List[Dict[str, object]], out_path: Path) -> None:
@@ -673,6 +726,8 @@ def train_from_npz(
     godark_event_use_short_rescue: bool = DEFAULT_GODARK_EVENT_USE_SHORT_RESCUE,
     godark_event_min_recall: float = DEFAULT_GODARK_EVENT_MIN_RECALL,
     godark_event_min_precision: float = DEFAULT_GODARK_EVENT_MIN_PRECISION,
+    godark_source_balancing: bool = True,
+    split_indices_path: Path | None = None,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -712,6 +767,30 @@ def train_from_npz(
     num_classes = int(len(label_map))
     input_size = int(X.shape[-1])
     task_name = _task_name_from_label_map(label_map)
+    if task_name in {"godark", "transshipment"}:
+        window_source_labels, has_window_source_labels = (
+            _load_window_source_labels(Path(data_npz))
+        )
+    else:
+        window_source_labels = np.array(
+            ["unknown"] * len(y), dtype=object
+        )
+        has_window_source_labels = False
+    transshipment_train_mmsi: list[str] = []
+    transshipment_protocol = ""
+    if task_name == "transshipment":
+        (
+            transshipment_is_synthetic,
+            transshipment_mmsi_a,
+            transshipment_mmsi_b,
+            transshipment_protocol,
+        ) = _load_transshipment_protocol_metadata(Path(data_npz))
+        expected_protocol = "synthetic_train_only_vessel_disjoint_external_real_v1"
+        if transshipment_protocol != expected_protocol:
+            raise ValueError(
+                "Transshipment training requires the locked leakage-safe protocol; "
+                f"expected={expected_protocol}, got={transshipment_protocol or 'missing'}."
+            )
     metric_scope = _primary_metric_scope(task_name)
     if task_name == "spoofing":
         normalized_label_map = {
@@ -733,6 +812,18 @@ def train_from_npz(
         print(
             "[train] spoofing augmentation: time/feature masking disabled; "
             "small jitter retained to avoid erasing the anomaly signal."
+        )
+    elif task_name == "godark":
+        aug_cfg = AugCfg(
+            p_aug=0.30,
+            p_time_mask=0.0,
+            p_feat_mask=0.0,
+            p_jitter=0.20,
+            noise_std=0.008,
+        )
+        print(
+            "[train] godark augmentation: time/feature masking disabled; "
+            "the observable gap boundary at the sequence center is preserved."
         )
     godark_event_prob_thresholds = [
         float(v) for v in (godark_event_prob_thresholds or list(DEFAULT_GODARK_EVENT_PROB_THRESHOLDS))
@@ -761,11 +852,12 @@ def train_from_npz(
     if task_name == "godark" and not has_window_metadata:
         print("[train] WARNING: NPZ has no Go-Dark window_event_ids/window_kinds; event-level model selection is disabled.")
     use_geo_aux = bool(float(geo_aux_weight) > 0.0 and coords is not None)
-    if task_name == "spoofing" and use_geo_aux:
+    use_context_summary = bool(task_name == "godark")
+    if task_name in {"spoofing", "godark"} and use_geo_aux:
         print(
-            "[train] WARNING: geo auxiliary loss disabled for spoofing. "
+            f"[train] WARNING: geo auxiliary loss disabled for {task_name}. "
             "Predicting absolute coordinates can encourage geographic "
-            "memorization instead of manipulation detection."
+            "memorization instead of anomaly-context detection."
         )
         use_geo_aux = False
     if float(geo_aux_weight) > 0.0 and coords is None:
@@ -780,15 +872,100 @@ def train_from_npz(
         f"geo_aux_weight={(float(geo_aux_weight) if use_geo_aux else 0.0)}"
     )
 
-    split = group_train_val_test_split(
-        X, y, groups,
-        val_size=val_size,
-        test_size=test_size,
-        random_state=split_seed,
-        stratify_groups=True,
-        max_tries=400,
-        mixed_label_groups=(task_name == "spoofing"),
-    )
+    if split_indices_path is not None:
+        with np.load(Path(split_indices_path), allow_pickle=True) as split_data:
+            split = Split3Result(
+                train_idx=split_data["train_idx"].astype(np.int64),
+                val_idx=split_data["val_idx"].astype(np.int64),
+                test_idx=(
+                    split_data["test_idx"].astype(np.int64)
+                    if "test_idx" in split_data.files
+                    else np.array([], dtype=np.int64)
+                ),
+            )
+        all_parts = np.concatenate([split.train_idx, split.val_idx, split.test_idx])
+        if all_parts.size != np.unique(all_parts).size:
+            raise ValueError("Precomputed split indices overlap.")
+        if all_parts.size and (int(all_parts.min()) < 0 or int(all_parts.max()) >= len(y)):
+            raise ValueError("Precomputed split index is outside the NPZ range.")
+        if split.train_idx.size == 0 or split.val_idx.size == 0:
+            raise ValueError("Precomputed train and validation splits must be non-empty.")
+        train_groups = set(groups[split.train_idx].astype(str).tolist())
+        val_groups = set(groups[split.val_idx].astype(str).tolist())
+        test_groups = set(groups[split.test_idx].astype(str).tolist())
+        if train_groups & val_groups or train_groups & test_groups or val_groups & test_groups:
+            raise ValueError("Precomputed split leaks vessel groups across partitions.")
+        print(f"[train] using precomputed source-stratified split -> {split_indices_path}")
+    else:
+        split = group_train_val_test_split(
+            X, y, groups,
+            val_size=val_size,
+            test_size=test_size,
+            random_state=split_seed,
+            stratify_groups=True,
+            max_tries=400,
+            mixed_label_groups=(task_name in {"spoofing", "godark"}),
+        )
+    if task_name == "godark":
+        split_event_counts = {}
+        for split_name, split_idx in (
+            ("train", split.train_idx),
+            ("validation", split.val_idx),
+            ("test", split.test_idx),
+        ):
+            y_part = y[split_idx]
+            pos = int(np.sum(y_part == 1))
+            neg = int(np.sum(y_part == 0))
+            pos_vessels = int(np.unique(groups[split_idx][y_part == 1]).size)
+            split_event_counts[split_name] = (pos, neg, pos_vessels)
+        print(f"[train] godark split event audit={split_event_counts}")
+        minimums = {"train": 5, "validation": 2}
+        if float(test_size) > 0.0:
+            minimums["test"] = 2
+        invalid = [
+            name
+            for name, (pos, neg, pos_vessels) in split_event_counts.items()
+            if name in minimums
+            and (
+                pos < minimums[name]
+                or neg < minimums[name]
+                or pos_vessels < 2
+            )
+        ]
+        if invalid:
+            raise RuntimeError(
+                "GoDark split terlalu kecil/tidak stabil pada "
+                f"{invalid}. Tambah vessel/event sumber sebelum training; "
+                f"audit={split_event_counts}."
+            )
+    if task_name == "transshipment":
+        train_syn = int(transshipment_is_synthetic[split.train_idx].sum())
+        val_syn = int(transshipment_is_synthetic[split.val_idx].sum())
+        test_syn = int(transshipment_is_synthetic[split.test_idx].sum())
+        if train_syn <= 0:
+            raise RuntimeError("Transshipment train split has no synthetic augmentation.")
+        if val_syn > 0 or test_syn > 0:
+            raise RuntimeError(
+                "Synthetic transshipment leakage detected: "
+                f"train={train_syn}, validation={val_syn}, test={test_syn}."
+            )
+        train_mmsi = _transshipment_mmsi_set(
+            split.train_idx, transshipment_mmsi_a, transshipment_mmsi_b
+        )
+        val_mmsi = _transshipment_mmsi_set(
+            split.val_idx, transshipment_mmsi_a, transshipment_mmsi_b
+        )
+        test_mmsi = _transshipment_mmsi_set(
+            split.test_idx, transshipment_mmsi_a, transshipment_mmsi_b
+        )
+        if train_mmsi & val_mmsi or train_mmsi & test_mmsi or val_mmsi & test_mmsi:
+            raise RuntimeError("Transshipment split leaks MMSI across partitions.")
+        transshipment_train_mmsi = sorted(train_mmsi)
+        print(
+            "[train] transshipment protocol valid: "
+            f"synthetic train/val/test={train_syn}/{val_syn}/{test_syn} "
+            f"MMSI train/val/test={len(train_mmsi)}/{len(val_mmsi)}/{len(test_mmsi)}"
+        )
     np.savez_compressed(
         out_dir / "split_indices.npz",
         train_idx=split.train_idx,
@@ -804,6 +981,8 @@ def train_from_npz(
     X_train = apply_scaler(X[split.train_idx], scaler)
     X_val = apply_scaler(X[split.val_idx], scaler)
     y_train, g_train = y[split.train_idx], groups[split.train_idx]
+    source_train = window_source_labels[split.train_idx].astype(str)
+    source_val = window_source_labels[split.val_idx].astype(str)
     y_val, g_val = y[split.val_idx], groups[split.val_idx]
     event_ids_val = window_event_ids[split.val_idx] if has_window_metadata else np.array([""] * len(split.val_idx), dtype=object)
     kinds_val = window_kinds[split.val_idx] if has_window_metadata else np.array(["unknown"] * len(split.val_idx), dtype=object)
@@ -825,8 +1004,9 @@ def train_from_npz(
     print(
         f"[train] split windows train={len(split.train_idx)} val={len(split.val_idx)} test={len(split.test_idx)}"
     )
+    split_group_name = "events" if task_name == "transshipment" else "vessels"
     print(
-        f"[train] split vessels train={np.unique(groups[split.train_idx]).size} "
+        f"[train] split {split_group_name} train={np.unique(groups[split.train_idx]).size} "
         f"val={np.unique(groups[split.val_idx]).size} test={np.unique(groups[split.test_idx]).size}"
     )
     print(f"[train] scaler fit on train split only -> {scaler_path}")
@@ -851,7 +1031,78 @@ def train_from_npz(
 
     vlab = _vessel_labels(y_train, np.asarray(g_train).astype(str))
     use_vessel_balancing = _has_all_classes_in_vessel_modes(vlab, num_classes)
-    if use_vessel_balancing:
+    use_godark_source_balancing = bool(
+        task_name == "godark"
+        and godark_source_balancing
+        and has_window_source_labels
+    )
+    use_transshipment_source_balancing = bool(
+        task_name == "transshipment" and has_window_source_labels
+    )
+    if use_godark_source_balancing:
+        joint_keys = np.array(
+            [f"{src}::{int(label)}" for src, label in zip(source_train, y_train)],
+            dtype=object,
+        )
+        joint_values, joint_counts = np.unique(joint_keys, return_counts=True)
+        expected_joint = {
+            f"{source}::{label}"
+            for source in np.unique(window_source_labels.astype(str)).tolist()
+            for label in range(num_classes)
+        }
+        missing_joint = sorted(expected_joint - set(joint_values.astype(str).tolist()))
+        if missing_joint:
+            raise RuntimeError(
+                "GoDark source-aware training split is missing source/class cells: "
+                + ", ".join(missing_joint)
+                + ". Use another split seed or add more source events."
+            )
+        # The sampler below already balances both source and class. Keep the
+        # loss weights neutral to avoid applying class correction twice. The
+        # original training prior is retained for validation-time logit
+        # adjustment/calibration.
+        pri_np = _prior_from_window_counts(y_train, num_classes)
+        class_w = torch.ones(num_classes, dtype=torch.float32, device=dev)
+        print(
+            "[train] godark source-aware balancing joint_counts="
+            + str({str(k): int(v) for k, v in zip(joint_values, joint_counts)})
+        )
+    elif use_transshipment_source_balancing:
+        # Balance observed source-pair x label cells at EVENT level, then give
+        # every event equal total mass regardless of how many windows it has.
+        # This prevents long loitering events from dominating short encounters.
+        group_str = np.asarray(g_train).astype(str)
+        source_str = np.asarray(source_train).astype(str)
+        event_cell: dict[str, str] = {}
+        event_windows: dict[str, int] = {}
+        for event_id in np.unique(group_str):
+            idx = np.where(group_str == event_id)[0]
+            event_label = int(np.bincount(y_train[idx], minlength=num_classes).argmax())
+            source_values, source_counts = np.unique(source_str[idx], return_counts=True)
+            event_source = str(source_values[int(np.argmax(source_counts))])
+            event_cell[str(event_id)] = f"{event_source}::{event_label}"
+            event_windows[str(event_id)] = int(len(idx))
+        cell_event_counts: dict[str, int] = {}
+        for cell in event_cell.values():
+            cell_event_counts[cell] = cell_event_counts.get(cell, 0) + 1
+        transshipment_sample_weights = np.asarray(
+            [
+                1.0
+                / float(
+                    cell_event_counts[event_cell[str(event_id)]]
+                    * event_windows[str(event_id)]
+                )
+                for event_id in group_str
+            ],
+            dtype=np.float64,
+        )
+        pri_np = _prior_from_vessels(vlab, num_classes)
+        class_w = torch.ones(num_classes, dtype=torch.float32, device=dev)
+        print(
+            "[train] transshipment source-label-event balancing cells="
+            + str(dict(sorted(cell_event_counts.items())))
+        )
+    elif use_vessel_balancing:
         pri_np = _prior_from_vessels(vlab, num_classes)
         class_w = _weights_from_vessel_counts(vlab, num_classes).to(dev)
     else:
@@ -937,7 +1188,47 @@ def train_from_npz(
     train_ds = AisSeqDataset(X_train, y_train, coords=coords_train)
     val_ds = AisSeqDataset(X_val, y_val, groups=g_val)
 
-    if use_vessel_balancing:
+    if use_godark_source_balancing:
+        inverse_count = {
+            str(key): 1.0 / float(count)
+            for key, count in zip(joint_values.tolist(), joint_counts.tolist())
+        }
+        sample_weights = np.array(
+            [inverse_count[str(key)] for key in joint_keys],
+            dtype=np.float64,
+        )
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(int(train_seed))
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=int(len(sample_weights)),
+            replacement=True,
+            generator=sampler_generator,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=0,
+        )
+    elif use_transshipment_source_balancing:
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(int(train_seed))
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(
+                transshipment_sample_weights, dtype=torch.double
+            ),
+            num_samples=int(len(transshipment_sample_weights)),
+            replacement=True,
+            generator=sampler_generator,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=0,
+        )
+    elif use_vessel_balancing:
         batch_sampler = VesselBalancedBatchSampler(
             y=y_train,
             groups=g_train,
@@ -961,6 +1252,23 @@ def train_from_npz(
         train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
 
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=0)
+    steps_per_epoch = int(len(train_loader))
+    planned_optimizer_steps = int(epochs) * steps_per_epoch
+    print(
+        "[train] workload "
+        f"sequences={len(y_train)} batch_size={batch_size} "
+        f"steps_per_epoch={steps_per_epoch} epochs={int(epochs)} "
+        f"planned_optimizer_steps={planned_optimizer_steps}"
+    )
+    if steps_per_epoch < 50:
+        print(
+            "[train] workload diagnosis: dataset-limited run; fast epochs are "
+            "expected because fewer than 50 optimizer steps are available per epoch."
+        )
+    print(
+        "[train] early_stopping="
+        f"{'disabled' if int(early_stop_patience) <= 0 else f'enabled(patience={int(early_stop_patience)})'}"
+    )
 
     def _build_model() -> LSTMClassifier:
         return LSTMClassifier(
@@ -975,6 +1283,7 @@ def train_from_npz(
             attention_heads=int(attention_heads),
             attention_layers=int(attention_layers),
             predict_coords=bool(use_geo_aux),
+            context_summary=use_context_summary,
         )
 
     used_cudnn_fallback = False
@@ -1210,6 +1519,58 @@ def train_from_npz(
                 min_event_precision=float(godark_event_min_precision),
             )
             agg_ep = agg_grid[0]
+            adjusted_logits_ep = logits_np - (
+                float(tau_ep) * log_pi_np.reshape(1, -1)
+            )
+            probs_ep = softmax_np(adjusted_logits_ep)
+            pred_ep = (probs_ep[:, 1] >= float(
+                godark_event_metrics_ep["godark_event_prob_threshold"]
+            )).astype(np.int64)
+            _, source_rows_ep = godark_event_report(
+                event_ids=event_ids_val,
+                kinds=kinds_val,
+                y_true=y_np,
+                y_pred=pred_ep,
+                probs=probs_ep,
+                label_map=label_map,
+                prob_threshold=float(godark_event_metrics_ep["godark_event_prob_threshold"]),
+                mean_prob_threshold=float(godark_event_metrics_ep["godark_event_mean_prob_threshold"]),
+                min_positive_windows=int(godark_event_metrics_ep["godark_event_min_positive_windows"]),
+                min_positive_ratio=float(godark_event_metrics_ep["godark_event_min_positive_ratio"]),
+                short_min_positive_ratio=float(godark_event_metrics_ep["godark_event_short_min_positive_ratio"]),
+                use_short_rescue=bool(godark_event_metrics_ep["godark_event_use_short_rescue"]),
+            )
+            source_by_event = {
+                str(event_id): str(source)
+                for event_id, source in zip(event_ids_val, source_val)
+            }
+            source_scores = []
+            source_recalls = []
+            for source in sorted(set(source_val.tolist())):
+                rows_source = [
+                    row for row in source_rows_ep
+                    if source_by_event.get(str(row["event_id"]), "unknown") == source
+                ]
+                tp_source = sum(row["error_type"] == "TP" for row in rows_source)
+                fp_source = sum(row["error_type"] == "FP" for row in rows_source)
+                fn_source = sum(row["error_type"] == "FN" for row in rows_source)
+                precision_source = tp_source / max(tp_source + fp_source, 1)
+                recall_source = tp_source / max(tp_source + fn_source, 1)
+                f1_source = 2.0 * precision_source * recall_source / max(
+                    precision_source + recall_source, 1e-12
+                )
+                source_scores.append(float(f1_source))
+                source_recalls.append(float(recall_source))
+            macro_source_f1_ep = float(np.mean(source_scores))
+            min_source_recall_ep = float(np.min(source_recalls))
+            godark_event_metrics_ep["macro_source_f1"] = macro_source_f1_ep
+            godark_event_metrics_ep["min_source_recall"] = min_source_recall_ep
+            godark_selection_key_ep = (
+                int(min_source_recall_ep >= 0.50),
+                macro_source_f1_ep,
+                min_source_recall_ep,
+                *(tuple(godark_selection_key_ep or ())),
+            )
         elif metric_scope == "sequence":
             tau_ep, m_ep = _pick_best_tau_by_sequence(
                 logits_np=logits_np,
@@ -1250,6 +1611,8 @@ def train_from_npz(
                 f"VAL(event) p={godark_event_metrics_ep['event_precision']:.4f} r={godark_event_metrics_ep['event_recall']:.4f} "
                 f"f1={godark_event_metrics_ep['event_f1']:.4f} fp={int(godark_event_metrics_ep['event_fp'])} "
                 f"fn={int(godark_event_metrics_ep['event_fn'])} score={godark_event_metrics_ep['godark_score']:.4f} "
+                f"source_macro_f1={godark_event_metrics_ep.get('macro_source_f1', 0.0):.4f} "
+                f"min_source_recall={godark_event_metrics_ep.get('min_source_recall', 0.0):.4f} "
                 f"thr={godark_event_metrics_ep['godark_event_prob_threshold']:.2f} "
                 f"mean_thr={godark_event_metrics_ep['godark_event_mean_prob_threshold']:.2f} "
                 f"min_win={int(godark_event_metrics_ep['godark_event_min_positive_windows'])} "
@@ -1262,9 +1625,10 @@ def train_from_npz(
                 f"tau={tau_ep:.2f} lr={lr_now:.2e}"
             )
         else:
+            aggregate_label = "event" if task_name == "transshipment" else "vessel"
             print(
                 f"[epoch {epoch}] train_loss={train_loss:.4f} cls={train_cls_loss:.4f} geo={train_geo_loss:.4f} "
-                f"VAL(vessel) macro_f1={m_ep['macro_f1']:.4f} bal_acc={m_ep['balanced_acc']:.4f} acc={m_ep['accuracy']:.4f} "
+                f"VAL({aggregate_label}) macro_f1={m_ep['macro_f1']:.4f} bal_acc={m_ep['balanced_acc']:.4f} acc={m_ep['accuracy']:.4f} "
                 f"tau={tau_ep:.2f} agg=({agg_ep.agg_method}, keep={agg_ep.keep_frac}, min={agg_ep.min_keep}, wp={agg_ep.weight_power}, conf={agg_ep.conf_mode}) "
                 f"lr={lr_now:.2e}"
             )
@@ -1294,6 +1658,16 @@ def train_from_npz(
                 ),
                 "val_event_f1": (
                     None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("event_f1", 0.0))
+                ),
+                "val_macro_source_f1": (
+                    None if godark_event_metrics_ep is None else float(
+                        godark_event_metrics_ep.get("macro_source_f1", 0.0)
+                    )
+                ),
+                "val_min_source_recall": (
+                    None if godark_event_metrics_ep is None else float(
+                        godark_event_metrics_ep.get("min_source_recall", 0.0)
+                    )
                 ),
                 "val_event_fp": (
                     None if godark_event_metrics_ep is None else int(godark_event_metrics_ep.get("event_fp", 0))
@@ -1332,6 +1706,15 @@ def train_from_npz(
                 "val_macro_f1_vessel": (m_ep["macro_f1"] if metric_scope == "vessel" else None),
                 "val_balanced_acc_vessel": (m_ep["balanced_acc"] if metric_scope == "vessel" else None),
                 "val_acc_vessel": (m_ep["accuracy"] if metric_scope == "vessel" else None),
+                "val_macro_f1_event": (
+                    m_ep["macro_f1"] if task_name == "transshipment" else None
+                ),
+                "val_balanced_acc_event": (
+                    m_ep["balanced_acc"] if task_name == "transshipment" else None
+                ),
+                "val_acc_event": (
+                    m_ep["accuracy"] if task_name == "transshipment" else None
+                ),
                 "lr": lr_now,
                 "best_tau": float(tau_ep),
                 "agg_keep_frac": float(agg_ep.keep_frac),
@@ -1476,12 +1859,19 @@ def train_from_npz(
                     "bidirectional": bidirectional,
                     "attention_heads": int(attention_heads),
                     "attention_layers": int(attention_layers),
+                    "context_summary": bool(use_context_summary),
                     "predict_coords": bool(use_geo_aux),
                     "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                     "geo_aux_scale_km": float(geo_aux_scale_km),
                     "num_classes": num_classes,
                     "label_map": label_map,
+                    "feature_cols": list(feature_cols),
                     "task": task_name,
+                    "transshipment_data_protocol": transshipment_protocol,
+                    "transshipment_train_mmsi": transshipment_train_mmsi,
+                    "transshipment_source_label_event_balancing": bool(
+                        use_transshipment_source_balancing
+                    ),
                     "primary_metric_scope": metric_scope,
                     "optimizer_name": optimizer_name,
                     "weight_decay": float(weight_decay),
@@ -1567,6 +1957,7 @@ def train_from_npz(
                     "godark_event_model_selection": (
                         "constrained_godark_score_validation_sweep" if use_godark_event_selection else "sequence_macro_f1"
                     ),
+                    "godark_source_balancing": bool(use_godark_source_balancing),
                     "tau": float(best_tau),
                     "priors": pri.detach().cpu().numpy().astype(np.float32),
                     "logit_adjust": logit_adjust,
@@ -1604,7 +1995,7 @@ def train_from_npz(
         else:
             no_improve += 1
 
-        if no_improve >= early_stop_patience:
+        if int(early_stop_patience) > 0 and no_improve >= early_stop_patience:
             print(f"[train] Early stopping: no improvement for {early_stop_patience} epochs.")
             break
 
@@ -1616,6 +2007,51 @@ def train_from_npz(
         "checkpoint_valid": None,
         "checkpoint_invalid_reason": None,
     }
+    if task_name == "godark" and best_path.exists():
+        from godark_context_ml import fit_godark_hardnegative_hybrid
+
+        best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(best_ckpt["model_state"], strict=True)
+        model.to(dev)
+        model.eval()
+        best_val_logits = []
+        with torch.inference_mode():
+            for xb, _, _ in val_loader:
+                xb = xb.to(dev, non_blocking=True)
+                if dev.type == "cuda":
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        lg = model(xb)
+                else:
+                    lg = model(xb)
+                best_val_logits.append(lg.detach().cpu().float().numpy())
+        best_val_logits_np = np.concatenate(best_val_logits, axis=0)
+        best_val_probs = softmax_np(
+            best_val_logits_np - (float(best_tau) * log_pi_np.reshape(1, -1))
+        )
+        hybrid_artifact = fit_godark_hardnegative_hybrid(
+            X_train=X[split.train_idx],
+            y_train=y_train,
+            X_val=X[split.val_idx],
+            y_val=y_val,
+            neural_val_positive_prob=best_val_probs[:, 1],
+            event_ids_val=event_ids_val,
+            kinds_val=kinds_val,
+            label_map=label_map,
+            out_path=out_dir / "godark_hardnegative_hybrid.joblib",
+            random_state=train_seed,
+            min_event_recall=float(godark_event_min_recall),
+            min_event_precision=float(godark_event_min_precision),
+            source_train=(source_train if use_godark_source_balancing else None),
+        )
+        hybrid_val = hybrid_artifact["validation_metrics"]
+        print(
+            "[train] godark hard-negative hybrid saved "
+            f"threshold={float(hybrid_artifact['prob_threshold']):.3f} "
+            f"event_p={float(hybrid_val['event_precision']):.4f} "
+            f"event_r={float(hybrid_val['event_recall']):.4f} "
+            f"event_f1={float(hybrid_val['event_f1']):.4f} -> "
+            f"{out_dir / 'godark_hardnegative_hybrid.joblib'}"
+        )
     (out_dir / "history.json").write_text(json.dumps(hist_rows, indent=2), encoding="utf-8")
     _save_history_plot(hist_rows, out_dir / "training_curves.png")
     (out_dir / "best_epoch.json").write_text(
@@ -1629,6 +2065,7 @@ def train_from_npz(
                 "sgd_momentum": float(sgd_momentum),
                 "attention_heads": int(attention_heads),
                 "attention_layers": int(attention_layers),
+                "context_summary": bool(use_context_summary),
                 "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                 "geo_aux_scale_km": float(geo_aux_scale_km),
                 "random_state": int(random_state),
@@ -1777,6 +2214,7 @@ def train_from_npz(
                 "sgd_momentum": float(sgd_momentum),
                 "attention_heads": int(attention_heads),
                 "attention_layers": int(attention_layers),
+                "context_summary": bool(use_context_summary),
                 "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                 "geo_aux_scale_km": float(geo_aux_scale_km),
                 "test_size": float(test_size),
@@ -1788,6 +2226,9 @@ def train_from_npz(
                 "deterministic_warn_only": bool(deterministic_warn_only),
                 "determinism_settings": determinism_settings,
                 "early_stop_patience": int(early_stop_patience),
+                "early_stopping_enabled": bool(int(early_stop_patience) > 0),
+                "steps_per_epoch": int(steps_per_epoch),
+                "planned_optimizer_steps": int(planned_optimizer_steps),
                 "use_ema": bool(use_ema),
                 "ema_decay": float(ema_decay),
                 "use_focal": bool(use_focal),
@@ -1812,6 +2253,7 @@ def train_from_npz(
                 "godark_event_min_recall": float(godark_event_min_recall),
                 "godark_event_min_precision": float(godark_event_min_precision),
                 "godark_event_selection_enabled": bool(use_godark_event_selection),
+                "godark_source_balancing": bool(use_godark_source_balancing),
                 "train_duration_seconds": train_duration_seconds,
             },
             indent=2,

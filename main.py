@@ -18,9 +18,14 @@ from plot_spoofing import (
     plot_spoofing_examples_from_csv,
 )
 from plot_preprocessed import plot_preprocessed_trajectory_from_npz
-from go_dark_simulator import GoDarkSimCfg, generate_go_dark_dataset
+from go_dark_simulator import (
+    DEFAULT_GODARK_SOURCE_INCLUDE_LABELS,
+    GoDarkSimCfg,
+    generate_go_dark_dataset,
+)
 from plot_go_dark import plot_go_dark_overlay_from_csv, heatmap_go_dark_from_csv, plot_go_dark_examples_from_csv
 from transshipment_detector import TransshipmentCfg, generate_transshipment_dataset
+from data_preparation import DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS
 from plot_transshipment import (
     plot_transshipment_event_from_csv,
     plot_transshipment_examples_from_csv,
@@ -80,6 +85,19 @@ def main():
     )
     p.add_argument("--spoofing_window_threshold", type=float, default=0.20)
     p.add_argument(
+        "--godark_min_distance_from_shore_nm",
+        type=float,
+        default=50.0,
+        help="GoDark: filter kandidat gap dengan kedua boundary minimal sejauh ini dari pantai.",
+    )
+    p.add_argument("--godark_ping_window_seconds", type=int, default=43200)
+    p.add_argument(
+        "--godark_min_ping_count_prev_window",
+        type=int,
+        default=14,
+        help="GoDark: minimum ping sebelum gap dalam jendela kandidat.",
+    )
+    p.add_argument(
         "--transshipment_target",
         default="multiclass",
         choices=["multiclass", "any", "encounter", "loitering", "auto"],
@@ -120,6 +138,11 @@ def main():
         default=None,
         help="Seed khusus inisialisasi/training/sampler. Kosong = ikut --random_state.",
     )
+    t.add_argument(
+        "--split_indices_path",
+        default="",
+        help="NPZ split train/val/test eksplisit. Dipakai tuning OOF source-stratified.",
+    )
     t.add_argument("--test_size", type=float, default=0.2)
     t.add_argument("--val_size", type=float, default=0.15)
     t.add_argument("--epochs", type=int, default=320)
@@ -148,6 +171,31 @@ def main():
     t.add_argument("--weight_decay", type=float, default=1.3e-3)
     t.add_argument("--sgd_momentum", type=float, default=0.9)
     t.add_argument("--early_stop_patience", type=int, default=90)
+    t.add_argument(
+        "--disable_early_stopping",
+        action="store_true",
+        help="Jalankan seluruh epoch dan tetap simpan checkpoint validation terbaik.",
+    )
+    t.add_argument(
+        "--eval_after_train",
+        action="store_true",
+        help="Setelah checkpoint tersimpan, langsung buat validation confusion matrix/eval.",
+    )
+    t.add_argument(
+        "--validation_eval_out",
+        default="",
+        help="Folder validation eval otomatis. Kosong = sibling validation_eval dari out_dir model.",
+    )
+    t.add_argument(
+        "--external_test_npz",
+        default="",
+        help="NPZ external opsional yang langsung dievaluasi penuh setelah training.",
+    )
+    t.add_argument(
+        "--external_eval_out",
+        default="",
+        help="Folder external eval otomatis. Kosong = sibling external_test_eval dari out_dir model.",
+    )
     t.add_argument(
         "--focal_gamma",
         type=float,
@@ -197,10 +245,15 @@ def main():
         help="Khusus task=godark: batas maksimum tau logit-adjustment agar kelas positif tidak over-correct.",
     )
     t.add_argument(
+        "--disable_godark_source_balancing",
+        action="store_true",
+        help="Ablation only: matikan balancing gabungan source-class Go-Dark.",
+    )
+    t.add_argument(
         "--godark_event_prob_thresholds",
         nargs="*",
         type=float,
-        default=[0.80, 0.90, 0.95],
+        default=[0.50, 0.65, 0.80],
         help="Khusus task=godark: grid threshold probabilitas event yang dipilih di validation set.",
     )
     t.add_argument(
@@ -213,14 +266,14 @@ def main():
         "--godark_event_mean_prob_thresholds",
         nargs="*",
         type=float,
-        default=[0.50, 0.60, 0.70],
+        default=[0.0],
         help="Khusus task=godark: grid mean probability threshold event.",
     )
     t.add_argument(
         "--godark_event_min_windows_grid",
         nargs="*",
         type=int,
-        default=[3, 5, 8, 10],
+        default=[1],
         help="Khusus task=godark: grid jumlah minimal window di atas threshold untuk event positif.",
     )
     t.add_argument(
@@ -233,7 +286,7 @@ def main():
         "--godark_event_min_positive_ratio_grid",
         nargs="*",
         type=float,
-        default=[0.5, 0.6, 0.8, 1.0],
+        default=[1.0],
         help="Khusus task=godark: grid rasio minimal window di atas threshold untuk event positif.",
     )
     t.add_argument(
@@ -287,6 +340,11 @@ def main():
         type=float,
         default=-1.0,
         help="Override threshold event Go-Dark saat eval. Default -1 memakai nilai checkpoint.",
+    )
+    e.add_argument(
+        "--godark_calibrator_path",
+        default="",
+        help="Artifact Platt calibration yang hanya di-fit dari pooled internal OOF.",
     )
     e.add_argument(
         "--godark_event_mean_prob_threshold",
@@ -369,9 +427,22 @@ def main():
     sp.add_argument("--max_vessels_per_file", type=int, default=20)
     sp.add_argument("--min_points_per_vessel", type=int, default=80)
     sp.add_argument("--points_per_attack", type=int, default=120)
+    sp.add_argument("--scenarios_per_attack", type=int, default=1)
     sp.add_argument("--max_attack_gap_seconds", type=int, default=10800)
     sp.add_argument("--drift_lat_deg", type=float, default=0.08)
     sp.add_argument("--drift_lon_deg", type=float, default=0.08)
+    sp.add_argument(
+        "--drift_rate_kmh",
+        type=float,
+        default=0.0,
+        help="Jika >0, gradual drift mengikuti laju fisik km/jam dan mengabaikan total offset derajat.",
+    )
+    sp.add_argument(
+        "--drift_rate_jitter_frac",
+        type=float,
+        default=0.25,
+        help="Variasi relatif laju gradual drift per skenario; 0.25 berarti 75-125%% target.",
+    )
     sp.add_argument("--jump_lat_deg", type=float, default=0.70)
     sp.add_argument("--jump_lon_deg", type=float, default=0.70)
     sp.add_argument("--replay_delay_seconds", type=int, default=21600)
@@ -380,6 +451,23 @@ def main():
     sp.add_argument("--ghost_offset_max_deg", type=float, default=8.0)
     sp.add_argument("--mirror_offset_min_deg", type=float, default=1.5)
     sp.add_argument("--mirror_offset_max_deg", type=float, default=8.0)
+    sp.add_argument(
+        "--reported_motion_mode",
+        choices=["preserve", "recompute", "mixed"],
+        default="preserve",
+        help="Cara menangani reported speed/course pada skenario attack.",
+    )
+    sp.add_argument(
+        "--mixed_recompute_probability",
+        type=float,
+        default=0.50,
+        help="Peluang recompute speed/course jika reported_motion_mode=mixed.",
+    )
+    sp.add_argument(
+        "--include_matched_normal_controls",
+        action="store_true",
+        help="Tambahkan salinan normal dari segmen sumber yang sama untuk setiap attack kinematik.",
+    )
     sp.add_argument("--combine_outputs", action="store_true")
 
     # ===== plot_spoofing =====
@@ -418,6 +506,15 @@ def main():
     gd.add_argument("--chunksize", type=int, default=0)
     gd.add_argument("--sample_frac", type=float, default=0.0)
     gd.add_argument(
+        "--include_labels",
+        nargs="*",
+        default=list(DEFAULT_GODARK_SOURCE_INCLUDE_LABELS),
+        help=(
+            "Allowlist sumber CSV Go-Dark. Default permanen hasil EDA: "
+            "drifting_longlines fixed_gear purse_seines trawlers."
+        ),
+    )
+    gd.add_argument(
         "--exclude_labels",
         nargs="*",
         default=list(DEFAULT_SOURCE_EXCLUDE_LABELS),
@@ -437,12 +534,30 @@ def main():
     )
     gd.add_argument("--max_dark_seconds", type=int, default=604800)
     gd.add_argument("--min_hidden_distance_km", type=float, default=0.5)
+    gd.add_argument(
+        "--max_source_gap_seconds",
+        type=int,
+        default=10800,
+        help="Gap alami maksimum di segmen sumber yang boleh dihapus. Default 3 jam.",
+    )
+    gd.add_argument(
+        "--context_points_each_side",
+        type=int,
+        default=60,
+        help="Jumlah titik utuh yang wajib tersedia sebelum dan sesudah event.",
+    )
 
     gd.add_argument(
         "--min_distance_from_shore_nm",
         type=float,
         default=50.0,
         help="Filter jarak minimal dari pantai dalam nautical miles. Isi 0 untuk mematikan filter.",
+    )
+    gd.add_argument(
+        "--shore_distance_unit",
+        choices=["meters", "kilometers"],
+        default="meters",
+        help="Satuan kolom distance_from_shore pada CSV sumber.",
     )
     gd.add_argument(
         "--ping_window_seconds",
@@ -457,8 +572,8 @@ def main():
         help="Opsional. Isi 14 kalau ingin lebih strict.",
     )
 
-    gd.add_argument("--label_before_points", type=int, default=2)
-    gd.add_argument("--label_after_points", type=int, default=30)
+    gd.add_argument("--label_before_points", type=int, default=1, help="Deprecated; boundary label selalu satu titik.")
+    gd.add_argument("--label_after_points", type=int, default=1, help="Deprecated; boundary label selalu satu titik.")
     gd.add_argument("--combine_outputs", action="store_true")
 
     # ===== plot_godark =====
@@ -493,10 +608,24 @@ def main():
     tx.add_argument("--chunksize", type=int, default=0)
     tx.add_argument("--sample_frac", type=float, default=0.0)
     tx.add_argument(
+        "--include_labels",
+        nargs="*",
+        default=list(DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS),
+        help=(
+            "Allowlist sumber CSV transshipment. Hanya subset dari empat gear "
+            "yang diizinkan: drifting_longlines fixed_gear purse_seines trawlers."
+        ),
+    )
+    tx.add_argument(
         "--exclude_labels",
         nargs="*",
         default=list(DEFAULT_SOURCE_EXCLUDE_LABELS),
         help="Label sumber CSV yang dikeluarkan dari generator transshipment. Default: pole_and_line trollers.",
+    )
+    tx.add_argument(
+        "--include_mmsi_path",
+        default="",
+        help="CSV/TXT MMSI allowlist untuk split train/validation yang vessel-disjoint.",
     )
     tx.add_argument("--max_vessels_per_file", type=int, default=60)
     tx.add_argument("--min_points_per_vessel", type=int, default=40)
@@ -518,6 +647,18 @@ def main():
     tx.add_argument("--max_loitering_events_per_file", type=int, default=250)
     tx.add_argument("--max_normal_events_per_file", type=int, default=500)
     tx.add_argument("--synthetic_encounters_per_file", type=int, default=0)
+    tx.add_argument("--synthetic_min_distance_km", type=float, default=0.05)
+    tx.add_argument("--synthetic_max_distance_km", type=float, default=0.48)
+    tx.add_argument("--synthetic_min_duration_hours", type=float, default=2.0)
+    tx.add_argument("--synthetic_max_duration_hours", type=float, default=6.0)
+    tx.add_argument("--synthetic_min_speed_knots", type=float, default=0.2)
+    tx.add_argument("--synthetic_max_speed_knots", type=float, default=1.9)
+    tx.add_argument("--synthetic_course_jitter_deg", type=float, default=30.0)
+    tx.add_argument(
+        "--no_synthetic_balance_gear_pairs",
+        action="store_true",
+        help="Matikan penyeimbangan pasangan gear pada synthetic encounter.",
+    )
     tx.add_argument("--combine_outputs", action="store_true")
 
     # ===== plot_transshipment =====
@@ -578,6 +719,9 @@ def main():
             op_speed_max=float(args.op_speed_max),
             use_location_features=(not bool(args.exclude_location_features)),
             spoofing_window_threshold=float(args.spoofing_window_threshold),
+            godark_min_distance_from_shore_nm=float(args.godark_min_distance_from_shore_nm),
+            godark_ping_window_seconds=int(args.godark_ping_window_seconds),
+            godark_min_ping_count_prev_window=int(args.godark_min_ping_count_prev_window),
             transshipment_target=str(args.transshipment_target),
             transshipment_feature_mode=str(args.transshipment_feature_mode),
             apply_jump_filter=(
@@ -610,11 +754,20 @@ def main():
             random_state=int(args.random_state),
             split_random_state=(None if args.split_random_state is None else int(args.split_random_state)),
             train_random_state=(None if args.train_random_state is None else int(args.train_random_state)),
+            split_indices_path=(
+                Path(args.split_indices_path)
+                if str(args.split_indices_path).strip()
+                else None
+            ),
             deterministic=(not bool(args.non_deterministic)),
             deterministic_warn_only=(not bool(args.strict_deterministic)),
             test_size=float(args.test_size),
             val_size=float(args.val_size),
-            early_stop_patience=int(args.early_stop_patience),
+            early_stop_patience=(
+                0
+                if bool(args.disable_early_stopping)
+                else int(args.early_stop_patience)
+            ),
             focal_gamma=float(args.focal_gamma),
             gear_minority_f1_weight=(
                 None if args.gear_minority_f1_weight is None else float(args.gear_minority_f1_weight)
@@ -643,7 +796,54 @@ def main():
             godark_event_use_short_rescue=bool(args.godark_event_use_short_rescue),
             godark_event_min_recall=float(args.godark_event_min_recall),
             godark_event_min_precision=float(args.godark_event_min_precision),
+            godark_source_balancing=(
+                not bool(args.disable_godark_source_balancing)
+            ),
         )
+        if bool(args.eval_after_train):
+            model_dir = Path(args.out_dir)
+            model_path = model_dir / "model.pt"
+            validation_out = (
+                Path(args.validation_eval_out)
+                if str(args.validation_eval_out).strip()
+                else model_dir.parent / "validation_eval"
+            )
+            print(f"[train->eval] validation -> {validation_out}")
+            evaluate(
+                data_npz=Path(args.data_npz),
+                model_path=model_path,
+                out_dir=validation_out,
+                device=args.device,
+                batch_size=64,
+                random_state=int(args.random_state),
+                split_random_state=(
+                    None
+                    if args.split_random_state is None
+                    else int(args.split_random_state)
+                ),
+                eval_split="val",
+            )
+            if str(args.external_test_npz).strip():
+                external_out = (
+                    Path(args.external_eval_out)
+                    if str(args.external_eval_out).strip()
+                    else model_dir.parent / "external_test_eval"
+                )
+                print(f"[train->eval] pure external all -> {external_out}")
+                evaluate(
+                    data_npz=Path(args.external_test_npz),
+                    model_path=model_path,
+                    out_dir=external_out,
+                    device=args.device,
+                    batch_size=64,
+                    random_state=int(args.random_state),
+                    split_random_state=(
+                        None
+                        if args.split_random_state is None
+                        else int(args.split_random_state)
+                    ),
+                    eval_split="all",
+                )
 
     elif args.cmd == "eval":
         mp = Path(args.model_path)
@@ -683,6 +883,11 @@ def main():
                 else float(args.godark_event_short_min_positive_ratio)
             ),
             godark_event_use_short_rescue=args.godark_event_use_short_rescue,
+            godark_calibrator_path=(
+                Path(args.godark_calibrator_path)
+                if str(args.godark_calibrator_path).strip()
+                else None
+            ),
         )
 
     elif args.cmd == "plot":
@@ -726,9 +931,12 @@ def main():
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
             points_per_attack=int(args.points_per_attack),
+            scenarios_per_attack=int(args.scenarios_per_attack),
             max_attack_gap_seconds=int(args.max_attack_gap_seconds),
             drift_lat_deg=float(args.drift_lat_deg),
             drift_lon_deg=float(args.drift_lon_deg),
+            drift_rate_kmh=float(args.drift_rate_kmh),
+            drift_rate_jitter_frac=float(args.drift_rate_jitter_frac),
             jump_lat_deg=float(args.jump_lat_deg),
             jump_lon_deg=float(args.jump_lon_deg),
             replay_delay_seconds=int(args.replay_delay_seconds),
@@ -737,6 +945,9 @@ def main():
             ghost_offset_max_deg=float(args.ghost_offset_max_deg),
             mirror_offset_min_deg=float(args.mirror_offset_min_deg),
             mirror_offset_max_deg=float(args.mirror_offset_max_deg),
+            reported_motion_mode=str(args.reported_motion_mode),
+            mixed_recompute_probability=float(args.mixed_recompute_probability),
+            include_matched_normal_controls=bool(args.include_matched_normal_controls),
             combine_outputs=bool(args.combine_outputs),
         )
         generate_spoofing_dataset(
@@ -776,6 +987,7 @@ def main():
             limit_rows=int(args.limit_rows),
             chunksize=int(args.chunksize),
             sample_frac=float(args.sample_frac),
+            include_labels=list(args.include_labels),
             exclude_labels=list(args.exclude_labels),
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
@@ -785,7 +997,10 @@ def main():
             min_dark_seconds=int(args.min_dark_seconds),
             max_dark_seconds=int(args.max_dark_seconds),
             min_hidden_distance_km=float(args.min_hidden_distance_km),
+            max_source_gap_seconds=int(args.max_source_gap_seconds),
+            context_points_each_side=int(args.context_points_each_side),
             min_distance_from_shore_nm=float(args.min_distance_from_shore_nm),
+            shore_distance_unit=str(args.shore_distance_unit),
             ping_window_seconds=int(args.ping_window_seconds),
             min_ping_count_prev_window=int(args.min_ping_count_prev_window),
             label_before_points=int(args.label_before_points),
@@ -830,7 +1045,9 @@ def main():
             limit_rows=int(args.limit_rows),
             chunksize=int(args.chunksize),
             sample_frac=float(args.sample_frac),
+            include_labels=list(args.include_labels),
             exclude_labels=list(args.exclude_labels),
+            include_mmsi_path=str(args.include_mmsi_path),
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
             grid_minutes=int(args.grid_minutes),
@@ -851,6 +1068,16 @@ def main():
             max_loitering_events_per_file=int(args.max_loitering_events_per_file),
             max_normal_events_per_file=int(args.max_normal_events_per_file),
             synthetic_encounters_per_file=int(args.synthetic_encounters_per_file),
+            synthetic_min_distance_km=float(args.synthetic_min_distance_km),
+            synthetic_max_distance_km=float(args.synthetic_max_distance_km),
+            synthetic_min_duration_hours=float(args.synthetic_min_duration_hours),
+            synthetic_max_duration_hours=float(args.synthetic_max_duration_hours),
+            synthetic_min_speed_knots=float(args.synthetic_min_speed_knots),
+            synthetic_max_speed_knots=float(args.synthetic_max_speed_knots),
+            synthetic_course_jitter_deg=float(args.synthetic_course_jitter_deg),
+            synthetic_balance_gear_pairs=(
+                not bool(args.no_synthetic_balance_gear_pairs)
+            ),
             combine_outputs=bool(args.combine_outputs),
         )
         generate_transshipment_dataset(

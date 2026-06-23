@@ -365,10 +365,18 @@ def group_train_val_test_split(
             best_score = float("inf")
 
             for k in range(max_tries):
+                # Give every requested split seed its own non-overlapping
+                # candidate stream. Using random_state + k made the 400-search
+                # ranges for seeds 42-46 almost identical, so all five runs
+                # selected exactly the same validation vessels.
+                candidate_seed = int(
+                    (int(random_state) * (int(max_tries) + 1) + int(k))
+                    % (2**32 - 1)
+                )
                 g_train, g_val = train_test_split(
                     uniq,
                     test_size=val_size,
-                    random_state=int(random_state + k),
+                    random_state=candidate_seed,
                     shuffle=True,
                 )
                 candidate = _indices_from_group_sets(

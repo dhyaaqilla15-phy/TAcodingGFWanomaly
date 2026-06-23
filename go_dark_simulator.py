@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -12,27 +13,27 @@ from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, haversine_km_np, bea
 
 
 NAUTICAL_MILE_KM = 1.852
+DEFAULT_GODARK_SOURCE_INCLUDE_LABELS = (
+    "drifting_longlines",
+    "fixed_gear",
+    "purse_seines",
+    "trawlers",
+)
 
 
 @dataclass
 class GoDarkSimCfg:
     """
-    Synthetic intentional AIS signal tampering / go-dark event generator.
+    Generator kandidat suspected AIS disabling sintetis.
     
-    Berdasarkan paper Lv et al. (2025): "A Deep Learning Approach for Identifying 
-    Intentional AIS Signal Tampering in Maritime Trajectories" - JMSE.
+    Desain candidate-gap mengikuti Welch et al. (2022), Science Advances,
+    DOI 10.1126/sciadv.abq2109. Segmen lintasan kontinu dihilangkan dan
+    konteks sebelum/sesudahnya diperlakukan sebagai satu event. Generator ini
+    tidak mengklaim membuktikan niat atau aktivitas ilegal kapal.
     
-    Methodology:
-    - Mendeteksi disappearance yang INTENTIONAL (bukan natural gaps)
-    - Injecting trajectory gaps dengan behavioral markers
-    - Track pre-gap behavior (speed changes, course anomalies)
-    - Identify suspicious zones (high-value fishing areas, busy routes)
-    
-    Implementasi:
+    Catatan:
     - Hapus segmen trajectory di tengah perjalanan → observed AIS punya gap besar
-    - Label points sebelum/sesudah gap untuk supervised learning
-    - Add behavioral features (speed_change, course_change, distance_traveled)
-    - Track event characteristics untuk distinguish intentional vs natural disappearance
+    - Output positif adalah suspected gap sintetis, bukan bukti niat ilegal.
     """
 
     seed: int = 42
@@ -41,27 +42,31 @@ class GoDarkSimCfg:
     limit_rows: int = 0
     chunksize: int = 0
     sample_frac: float = 0.0
+    include_labels: Sequence[str] = DEFAULT_GODARK_SOURCE_INCLUDE_LABELS
     exclude_labels: Sequence[str] = DEFAULT_SOURCE_EXCLUDE_LABELS
 
     # Vessel dan event sampling
     max_vessels_per_file: int = 20
     min_points_per_vessel: int = 120
     events_per_vessel: int = 1
+    diversity_candidate_pool: int = 48
 
     # Panjang segmen yang sengaja dihilangkan
     min_hidden_points: int = 20
     max_hidden_points: int = 120
 
-    # Gap duration - intentional tampering biasanya >12 jam
+    # Gap candidate. Default 12 jam mengikuti Welch et al. (2022).
     min_dark_seconds: int = 12 * 3600
     max_dark_seconds: int = 7 * 24 * 3600
     min_hidden_distance_km: float = 0.5
+    max_source_gap_seconds: int = 3 * 3600
+    context_points_each_side: int = 60
 
     # Geographic context - analyze jauh dari pantai untuk reduce false positives
     min_distance_from_shore_nm: float = 50.0
+    shore_distance_unit: str = "meters"
 
-    # Behavioral markers sebelum disappearance (Lv et al. indicators)
-    # Track speed changes dan course anomalies
+    # Konteks perilaku sebelum disappearance.
     min_pre_gap_speed_knots: float = 1.0        # Kapal harus moving sebelum gap
     max_pre_gap_speed_knots: float = 50.0
     
@@ -69,11 +74,11 @@ class GoDarkSimCfg:
     ping_window_seconds: int = 12 * 3600
     min_ping_count_prev_window: int = 0
 
-    # Label window - titik di sekitar gap diberi label GoDark
-    label_before_points: int = 2
-    label_after_points: int = 30
+    # Kompatibilitas CLI lama; event sekarang hanya memakai dua boundary.
+    label_before_points: int = 1
+    label_after_points: int = 1
 
-    # Behavioral anomaly scoring (untuk future MCon-LSTM features)
+    # Metadata audit saja, bukan fitur label yang dimasukkan ke model.
     # Seberapa ekstrem perubahan behavior sebelum gap
     speed_change_threshold_knots: float = 5.0   # Sudden speed change
     course_change_threshold_deg: float = 45.0   # Sudden course change
@@ -86,12 +91,24 @@ def _label_set(labels: Sequence[str] | None) -> set[str]:
     return {str(label).strip().lower() for label in (labels or []) if str(label).strip()}
 
 
-def _input_csvs(input_path: Path, exclude_labels: Sequence[str] | None) -> List[Path]:
+def _input_csvs(
+    input_path: Path,
+    include_labels: Sequence[str] | None,
+    exclude_labels: Sequence[str] | None,
+) -> List[Path]:
+    included = _label_set(include_labels)
     excluded = _label_set(exclude_labels)
     if input_path.is_dir():
         csvs = sorted(input_path.glob("*.csv"))
     else:
         csvs = [input_path]
+
+    if included:
+        skipped = [p for p in csvs if p.stem.strip().lower() not in included]
+        csvs = [p for p in csvs if p.stem.strip().lower() in included]
+        if skipped:
+            names = ", ".join(p.name for p in skipped)
+            print(f"[godark] include source labels={sorted(included)} skipped={names}")
 
     if excluded:
         skipped = [p for p in csvs if p.stem.strip().lower() in excluded]
@@ -147,7 +164,12 @@ def _read_input_csv(path: Path, cfg: GoDarkSimCfg) -> pd.DataFrame:
     df = _prep_base_df(df)
 
     if cfg.sample_frac and 0.0 < cfg.sample_frac < 1.0:
-        df = df.sample(frac=float(cfg.sample_frac), random_state=int(cfg.seed)).copy()
+        # Sampling baris merusak kontinuitas temporal. Ambil vessel utuh.
+        vessels = np.sort(df["mmsi"].unique())
+        rng = np.random.RandomState(int(cfg.seed))
+        keep_n = max(1, int(round(len(vessels) * float(cfg.sample_frac))))
+        keep = rng.choice(vessels, size=min(keep_n, len(vessels)), replace=False)
+        df = df[df["mmsi"].isin(keep)].copy()
         df = df.sort_values(["mmsi", "timestamp"]).reset_index(drop=True)
 
     return df
@@ -201,7 +223,7 @@ def _compute_behavioral_markers(
 ) -> dict:
     """
     Compute behavioral anomaly markers sebelum gap untuk detectability score.
-    Mengikuti Lv et al. indicators untuk intentional tampering.
+    Metadata deskriptif untuk audit konteks sebelum gap.
     
     Returns dict dengan keys:
     - speed_before_gap: speed kapal sebelum disappearance
@@ -266,10 +288,9 @@ def _compute_behavioral_markers(
     }
 
 
-def _distance_from_shore_km(g: pd.DataFrame) -> np.ndarray:
+def _distance_from_shore_km(g: pd.DataFrame, unit: str = "meters") -> np.ndarray:
     """
-    Mengubah distance_from_shore menjadi km secara otomatis.
-    Beberapa AIS dataset menyimpan meter, sebagian lain km.
+    Mengubah distance_from_shore menjadi km dengan satuan eksplisit.
     Nilai <0 dianggap tidak tersedia.
     """
     raw = pd.to_numeric(
@@ -283,8 +304,10 @@ def _distance_from_shore_km(g: pd.DataFrame) -> np.ndarray:
     if valid.size == 0:
         return np.full(len(g), np.nan, dtype=np.float64)
 
-    # Kalau median >1000, kemungkinan besar satuannya meter.
-    if float(np.nanmedian(valid)) > 1000.0:
+    unit_norm = str(unit).strip().lower()
+    if unit_norm not in {"meters", "kilometers"}:
+        raise ValueError("shore_distance_unit harus 'meters' atau 'kilometers'")
+    if unit_norm == "meters":
         x = x / 1000.0
 
     x[x < 0] = np.nan
@@ -299,12 +322,25 @@ def _shore_ok(shore_km: np.ndarray, start_idx: int, end_idx: int, cfg: GoDarkSim
     min_km = min_nm * NAUTICAL_MILE_KM
     vals = np.array([shore_km[start_idx], shore_km[end_idx]], dtype=float)
 
-    # Kalau kolom jarak pantai tidak tersedia, generator tetap jalan.
+    # Filter tidak boleh diam-diam lolos jika konteks pantai tidak tersedia.
     if np.isnan(vals).all():
-        return True
+        return False
 
     valid_vals = vals[~np.isnan(vals)]
     return bool(valid_vals.size > 0 and np.nanmin(valid_vals) >= min_km)
+
+
+def _source_segment_is_continuous(
+    g: pd.DataFrame,
+    start_idx: int,
+    end_idx: int,
+    cfg: GoDarkSimCfg,
+) -> bool:
+    ts = g.loc[start_idx:end_idx, "timestamp"].to_numpy(dtype=np.int64)
+    if ts.size < 2:
+        return False
+    dt = np.diff(ts)
+    return bool(np.all(dt > 0) and np.max(dt) <= int(cfg.max_source_gap_seconds))
 
 
 def _prev_ping_count_ok(g: pd.DataFrame, start_idx: int, cfg: GoDarkSimCfg) -> Tuple[bool, int]:
@@ -330,18 +366,23 @@ def _find_event(
     rng: np.random.RandomState,
     used: np.ndarray,
     shore_km: np.ndarray,
+    diversity_counts: dict[tuple[int, int, int, int], int],
 ) -> Tuple[int, int, int] | None:
     n = len(g)
 
     min_hidden = max(1, int(cfg.min_hidden_points))
     max_hidden = max(min_hidden, int(cfg.max_hidden_points))
-    label_pad = max(0, int(cfg.label_before_points)) + max(1, int(cfg.label_after_points))
+    context = max(1, int(cfg.context_points_each_side))
+    label_pad = 2 * context
 
     # Butuh titik sebelum gap, titik tersembunyi, titik muncul kembali, dan label setelahnya.
     if n < min_hidden + label_pad + 4:
         return None
 
-    for _ in range(700):
+    candidates: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+    max_attempts = max(700, int(cfg.diversity_candidate_pool) * 12)
+    for _ in range(max_attempts):
         hidden_len = int(rng.randint(min_hidden, max_hidden + 1))
 
         if hidden_len + label_pad + 4 >= n:
@@ -350,8 +391,8 @@ def _find_event(
         if hidden_len < min_hidden:
             return None
 
-        start_min = max(1, int(cfg.label_before_points))
-        start_max = n - hidden_len - int(cfg.label_after_points) - 2
+        start_min = max(1, context - 1)
+        start_max = n - hidden_len - context - 1
 
         if start_max <= start_min:
             continue
@@ -363,8 +404,8 @@ def _find_event(
             continue
 
         # Jangan overlap dengan event lain.
-        lo = max(0, start_idx - int(cfg.label_before_points))
-        hi = min(n, end_idx + int(cfg.label_after_points) + 1)
+        lo = max(0, start_idx - context + 1)
+        hi = min(n, end_idx + context)
 
         if used[lo:hi].any():
             continue
@@ -380,6 +421,17 @@ def _find_event(
         if km < float(cfg.min_hidden_distance_km):
             continue
 
+        if not _source_segment_is_continuous(g, start_idx, end_idx, cfg):
+            continue
+
+        speed_before = float(pd.to_numeric(g.loc[start_idx, "speed"], errors="coerce"))
+        if not (
+            float(cfg.min_pre_gap_speed_knots)
+            <= speed_before
+            <= float(cfg.max_pre_gap_speed_knots)
+        ):
+            continue
+
         if not _shore_ok(shore_km, start_idx, end_idx, cfg):
             continue
 
@@ -387,11 +439,50 @@ def _find_event(
 
         if not ok_ping:
             continue
+        key = (start_idx, end_idx)
+        if key in seen:
+            continue
+        seen.add(key)
+        cadence_per_hour = float(ping_count) / max(
+            float(cfg.ping_window_seconds) / 3600.0, 1e-6
+        )
+        # Fixed, interpretable strata avoid learning only the most common
+        # synthetic severity. They are protocol constants, not fitted on the
+        # external domain.
+        duration_bin = int(np.digitize(dark_seconds, [24 * 3600, 72 * 3600]))
+        cadence_bin = int(np.digitize(cadence_per_hour, [2.0, 6.0]))
+        distance_bin = int(np.digitize(km, [10.0, 100.0]))
+        position_fraction = float((start_idx + end_idx) / (2.0 * max(n - 1, 1)))
+        position_bin = int(np.digitize(position_fraction, [1.0 / 3.0, 2.0 / 3.0]))
+        candidates.append(
+            {
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "ping_count": ping_count,
+                "lo": lo,
+                "hi": hi,
+                "cell": (duration_bin, cadence_bin, distance_bin, position_bin),
+            }
+        )
+        if len(candidates) >= int(cfg.diversity_candidate_pool):
+            break
 
-        used[lo:hi] = True
-        return start_idx, end_idx, ping_count
-
-    return None
+    if not candidates:
+        return None
+    minimum = min(diversity_counts.get(item["cell"], 0) for item in candidates)
+    balanced = [
+        item for item in candidates
+        if diversity_counts.get(item["cell"], 0) == minimum
+    ]
+    selected = balanced[int(rng.randint(0, len(balanced)))]
+    used[int(selected["lo"]):int(selected["hi"])] = True
+    cell = selected["cell"]
+    diversity_counts[cell] = diversity_counts.get(cell, 0) + 1
+    return (
+        int(selected["start_idx"]),
+        int(selected["end_idx"]),
+        int(selected["ping_count"]),
+    )
 
 
 def _init_label_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -415,8 +506,10 @@ def _init_label_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["gap_bearing"] = 0.0
     df["ping_count_prev_window"] = 0
     df["min_distance_from_shore_nm_used"] = 0.0
+    df["distance_from_shore_km_normalized"] = np.nan
+    df["candidate_generation_method"] = "none"
     
-    # Behavioral markers untuk MCon-LSTM (Lv et al. features)
+    # Metadata perilaku untuk audit; tidak otomatis menjadi fitur model.
     df["speed_before_gap"] = 0.0
     df["speed_mean_window"] = 0.0
     df["course_change_deg"] = 0.0
@@ -434,12 +527,14 @@ def _apply_go_dark_events_to_vessel(
     cfg: GoDarkSimCfg,
     rng: np.random.RandomState,
     file_stem: str,
+    diversity_counts: dict[tuple[int, int, int, int], int],
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     g = g.sort_values("timestamp").reset_index(drop=True).copy()
     g = _init_label_columns(g)
 
     used = np.zeros(len(g), dtype=bool)
-    shore_km = _distance_from_shore_km(g)
+    shore_km = _distance_from_shore_km(g, cfg.shore_distance_unit)
+    g["distance_from_shore_km_normalized"] = shore_km
 
     hidden_indices: set[int] = set()
     event_rows = []
@@ -448,7 +543,9 @@ def _apply_go_dark_events_to_vessel(
     vessel = int(g["mmsi"].iloc[0])
 
     for event_no in range(1, int(cfg.events_per_vessel) + 1):
-        found = _find_event(g, cfg, rng, used, shore_km)
+        found = _find_event(
+            g, cfg, rng, used, shore_km, diversity_counts
+        )
 
         if found is None:
             continue
@@ -493,14 +590,9 @@ def _apply_go_dark_events_to_vessel(
         hidden["note"] = "ground_truth_removed_points_not_seen_by_ais"
         hidden_parts.append(hidden)
 
-        # Label titik terakhir sebelum gelap dan beberapa titik setelah kapal muncul kembali.
-        before_lo = max(0, start_idx - int(cfg.label_before_points) + 1)
-        before_idx = list(range(before_lo, start_idx + 1)) if int(cfg.label_before_points) > 0 else []
-
-        after_hi = min(len(g), end_idx + int(cfg.label_after_points))
-        after_idx = list(range(end_idx, after_hi))
-
-        for phase, indices in [("pre_blackout", before_idx), ("reappearance", after_idx)]:
+        # Hanya boundary yang dapat diamati diberi metadata. Preprocessing
+        # membentuk satu sample event dari konteks sebelum dan sesudah gap.
+        for phase, indices in [("pre_gap_boundary", [start_idx]), ("post_gap_boundary", [end_idx])]:
             if not indices:
                 continue
 
@@ -527,7 +619,8 @@ def _apply_go_dark_events_to_vessel(
             g.loc[indices, "activity_level_0to1"] = behavior_markers["activity_level_0to1"]
             g.loc[indices, "behavior_anomaly_score"] = behavior_markers["behavior_anomaly_score"]
             g.loc[indices, "generation_method"] = "synthetic_go_dark_gap_injection"
-            g.loc[indices, "note"] = "synthetic_go_dark_gap_boundary"
+            g.loc[indices, "candidate_generation_method"] = "rule_gap_context"
+            g.loc[indices, "note"] = "synthetic_suspected_ais_disabling_boundary"
 
         start_shore = shore_km[start_idx] if not np.isnan(shore_km[start_idx]) else np.nan
         end_shore = shore_km[end_idx] if not np.isnan(shore_km[end_idx]) else np.nan
@@ -549,13 +642,25 @@ def _apply_go_dark_events_to_vessel(
             "start_distance_from_shore_km": float(start_shore) if not np.isnan(start_shore) else np.nan,
             "end_distance_from_shore_km": float(end_shore) if not np.isnan(end_shore) else np.nan,
             "min_distance_from_shore_nm_used": float(cfg.min_distance_from_shore_nm),
-            # Behavioral markers (Lv et al. indicators)
+            "shore_distance_unit_input": str(cfg.shore_distance_unit),
+            "max_source_gap_seconds": int(cfg.max_source_gap_seconds),
+            "context_points_each_side": int(cfg.context_points_each_side),
+            # Metadata perilaku sebelum gap.
             "speed_before_gap": behavior_markers["speed_before_gap"],
             "speed_mean_window": behavior_markers["speed_mean_window"],
             "course_change_deg": behavior_markers["course_change_deg"],
             "activity_level_0to1": behavior_markers["activity_level_0to1"],
             "behavior_anomaly_score": behavior_markers["behavior_anomaly_score"],
             "generation_method": "synthetic_go_dark_gap_injection",
+            "trajectory_position_fraction": float(
+                (start_idx + end_idx) / (2.0 * max(len(g) - 1, 1))
+            ),
+            "trajectory_position_stratum": int(
+                np.digitize(
+                    (start_idx + end_idx) / (2.0 * max(len(g) - 1, 1)),
+                    [1.0 / 3.0, 2.0 / 3.0],
+                )
+            ),
             "lat_before": float(g.loc[start_idx, "lat"]),
             "lon_before": float(g.loc[start_idx, "lon"]),
             "lat_after": float(g.loc[end_idx, "lat"]),
@@ -586,7 +691,12 @@ def generate_go_dark_for_file(csv_path: Path, out_dir: Path, cfg: GoDarkSimCfg) 
     hidden_dir.mkdir(parents=True, exist_ok=True)
     summary_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.RandomState(int(cfg.seed) + (abs(hash(csv_path.stem)) % 100_000))
+    stable_file_hash = int.from_bytes(
+        hashlib.blake2b(csv_path.stem.encode("utf-8"), digest_size=4).digest(),
+        byteorder="little",
+        signed=False,
+    )
+    rng = np.random.RandomState((int(cfg.seed) + stable_file_hash) % (2**32 - 1))
 
     print(f"[godark] read: {csv_path}")
 
@@ -594,6 +704,9 @@ def generate_go_dark_for_file(csv_path: Path, out_dir: Path, cfg: GoDarkSimCfg) 
 
     if df.empty:
         raise RuntimeError(f"No valid rows in {csv_path}")
+    # Persist the EDA source class through the combined CSV and NPZ. This is
+    # metadata for source-aware sampling/auditing, never an input feature.
+    df["godark_source_class"] = csv_path.stem.strip().lower()
 
     vessels = _choose_vessels(df, cfg, rng)
 
@@ -608,6 +721,7 @@ def generate_go_dark_for_file(csv_path: Path, out_dir: Path, cfg: GoDarkSimCfg) 
     observed_parts = []
     event_parts = []
     hidden_parts = []
+    diversity_counts: dict[tuple[int, int, int, int], int] = {}
 
     for _, g in selected.groupby("mmsi", sort=False):
         obs, events, hidden = _apply_go_dark_events_to_vessel(
@@ -615,6 +729,7 @@ def generate_go_dark_for_file(csv_path: Path, out_dir: Path, cfg: GoDarkSimCfg) 
             cfg=cfg,
             rng=rng,
             file_stem=csv_path.stem,
+            diversity_counts=diversity_counts,
         )
 
         observed_parts.append(obs)
@@ -635,20 +750,44 @@ def generate_go_dark_for_file(csv_path: Path, out_dir: Path, cfg: GoDarkSimCfg) 
             "atau --min_points_per_vessel."
         )
 
-    # Fill NaN values untuk synthetic go_dark data sebelum preprocessing
-    # Ini penting karena preprocessing menggunakan dropna() yang akan menghapus ~95% data!
-    # Synthetic points baru mungkin punya NaN di derived features (dspeed, accel, ma5, etc)
-    numeric_cols = observed.select_dtypes(include=['float64', 'float32']).columns.tolist()
-    for col in numeric_cols:
-        # Forward fill per vessel untuk maintain continuity
-        observed[col] = observed.groupby('mmsi')[col].ffill().bfill().fillna(0)
-    
+    # Jangan forward/back-fill semua kolom. Itu dapat memalsukan konteks
+    # pantai, port, dan fishing; derived features dihitung ulang saat preprocess.
     out_path = out_dir / f"godark_{csv_path.stem}.csv"
     observed.to_csv(out_path, index=False)
 
     events_df = pd.concat(event_parts, ignore_index=True, sort=False) if event_parts else pd.DataFrame()
+    if not events_df.empty:
+        events_df["duration_stratum"] = np.digitize(
+            pd.to_numeric(events_df["dark_duration_seconds"], errors="coerce").fillna(0),
+            [24 * 3600, 72 * 3600],
+        )
+        cadence_per_hour = pd.to_numeric(
+            events_df["ping_count_prev_window"], errors="coerce"
+        ).fillna(0) / max(float(cfg.ping_window_seconds) / 3600.0, 1e-6)
+        events_df["cadence_stratum"] = np.digitize(cadence_per_hour, [2.0, 6.0])
+        events_df["distance_stratum"] = np.digitize(
+            pd.to_numeric(events_df["hidden_distance_km"], errors="coerce").fillna(0),
+            [10.0, 100.0],
+        )
     events_path = events_dir / f"events_godark_{csv_path.stem}.csv"
     events_df.to_csv(events_path, index=False)
+    if not events_df.empty:
+        diversity_audit = (
+            events_df.groupby(
+                [
+                    "duration_stratum",
+                    "cadence_stratum",
+                    "distance_stratum",
+                    "trajectory_position_stratum",
+                ],
+                dropna=False,
+            )
+            .agg(events=("go_dark_event_id", "nunique"), vessels=("mmsi", "nunique"))
+            .reset_index()
+        )
+        diversity_audit.to_csv(
+            summary_dir / f"diversity_godark_{csv_path.stem}.csv", index=False
+        )
 
     hidden_truth = pd.concat(hidden_parts, ignore_index=True, sort=False) if hidden_parts else pd.DataFrame()
     hidden_path = hidden_dir / f"hidden_truth_godark_{csv_path.stem}.csv"
@@ -678,7 +817,7 @@ def generate_go_dark_dataset(input_path: Path, out_dir: Path, cfg: GoDarkSimCfg)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    csvs = _input_csvs(input_path, cfg.exclude_labels)
+    csvs = _input_csvs(input_path, cfg.include_labels, cfg.exclude_labels)
 
     if not csvs:
         raise FileNotFoundError(f"No CSV found in {input_path}")

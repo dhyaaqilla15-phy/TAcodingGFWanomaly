@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""
-Monitor go_dark generation dan check class balance improvements
-"""
-import sys
+"""Audit output candidate-event GoDark tanpa menjalankan training."""
+import argparse
 from pathlib import Path
 import pandas as pd
-import numpy as np
 
 def analyze_godark(csv_path):
     print(f"\n{'='*70}")
@@ -14,7 +11,7 @@ def analyze_godark(csv_path):
     
     df = pd.read_csv(csv_path)
     
-    # Class distribution
+    # Boundary labels are metadata only; one event sample is created later.
     normal_count = (df['is_go_dark'] == 0).sum()
     godark_count = (df['is_go_dark'] == 1).sum()
     total = len(df)
@@ -22,7 +19,11 @@ def analyze_godark(csv_path):
     print(f"Total rows: {total:,}")
     print(f"Normal samples: {normal_count:,} ({100*normal_count/total:.2f}%)")
     print(f"Go_dark samples: {godark_count:,} ({100*godark_count/total:.2f}%)")
-    print(f"Imbalance ratio: {normal_count/max(1, godark_count):.1f}:1")
+    print(f"Boundary row ratio: {normal_count/max(1, godark_count):.1f}:1 (bukan class balance model)")
+
+    event_mask = df.get("go_dark_event_id", pd.Series("normal", index=df.index)).astype(str).ne("normal")
+    print(f"Synthetic candidate events: {df.loc[event_mask, 'go_dark_event_id'].nunique():,}")
+    print(f"Source vessels: {df['mmsi'].nunique():,}")
     
     # By label
     print(f"\nBy 'label' column:")
@@ -49,9 +50,21 @@ def analyze_godark(csv_path):
     print("\n")
 
 if __name__ == "__main__":
-    base_path = Path("/home/aqila/newcodinggfw/output")
-    
-    for run_folder in sorted(base_path.glob("run*")):
-        godark_csv = run_folder / "godark" / "godark_all.csv"
-        if godark_csv.exists():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=str(Path(__file__).resolve().parent / "Outputs"),
+        help="godark_all.csv, folder godark, atau root output berisi run*/godark",
+    )
+    args = parser.parse_args()
+    target = Path(args.path)
+    if target.is_file():
+        analyze_godark(target)
+    else:
+        candidates = sorted(target.glob("godark_all.csv"))
+        candidates += sorted(target.glob("*/godark/godark_all.csv"))
+        if not candidates:
+            raise FileNotFoundError(f"Tidak menemukan godark_all.csv di {target}")
+        for godark_csv in candidates:
             analyze_godark(godark_csv)

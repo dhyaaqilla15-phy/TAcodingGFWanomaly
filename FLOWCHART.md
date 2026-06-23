@@ -32,13 +32,13 @@ flowchart LR
   end
 
   subgraph D[Go-Dark Pipeline]
-    D1[make_godark]:::process
-    D2[plot_godark / heatmap_godark]:::process
-    D3[preprocess --task godark]:::process
-    D4[train model go-dark]:::process
-    D5[eval model go-dark]:::process
-    D6[/godark_all.csv<br/>events/*.csv<br/>hidden_truth/*.csv<br/>confusion_matrix.png<br/>eval_summary.json/]:::io
-    D1 --> D2 --> D3 --> D4 --> D5 --> D6
+    D1[Dataset internal<br/>make + preprocess]:::process
+    D2[train + validation only<br/>test_size=0]:::process
+    D3[Dataset_Test_Enriched<br/>make + preprocess independently]:::process
+    D4[pure external eval<br/>eval_split all]:::process
+    D5[/one event confusion_matrix.png<br/>eval_summary.json<br/>protocol audit/]:::io
+    D1 --> D2 --> D4 --> D5
+    D3 --> D4
   end
 
   subgraph T[Transshipment Candidate Pipeline]
