@@ -129,9 +129,10 @@ class LSTMClassifier(nn.Module):
 
         self.context_summary = bool(context_summary)
         if self.context_summary:
-            # Go-Dark samples are constructed with the observable gap boundary
-            # at T//2.  Preserve that local signal alongside global temporal
-            # pooling; no labels or simulator-only metadata enter this branch.
+            # Explicit raw-context branch beside the learned BiLSTM embedding.
+            # GoDark uses the centered gap boundary; spoofing uses observable
+            # identity/history channels.  Labels and simulator-only magnitude
+            # metadata are never part of raw_x.
             context_in_dim = input_size * 5
             self.context_proj = nn.Sequential(
                 nn.LayerNorm(context_in_dim),

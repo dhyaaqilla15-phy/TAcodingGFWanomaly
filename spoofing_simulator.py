@@ -9,7 +9,12 @@ import numpy as np
 import pandas as pd
 
 from dataload import read_ais_csv
-from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, haversine_km_np, bearing_deg_np
+from data_preparation import (
+    DEFAULT_SOURCE_EXCLUDE_LABELS,
+    DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS,
+    bearing_deg_np,
+    haversine_km_np,
+)
 
 
 DEFAULT_ATTACKS = ["gradual_drift", "location_jump", "replay", "meaconing", "ghost", "mirroring"]
@@ -36,6 +41,7 @@ class SpoofingSimCfg:
     chunksize: int = 0
     sample_frac: float = 0.0
     normal_keep_frac: float = 1.0
+    include_labels: Sequence[str] = DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS
     exclude_labels: Sequence[str] = DEFAULT_SOURCE_EXCLUDE_LABELS
 
     # banyaknya vessel/points yang dimanipulasi
@@ -97,12 +103,30 @@ def _label_set(labels: Sequence[str] | None) -> set[str]:
     return {str(label).strip().lower() for label in (labels or []) if str(label).strip()}
 
 
-def _input_csvs(input_path: Path, exclude_labels: Sequence[str] | None) -> List[Path]:
+def _input_csvs(
+    input_path: Path,
+    include_labels: Sequence[str] | None,
+    exclude_labels: Sequence[str] | None,
+) -> List[Path]:
+    included = _label_set(include_labels)
     excluded = _label_set(exclude_labels)
     if input_path.is_dir():
         csvs = sorted(input_path.glob("*.csv"))
+        available = {path.stem.strip().lower() for path in csvs}
+        missing = sorted(included - available)
+        if missing:
+            raise FileNotFoundError(
+                f"Required spoofing source CSVs missing from {input_path}: {missing}"
+            )
     else:
         csvs = [input_path]
+
+    if included:
+        skipped = [p for p in csvs if p.stem.strip().lower() not in included]
+        csvs = [p for p in csvs if p.stem.strip().lower() in included]
+        if skipped:
+            names = ", ".join(p.name for p in skipped)
+            print(f"[spoof] include source labels={sorted(included)} skipped={names}")
 
     if excluded:
         skipped = [p for p in csvs if p.stem.strip().lower() in excluded]
@@ -533,6 +557,9 @@ def _attack_replay(
     )
     if seg.empty:
         return seg
+    # Preserve the trusted source time so a paired unmodified control can be
+    # reconstructed after the replay is moved into the future.
+    seg["reference_timestamp"] = seg["timestamp"].astype("int64")
     start_new = int(g["timestamp"].max()) + int(cfg.replay_delay_seconds) + int(rng.randint(0, 1800))
     delta = start_new - int(seg["timestamp"].iloc[0])
     seg["timestamp"] = seg["timestamp"].astype("int64") + int(delta)
@@ -542,6 +569,10 @@ def _attack_replay(
         vessel,
         sid,
         scenario_mmsi,
+        magnitude={
+            "attack_replay_delay_seconds": float(delta),
+            "attack_displacement_km": 0.0,
+        },
         reported_motion_mode=_select_reported_motion_mode(cfg, rng),
     )
 
@@ -568,6 +599,8 @@ def _attack_meaconing(
     delayed = seg.iloc[lag:].copy().reset_index(drop=True)
     old = seg.iloc[:-lag].copy().reset_index(drop=True)
     # timestamp tetap timestamp saat ini, tapi posisi yang dibaca adalah posisi lama.
+    current_lat = delayed["lat"].to_numpy(dtype=float, copy=True)
+    current_lon = delayed["lon"].to_numpy(dtype=float, copy=True)
     delayed["lat"] = old["lat"].to_numpy(dtype=float)
     delayed["lon"] = old["lon"].to_numpy(dtype=float)
     if "speed" in delayed.columns:
@@ -580,6 +613,19 @@ def _attack_meaconing(
         vessel,
         sid,
         scenario_mmsi,
+        magnitude={
+            "attack_meacon_lag_steps": float(lag),
+            "attack_displacement_km": float(
+                np.median(
+                    haversine_km_np(
+                        current_lat,
+                        current_lon,
+                        delayed["lat"].to_numpy(dtype=float),
+                        delayed["lon"].to_numpy(dtype=float),
+                    )
+                )
+            ),
+        },
         reported_motion_mode=_select_reported_motion_mode(cfg, rng),
     )
 
@@ -607,8 +653,10 @@ def _attack_ghost(
     lat_off = _signed_offset(rng, rng.uniform(min_off, max_off))
     lon_off = _signed_offset(rng, rng.uniform(min_off, max_off))
 
-    seg["lat"] = _clip_lat(seg["lat"].to_numpy(dtype=float) + lat_off)
-    seg["lon"] = _wrap_lon(seg["lon"].to_numpy(dtype=float) + lon_off)
+    original_lat = seg["lat"].to_numpy(dtype=float, copy=True)
+    original_lon = seg["lon"].to_numpy(dtype=float, copy=True)
+    seg["lat"] = _clip_lat(original_lat + lat_off)
+    seg["lon"] = _wrap_lon(original_lon + lon_off)
     seg["source"] = seg["source"].astype(str) + "_ghost"
     return _finish_attack(
         seg,
@@ -616,6 +664,18 @@ def _attack_ghost(
         vessel,
         sid,
         scenario_mmsi,
+        magnitude={
+            "attack_displacement_km": float(
+                np.median(
+                    haversine_km_np(
+                        original_lat,
+                        original_lon,
+                        seg["lat"].to_numpy(dtype=float),
+                        seg["lon"].to_numpy(dtype=float),
+                    )
+                )
+            )
+        },
         reported_motion_mode=_select_reported_motion_mode(cfg, rng),
     )
 
@@ -640,8 +700,10 @@ def _attack_mirroring(
     lat_off = _signed_uniform_offset(rng, cfg.mirror_offset_min_deg, cfg.mirror_offset_max_deg)
     lon_off = _signed_uniform_offset(rng, cfg.mirror_offset_min_deg, cfg.mirror_offset_max_deg)
 
-    seg["lat"] = _clip_lat(seg["lat"].to_numpy(dtype=float) + lat_off)
-    seg["lon"] = _wrap_lon(seg["lon"].to_numpy(dtype=float) + lon_off)
+    original_lat = seg["lat"].to_numpy(dtype=float, copy=True)
+    original_lon = seg["lon"].to_numpy(dtype=float, copy=True)
+    seg["lat"] = _clip_lat(original_lat + lat_off)
+    seg["lon"] = _wrap_lon(original_lon + lon_off)
     seg["source"] = seg["source"].astype(str) + "_mirroring"
     return _finish_attack(
         seg,
@@ -649,6 +711,18 @@ def _attack_mirroring(
         vessel,
         sid,
         scenario_mmsi,
+        magnitude={
+            "attack_displacement_km": float(
+                np.median(
+                    haversine_km_np(
+                        original_lat,
+                        original_lon,
+                        seg["lat"].to_numpy(dtype=float),
+                        seg["lon"].to_numpy(dtype=float),
+                    )
+                )
+            )
+        },
         reported_motion_mode=_select_reported_motion_mode(cfg, rng),
     )
 
@@ -687,7 +761,12 @@ def _matched_normal_control(
     attack_type: str,
 ) -> pd.DataFrame:
     """Return the exact unmodified source segment paired with one attack."""
-    timestamps = attacked["timestamp"].to_numpy(dtype=np.int64)
+    timestamp_column = (
+        "reference_timestamp"
+        if "reference_timestamp" in attacked.columns
+        else "timestamp"
+    )
+    timestamps = attacked[timestamp_column].to_numpy(dtype=np.int64)
     source = source_track.drop_duplicates("timestamp", keep="last").set_index("timestamp")
     missing = [int(ts) for ts in timestamps if int(ts) not in source.index]
     if missing:
@@ -745,6 +824,13 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
     df = _read_input_csv(csv_path, cfg)
     if df.empty:
         raise RuntimeError(f"No valid rows in {csv_path}")
+    source_label = csv_path.stem.strip().lower()
+    if source_label not in _label_set(cfg.include_labels):
+        raise RuntimeError(
+            f"Spoofing source {source_label!r} is outside locked sources "
+            f"{sorted(_label_set(cfg.include_labels))}."
+        )
+    df["source_label"] = source_label
 
     normal = _sample_contiguous_normal(
         df,
@@ -813,7 +899,34 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
                     f"_rep{replicate + 1:02d}"
                 )
                 scenario_mmsi = scenario_base + scenario_no
-                scenario_cfg = replace(cfg, reported_motion_mode=scenario_mode)
+                # Deterministic severity grid: every source/attack/vessel gets
+                # comparable mild, medium, and strong variants.  This is data
+                # diversity for internal validation, not tuning on external.
+                if scenarios_per_attack <= 1:
+                    severity_scale = 1.0
+                else:
+                    severity_scale = float(
+                        np.linspace(0.60, 1.40, scenarios_per_attack)[replicate]
+                    )
+                scenario_cfg = replace(
+                    cfg,
+                    reported_motion_mode=scenario_mode,
+                    drift_lat_deg=float(cfg.drift_lat_deg) * severity_scale,
+                    drift_lon_deg=float(cfg.drift_lon_deg) * severity_scale,
+                    drift_rate_kmh=float(cfg.drift_rate_kmh) * severity_scale,
+                    jump_lat_deg=float(cfg.jump_lat_deg) * severity_scale,
+                    jump_lon_deg=float(cfg.jump_lon_deg) * severity_scale,
+                    replay_delay_seconds=max(
+                        60, int(round(float(cfg.replay_delay_seconds) * severity_scale))
+                    ),
+                    meacon_lag_steps=max(
+                        1, int(round(float(cfg.meacon_lag_steps) * severity_scale))
+                    ),
+                    ghost_offset_min_deg=float(cfg.ghost_offset_min_deg) * severity_scale,
+                    ghost_offset_max_deg=float(cfg.ghost_offset_max_deg) * severity_scale,
+                    mirror_offset_min_deg=float(cfg.mirror_offset_min_deg) * severity_scale,
+                    mirror_offset_max_deg=float(cfg.mirror_offset_max_deg) * severity_scale,
+                )
                 if attack == "gradual_drift":
                     part = _attack_gradual_drift(
                         g, vessel, scenario_cfg, rng, sid, scenario_mmsi
@@ -843,10 +956,7 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
 
                 if not part.empty:
                     spoof_parts.append(part)
-                    if (
-                        bool(cfg.include_matched_normal_controls)
-                        and attack in DEFAULT_DETECTABLE_ATTACKS
-                    ):
+                    if bool(cfg.include_matched_normal_controls):
                         control = _matched_normal_control(
                             g,
                             part,
@@ -859,6 +969,12 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
 
     merged_parts = [normal] + spoof_parts
     merged = pd.concat(merged_parts, ignore_index=True, sort=False)
+    # Trusted identity-registry side channel.  It is derived only from the
+    # identities present in the source dataset, never from attack labels.
+    registered_identities = set(df["mmsi"].astype(str).tolist())
+    merged["claimed_identity_registered"] = (
+        merged["claimed_mmsi"].astype(str).isin(registered_identities).astype("int8")
+    )
     merged = merged.sort_values(["timestamp", "mmsi", "attack_type"]).reset_index(drop=True)
 
     out_path = out_dir / f"spoofed_{csv_path.stem}.csv"
@@ -887,6 +1003,8 @@ def generate_spoofing_for_file(csv_path: Path, out_dir: Path, cfg: SpoofingSimCf
         "attack_drift_rate_kmh",
         "attack_target_drift_rate_kmh",
         "attack_applied_drift_rate_kmh",
+        "attack_replay_delay_seconds",
+        "attack_meacon_lag_steps",
         "reported_motion_mode",
     ]
     magnitude_summary = (
@@ -909,7 +1027,7 @@ def generate_spoofing_dataset(input_path: Path, out_dir: Path, cfg: SpoofingSimC
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    csvs = _input_csvs(input_path, cfg.exclude_labels)
+    csvs = _input_csvs(input_path, cfg.include_labels, cfg.exclude_labels)
 
     if not csvs:
         raise FileNotFoundError(f"No CSV found in {input_path}")

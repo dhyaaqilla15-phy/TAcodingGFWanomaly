@@ -135,6 +135,16 @@ def _load_window_source_labels(npz_path: Path) -> Tuple[np.ndarray, bool]:
     return labels, bool(valid)
 
 
+def _load_spoofing_balance_strata(npz_path: Path) -> Tuple[np.ndarray, bool]:
+    with np.load(npz_path, allow_pickle=True) as data:
+        n = int(data["y"].shape[0])
+        if "spoofing_balance_strata" not in data.files:
+            return np.array(["unknown"] * n, dtype=object), False
+        strata = data["spoofing_balance_strata"].astype(object)
+    valid = int(strata.shape[0]) == n and len(set(strata.astype(str))) > 1
+    return strata, bool(valid)
+
+
 def _load_transshipment_protocol_metadata(
     npz_path: Path,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
@@ -346,6 +356,50 @@ def _pick_best_tau_by_sequence(
                 best_tau, best_m = float(tau), m
 
     return float(best_tau), dict(best_m)
+
+
+def _pick_best_spoofing_tau_by_source(
+    logits_np: np.ndarray,
+    y_np: np.ndarray,
+    sources: np.ndarray,
+    log_pi: np.ndarray,
+    tau_list: List[float],
+    num_classes: int,
+) -> Tuple[float, Dict[str, float], Dict[str, float], Tuple[float, ...]]:
+    """Select validation policy without letting a large source dominate."""
+    sources = np.asarray(sources).astype(str)
+    best: tuple | None = None
+    for tau in tau_list:
+        adjusted = logits_np - (float(tau) * log_pi.reshape(1, -1))
+        pred = np.argmax(adjusted, axis=1).astype(np.int64)
+        overall = metrics_from_cm(
+            confusion_matrix_np(y_np, pred, num_classes)
+        )
+        source_macro_f1: list[float] = []
+        source_spoofing_recall: list[float] = []
+        for source in sorted(set(sources.tolist())):
+            idx = np.where(sources == source)[0]
+            cm_source = confusion_matrix_np(y_np[idx], pred[idx], num_classes)
+            source_metrics = metrics_from_cm(cm_source)
+            tp = int(cm_source[1, 1]) if cm_source.shape == (2, 2) else 0
+            fn = int(cm_source[1, 0]) if cm_source.shape == (2, 2) else 0
+            source_macro_f1.append(float(source_metrics["macro_f1"]))
+            source_spoofing_recall.append(float(tp / max(tp + fn, 1)))
+        source_report = {
+            "macro_source_f1": float(np.mean(source_macro_f1)),
+            "min_source_recall": float(np.min(source_spoofing_recall)),
+        }
+        key = (
+            int(source_report["min_source_recall"] >= 0.20),
+            source_report["macro_source_f1"],
+            source_report["min_source_recall"],
+            float(overall["macro_f1"]),
+            float(overall["balanced_acc"]),
+        )
+        if best is None or key > best[0]:
+            best = (key, float(tau), dict(overall), source_report)
+    assert best is not None
+    return best[1], best[2], best[3], tuple(best[0])
 
 
 def _pick_best_godark_by_validation(
@@ -767,7 +821,7 @@ def train_from_npz(
     num_classes = int(len(label_map))
     input_size = int(X.shape[-1])
     task_name = _task_name_from_label_map(label_map)
-    if task_name in {"godark", "transshipment"}:
+    if task_name in {"spoofing", "godark", "transshipment"}:
         window_source_labels, has_window_source_labels = (
             _load_window_source_labels(Path(data_npz))
         )
@@ -776,6 +830,12 @@ def train_from_npz(
             ["unknown"] * len(y), dtype=object
         )
         has_window_source_labels = False
+    spoofing_balance_strata = np.array(["unknown"] * len(y), dtype=object)
+    has_spoofing_balance_strata = False
+    if task_name == "spoofing":
+        spoofing_balance_strata, has_spoofing_balance_strata = (
+            _load_spoofing_balance_strata(Path(data_npz))
+        )
     transshipment_train_mmsi: list[str] = []
     transshipment_protocol = ""
     if task_name == "transshipment":
@@ -801,6 +861,23 @@ def train_from_npz(
             raise ValueError(
                 "Spoofing requires label_map {0: 'normal', 1: 'spoofing'}; "
                 f"got {normalized_label_map}."
+            )
+        required_context = {
+            "claimed_identity_registered",
+            "claimed_history_age_log_hours",
+            "claimed_prev_dt_log_hours",
+            "claimed_prev_distance_log_km",
+            "claimed_prev_implied_speed_log_knots",
+            "claimed_concurrent_reports_log1p",
+            "claimed_concurrent_spread_log_km",
+            "claimed_revisit_lag_log_hours",
+            "claimed_revisit_score",
+        }
+        missing_context = sorted(required_context - set(feature_cols))
+        if missing_context:
+            raise ValueError(
+                "Spoofing hybrid training requires observable context features. "
+                f"Rerun prepare; missing={missing_context}."
             )
         aug_cfg = AugCfg(
             p_aug=0.30,
@@ -852,7 +929,7 @@ def train_from_npz(
     if task_name == "godark" and not has_window_metadata:
         print("[train] WARNING: NPZ has no Go-Dark window_event_ids/window_kinds; event-level model selection is disabled.")
     use_geo_aux = bool(float(geo_aux_weight) > 0.0 and coords is not None)
-    use_context_summary = bool(task_name == "godark")
+    use_context_summary = bool(task_name in {"spoofing", "godark"})
     if task_name in {"spoofing", "godark"} and use_geo_aux:
         print(
             f"[train] WARNING: geo auxiliary loss disabled for {task_name}. "
@@ -983,6 +1060,7 @@ def train_from_npz(
     y_train, g_train = y[split.train_idx], groups[split.train_idx]
     source_train = window_source_labels[split.train_idx].astype(str)
     source_val = window_source_labels[split.val_idx].astype(str)
+    spoofing_strata_train = spoofing_balance_strata[split.train_idx].astype(str)
     y_val, g_val = y[split.val_idx], groups[split.val_idx]
     event_ids_val = window_event_ids[split.val_idx] if has_window_metadata else np.array([""] * len(split.val_idx), dtype=object)
     kinds_val = window_kinds[split.val_idx] if has_window_metadata else np.array(["unknown"] * len(split.val_idx), dtype=object)
@@ -1039,7 +1117,48 @@ def train_from_npz(
     use_transshipment_source_balancing = bool(
         task_name == "transshipment" and has_window_source_labels
     )
-    if use_godark_source_balancing:
+    use_spoofing_context_balancing = bool(
+        task_name == "spoofing"
+        and has_window_source_labels
+        and has_spoofing_balance_strata
+        and has_window_metadata
+    )
+    spoofing_sample_weights = None
+    spoofing_cell_event_counts: dict[str, int] = {}
+    if use_spoofing_context_balancing:
+        event_str = np.asarray(window_event_ids[split.train_idx]).astype(str)
+        # Equal total mass per source×attack×label×duration×cadence×magnitude
+        # cell, then equal mass per scenario inside that cell.  Simulator-only
+        # magnitude metadata controls sampling only and never enters X.
+        event_to_cell: dict[str, str] = {}
+        event_windows: dict[str, int] = {}
+        for event_id in np.unique(event_str):
+            idx = np.where(event_str == event_id)[0]
+            values, counts = np.unique(spoofing_strata_train[idx], return_counts=True)
+            cell = str(values[int(np.argmax(counts))])
+            event_to_cell[str(event_id)] = cell
+            event_windows[str(event_id)] = int(len(idx))
+            spoofing_cell_event_counts[cell] = (
+                spoofing_cell_event_counts.get(cell, 0) + 1
+            )
+        spoofing_sample_weights = np.asarray(
+            [
+                1.0
+                / float(
+                    spoofing_cell_event_counts[event_to_cell[str(event_id)]]
+                    * event_windows[str(event_id)]
+                )
+                for event_id in event_str
+            ],
+            dtype=np.float64,
+        )
+        pri_np = _prior_from_window_counts(y_train, num_classes)
+        class_w = torch.ones(num_classes, dtype=torch.float32, device=dev)
+        print(
+            "[train] spoofing context-aware scenario balancing cells="
+            + str(dict(sorted(spoofing_cell_event_counts.items())))
+        )
+    elif use_godark_source_balancing:
         joint_keys = np.array(
             [f"{src}::{int(label)}" for src, label in zip(source_train, y_train)],
             dtype=object,
@@ -1188,7 +1307,22 @@ def train_from_npz(
     train_ds = AisSeqDataset(X_train, y_train, coords=coords_train)
     val_ds = AisSeqDataset(X_val, y_val, groups=g_val)
 
-    if use_godark_source_balancing:
+    if use_spoofing_context_balancing:
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(int(train_seed))
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(spoofing_sample_weights, dtype=torch.double),
+            num_samples=int(len(spoofing_sample_weights)),
+            replacement=True,
+            generator=sampler_generator,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=0,
+        )
+    elif use_godark_source_balancing:
         inverse_count = {
             str(key): 1.0 / float(count)
             for key, count in zip(joint_values.tolist(), joint_counts.tolist())
@@ -1499,6 +1633,8 @@ def train_from_npz(
 
         godark_event_metrics_ep = None
         godark_selection_key_ep = None
+        spoofing_source_metrics_ep = None
+        spoofing_selection_key_ep = None
         if use_godark_event_selection:
             tau_ep, m_ep, godark_event_metrics_ep, godark_selection_key_ep = _pick_best_godark_by_validation(
                 logits_np=logits_np,
@@ -1571,6 +1707,21 @@ def train_from_npz(
                 min_source_recall_ep,
                 *(tuple(godark_selection_key_ep or ())),
             )
+        elif task_name == "spoofing":
+            (
+                tau_ep,
+                m_ep,
+                spoofing_source_metrics_ep,
+                spoofing_selection_key_ep,
+            ) = _pick_best_spoofing_tau_by_source(
+                logits_np=logits_np,
+                y_np=y_np,
+                sources=source_val,
+                log_pi=log_pi_np,
+                tau_list=tau_candidates,
+                num_classes=num_classes,
+            )
+            agg_ep = agg_grid[0]
         elif metric_scope == "sequence":
             tau_ep, m_ep = _pick_best_tau_by_sequence(
                 logits_np=logits_np,
@@ -1618,6 +1769,14 @@ def train_from_npz(
                 f"min_win={int(godark_event_metrics_ep['godark_event_min_positive_windows'])} "
                 f"status={godark_status_ep['checkpoint_status']} tau={tau_ep:.2f} lr={lr_now:.2e}"
             )
+        elif task_name == "spoofing" and spoofing_source_metrics_ep is not None:
+            print(
+                f"[epoch {epoch}] train_loss={train_loss:.4f} cls={train_cls_loss:.4f} geo={train_geo_loss:.4f} "
+                f"VAL(seq) macro_f1={m_ep['macro_f1']:.4f} bal_acc={m_ep['balanced_acc']:.4f} acc={m_ep['accuracy']:.4f} "
+                f"source_macro_f1={spoofing_source_metrics_ep['macro_source_f1']:.4f} "
+                f"min_source_recall={spoofing_source_metrics_ep['min_source_recall']:.4f} "
+                f"tau={tau_ep:.2f} lr={lr_now:.2e}"
+            )
         elif metric_scope == "sequence":
             print(
                 f"[epoch {epoch}] train_loss={train_loss:.4f} cls={train_cls_loss:.4f} geo={train_geo_loss:.4f} "
@@ -1660,12 +1819,16 @@ def train_from_npz(
                     None if godark_event_metrics_ep is None else float(godark_event_metrics_ep.get("event_f1", 0.0))
                 ),
                 "val_macro_source_f1": (
-                    None if godark_event_metrics_ep is None else float(
+                    float(spoofing_source_metrics_ep["macro_source_f1"])
+                    if spoofing_source_metrics_ep is not None
+                    else None if godark_event_metrics_ep is None else float(
                         godark_event_metrics_ep.get("macro_source_f1", 0.0)
                     )
                 ),
                 "val_min_source_recall": (
-                    None if godark_event_metrics_ep is None else float(
+                    float(spoofing_source_metrics_ep["min_source_recall"])
+                    if spoofing_source_metrics_ep is not None
+                    else None if godark_event_metrics_ep is None else float(
                         godark_event_metrics_ep.get("min_source_recall", 0.0)
                     )
                 ),
@@ -1773,6 +1936,11 @@ def train_from_npz(
 
         if use_godark_event_selection and godark_event_metrics_ep is not None:
             improved = best_selection_key is None or tuple(godark_selection_key_ep or ()) > best_selection_key
+        elif task_name == "spoofing":
+            improved = (
+                best_selection_key is None
+                or tuple(spoofing_selection_key_ep or ()) > best_selection_key
+            )
         elif task_name == "gear":
             rare_mean_f1 = float(m_ep.get("rare_mean_f1", 0.0))
             min_present_f1 = float(m_ep.get("min_present_f1", 0.0))
@@ -1803,7 +1971,10 @@ def train_from_npz(
                 best_selection_key = tuple(godark_selection_key_ep or ())
                 best_godark_event_metrics = dict(godark_event_metrics_ep)
                 best_godark_event_prob_threshold = float(
-                    godark_event_metrics_ep.get("godark_event_prob_threshold", DEFAULT_GODARK_EVENT_PROB_THRESHOLD)
+                    godark_event_metrics_ep.get(
+                        "godark_event_prob_threshold",
+                        DEFAULT_GODARK_EVENT_PROB_THRESHOLD,
+                    )
                 )
                 best_godark_event_mean_prob_threshold = float(
                     godark_event_metrics_ep.get(
@@ -1835,12 +2006,22 @@ def train_from_npz(
                         int(bool(godark_event_use_short_rescue)),
                     )
                 )
+            elif task_name == "spoofing":
+                best_selection_key = tuple(spoofing_selection_key_ep or ())
             no_improve = 0
 
             logit_adjust = (best_tau * log_pi).detach().cpu().numpy().astype(np.float32)
-            best_checkpoint_status = _godark_checkpoint_status(
-                best_godark_event_metrics,
-                min_precision=float(godark_event_min_precision),
+            best_checkpoint_status = (
+                _godark_checkpoint_status(
+                    best_godark_event_metrics,
+                    min_precision=float(godark_event_min_precision),
+                )
+                if task_name == "godark"
+                else {
+                    "checkpoint_status": "not_applicable",
+                    "checkpoint_valid": None,
+                    "checkpoint_invalid_reason": None,
+                }
             )
 
             # Metric val dihitung pakai EMA shadow; simpan checkpoint dengan bobot yang sama.
@@ -1860,6 +2041,14 @@ def train_from_npz(
                     "attention_heads": int(attention_heads),
                     "attention_layers": int(attention_layers),
                     "context_summary": bool(use_context_summary),
+                    "spoofing_context_balancing": bool(
+                        use_spoofing_context_balancing
+                    ),
+                    "spoofing_model_selection": (
+                        "min_source_recall_floor_then_macro_source_f1"
+                        if task_name == "spoofing"
+                        else None
+                    ),
                     "predict_coords": bool(use_geo_aux),
                     "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                     "geo_aux_scale_km": float(geo_aux_scale_km),
@@ -2066,6 +2255,14 @@ def train_from_npz(
                 "attention_heads": int(attention_heads),
                 "attention_layers": int(attention_layers),
                 "context_summary": bool(use_context_summary),
+                "spoofing_context_balancing": bool(
+                    use_spoofing_context_balancing
+                ),
+                "spoofing_model_selection": (
+                    "min_source_recall_floor_then_macro_source_f1"
+                    if task_name == "spoofing"
+                    else None
+                ),
                 "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                 "geo_aux_scale_km": float(geo_aux_scale_km),
                 "random_state": int(random_state),
@@ -2215,6 +2412,14 @@ def train_from_npz(
                 "attention_heads": int(attention_heads),
                 "attention_layers": int(attention_layers),
                 "context_summary": bool(use_context_summary),
+                "spoofing_context_balancing": bool(
+                    use_spoofing_context_balancing
+                ),
+                "spoofing_model_selection": (
+                    "min_source_recall_floor_then_macro_source_f1"
+                    if task_name == "spoofing"
+                    else None
+                ),
                 "geo_aux_weight": float(geo_aux_weight) if use_geo_aux else 0.0,
                 "geo_aux_scale_km": float(geo_aux_scale_km),
                 "test_size": float(test_size),

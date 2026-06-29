@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -14,6 +15,12 @@ from dataload import read_ais_csv, infer_label_from_filename
 DEFAULT_SOURCE_EXCLUDE_LABELS = ("pole_and_line", "trollers")
 DEFAULT_GEAR_EXCLUDE_LABELS = ("unknown", *DEFAULT_SOURCE_EXCLUDE_LABELS)
 DEFAULT_TRANSSHIPMENT_SOURCE_INCLUDE_LABELS = (
+    "drifting_longlines",
+    "fixed_gear",
+    "purse_seines",
+    "trawlers",
+)
+DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS = (
     "drifting_longlines",
     "fixed_gear",
     "purse_seines",
@@ -51,6 +58,22 @@ SEQ_FEATURE_COLS = [
     "pos_speed_std5",
     "abs_turn_ma5",
     "curvature_ma5",
+]
+
+# Context features are computed only from fields observable by a detector:
+# claimed identity, report time, and reported position.  Attack labels,
+# original_mmsi, scenario_id, and simulator magnitude are deliberately excluded
+# from X; those fields are allowed only as split/balancing/audit metadata.
+SPOOFING_CONTEXT_FEATURE_COLS = [
+    "claimed_identity_registered",
+    "claimed_history_age_log_hours",
+    "claimed_prev_dt_log_hours",
+    "claimed_prev_distance_log_km",
+    "claimed_prev_implied_speed_log_knots",
+    "claimed_concurrent_reports_log1p",
+    "claimed_concurrent_spread_log_km",
+    "claimed_revisit_lag_log_hours",
+    "claimed_revisit_score",
 ]
 
 LOCATION_FEATURE_COLS = [
@@ -161,9 +184,14 @@ def _normalize_exclude_labels(task: str, exclude_labels: Optional[List[str]]) ->
 
 
 def _sequence_feature_cols(cfg: PreprocessCfg) -> List[str]:
-    if cfg.use_location_features:
-        return list(SEQ_FEATURE_COLS)
-    return [c for c in SEQ_FEATURE_COLS if c not in LOCATION_FEATURE_COLS]
+    cols = (
+        list(SEQ_FEATURE_COLS)
+        if cfg.use_location_features
+        else [c for c in SEQ_FEATURE_COLS if c not in LOCATION_FEATURE_COLS]
+    )
+    if str(cfg.task) == "spoofing":
+        cols.extend(SPOOFING_CONTEXT_FEATURE_COLS)
+    return cols
 
 
 def _select_spoofing_cap_indices(
@@ -280,6 +308,153 @@ def bearing_deg_np(lat1, lon1, lat2, lon2) -> np.ndarray:
     return brng
 
 
+def _add_spoofing_observable_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Add causal identity/history context without using simulator labels.
+
+    The feature contract mirrors information available to an operational
+    detector that maintains a registry and a time-ordered AIS message cache.
+    No attack_type, label, original_mmsi, scenario_id, or injected magnitude is
+    consulted here.
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+    stale_context = [
+        column
+        for column in SPOOFING_CONTEXT_FEATURE_COLS
+        if column != "claimed_identity_registered" and column in out.columns
+    ]
+    if stale_context:
+        out = out.drop(columns=stale_context)
+    if "claimed_mmsi" in out.columns:
+        claimed = out["claimed_mmsi"].astype(str)
+    else:
+        claimed = out["mmsi"].astype(str)
+    out["_claimed_identity"] = claimed
+
+    if "claimed_identity_registered" in out.columns:
+        registered = pd.to_numeric(
+            out["claimed_identity_registered"], errors="coerce"
+        ).fillna(0.0)
+    else:
+        # Backward-compatible fallback: identities that also appear as a
+        # native report identity are considered present in the local registry.
+        native = set(out["mmsi"].astype(str).tolist())
+        registered = claimed.isin(native).astype(float)
+    out["claimed_identity_registered"] = registered.clip(0.0, 1.0).astype("float32")
+
+    keys = ["_claimed_identity", "timestamp"]
+    simultaneous_count = out.groupby(keys, sort=False)["mmsi"].transform("size")
+    median_lat = out.groupby(keys, sort=False)["lat"].transform("median")
+    median_lon = out.groupby(keys, sort=False)["lon"].transform("median")
+    distance_to_center = haversine_km_np(
+        out["lat"].to_numpy(dtype=float),
+        out["lon"].to_numpy(dtype=float),
+        median_lat.to_numpy(dtype=float),
+        median_lon.to_numpy(dtype=float),
+    )
+    out["_simultaneous_distance_km"] = distance_to_center
+    simultaneous_spread = out.groupby(keys, sort=False)[
+        "_simultaneous_distance_km"
+    ].transform("max")
+
+    centroids = (
+        out.groupby(keys, sort=False, as_index=False)
+        .agg(_ctx_lat=("lat", "median"), _ctx_lon=("lon", "median"))
+        .sort_values(["_claimed_identity", "timestamp"])
+    )
+    by_claim = centroids.groupby("_claimed_identity", sort=False)
+    centroids["_prev_timestamp"] = by_claim["timestamp"].shift(1)
+    centroids["_prev_lat"] = by_claim["_ctx_lat"].shift(1)
+    centroids["_prev_lon"] = by_claim["_ctx_lon"].shift(1)
+    centroids["_first_timestamp"] = by_claim["timestamp"].transform("min")
+
+    prev_valid = centroids["_prev_timestamp"].notna()
+    prev_distance = np.zeros(len(centroids), dtype=np.float64)
+    if bool(prev_valid.any()):
+        prev_distance[prev_valid.to_numpy()] = haversine_km_np(
+            centroids.loc[prev_valid, "_prev_lat"].to_numpy(dtype=float),
+            centroids.loc[prev_valid, "_prev_lon"].to_numpy(dtype=float),
+            centroids.loc[prev_valid, "_ctx_lat"].to_numpy(dtype=float),
+            centroids.loc[prev_valid, "_ctx_lon"].to_numpy(dtype=float),
+        )
+    prev_dt = (
+        centroids["timestamp"] - centroids["_prev_timestamp"]
+    ).fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+    prev_speed_knots = np.divide(
+        prev_distance * (3600.0 / 1.852),
+        np.maximum(prev_dt, 1.0),
+    )
+
+    # Approximate causal revisit memory using ~1 km spatial cells. Updates are
+    # committed per timestamp so simultaneous reports cannot masquerade as
+    # historical revisits.
+    revisit_lag = np.zeros(len(centroids), dtype=np.float64)
+    for _, idx in centroids.groupby("_claimed_identity", sort=False).groups.items():
+        last_seen: Dict[Tuple[int, int], float] = {}
+        local = centroids.loc[list(idx)].sort_values("timestamp")
+        for timestamp, rows in local.groupby("timestamp", sort=True):
+            pending: List[Tuple[int, int]] = []
+            for row_idx, row in rows.iterrows():
+                cell = (
+                    int(np.round(float(row["_ctx_lat"]) * 100.0)),
+                    int(np.round(float(row["_ctx_lon"]) * 100.0)),
+                )
+                if cell in last_seen:
+                    revisit_lag[int(row_idx)] = max(
+                        0.0, float(timestamp) - float(last_seen[cell])
+                    )
+                pending.append(cell)
+            for cell in pending:
+                last_seen[cell] = float(timestamp)
+
+    centroids["claimed_history_age_log_hours"] = np.log1p(
+        ((centroids["timestamp"] - centroids["_first_timestamp"]) / 3600.0)
+        .clip(lower=0.0)
+    )
+    centroids["claimed_prev_dt_log_hours"] = np.log1p(prev_dt / 3600.0)
+    centroids["claimed_prev_distance_log_km"] = np.log1p(
+        np.clip(prev_distance, 0.0, 20000.0)
+    )
+    centroids["claimed_prev_implied_speed_log_knots"] = np.log1p(
+        np.clip(prev_speed_knots, 0.0, 10000.0)
+    )
+    centroids["claimed_revisit_lag_log_hours"] = np.log1p(revisit_lag / 3600.0)
+    centroids["claimed_revisit_score"] = (
+        revisit_lag >= 3600.0
+    ).astype(np.float32)
+
+    context_cols = [
+        "claimed_history_age_log_hours",
+        "claimed_prev_dt_log_hours",
+        "claimed_prev_distance_log_km",
+        "claimed_prev_implied_speed_log_knots",
+        "claimed_revisit_lag_log_hours",
+        "claimed_revisit_score",
+    ]
+    out = out.merge(
+        centroids[keys + context_cols],
+        on=keys,
+        how="left",
+        validate="many_to_one",
+    )
+    out["claimed_concurrent_reports_log1p"] = np.log1p(
+        simultaneous_count.to_numpy(dtype=float).clip(min=1.0) - 1.0
+    ).astype(np.float32)
+    out["claimed_concurrent_spread_log_km"] = np.log1p(
+        np.clip(simultaneous_spread.to_numpy(dtype=float), 0.0, 20000.0)
+    ).astype(np.float32)
+    for column in SPOOFING_CONTEXT_FEATURE_COLS:
+        out[column] = (
+            pd.to_numeric(out[column], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+            .astype("float32")
+        )
+    return out.drop(columns=["_claimed_identity", "_simultaneous_distance_km"])
+
+
 def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     need = ["mmsi", "timestamp", "lat", "lon"]
     for c in need:
@@ -300,6 +475,9 @@ def clean_and_derive(df: pd.DataFrame, cfg: PreprocessCfg) -> pd.DataFrame:
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
     df = df.dropna(subset=["lat", "lon"]).copy()
     df = df[(df["lat"].between(-90, 90)) & (df["lon"].between(-180, 180))].copy()
+
+    if str(cfg.task) == "spoofing":
+        df = _add_spoofing_observable_context(df)
 
     if "speed" in df.columns:
         df["speed"] = pd.to_numeric(df["speed"], errors="coerce")
@@ -1095,7 +1273,7 @@ def build_sequences_from_df(
     cfg: PreprocessCfg,
 ) -> Tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-    np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
 ]:
     df = clean_and_derive(df, cfg)
 
@@ -1187,6 +1365,7 @@ def build_sequences_from_df(
     source_list: List[str] = []
     event_order_list: List[int] = []
     position_stratum_list: List[int] = []
+    balance_stratum_list: List[str] = []
 
     for vessel_id, g in df.groupby("mmsi", sort=False):
         g = g.sort_values("timestamp")
@@ -1215,6 +1394,7 @@ def build_sequences_from_df(
         split_group_id = str(vessel_id)
         spoof_scenario_ids = np.array([str(vessel_id)] * len(g), dtype=object)
         spoof_attack_types = np.array(["normal"] * len(g), dtype=object)
+        spoof_source_label = "unknown"
         if cfg.task == "spoofing":
             if "original_mmsi" in g.columns:
                 source_ids = g["original_mmsi"].dropna().astype(str).unique()
@@ -1229,6 +1409,30 @@ def build_sequences_from_df(
             if "attack_type" in g.columns:
                 spoof_attack_types = (
                     g["attack_type"].astype(str).str.lower().to_numpy()
+                )
+            if "source_label" not in g.columns:
+                raise ValueError(
+                    "task=spoofing requires source_label so the locked four-gear "
+                    "protocol can be audited. Regenerate spoofing data."
+                )
+            source_values = sorted(
+                {
+                    str(value).strip().lower()
+                    for value in g["source_label"].dropna().tolist()
+                    if str(value).strip()
+                }
+            )
+            if len(source_values) != 1:
+                raise ValueError(
+                    "Each spoofing scenario must map to exactly one source_label; "
+                    f"got {source_values}."
+                )
+            spoof_source_label = source_values[0]
+            if spoof_source_label not in DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS:
+                raise ValueError(
+                    "task=spoofing only accepts source labels "
+                    f"{list(DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS)}; "
+                    f"got {spoof_source_label!r}."
                 )
         event_ids = (
             g.get("go_dark_event_id", pd.Series("normal", index=g.index))
@@ -1260,6 +1464,7 @@ def build_sequences_from_df(
                 position_stratum_list.append(
                     int(item.get("trajectory_position_stratum", -1))
                 )
+                balance_stratum_list.append("not_applicable")
             continue
 
         win_count = 0
@@ -1321,12 +1526,77 @@ def build_sequences_from_df(
                     event_id_list.append(str(scenario_values[0]))
                     attack_counts = pd.Series(attack_values).value_counts()
                     kind_list.append(str(attack_counts.index[0]))
+                    raw_window = g.iloc[s + i:s + i + cfg.seq_len]
+                    attack_ref = str(attack_counts.index[0]).strip().lower()
+                    if attack_ref == "normal" and "normal_control_for_attack" in raw_window:
+                        controls = (
+                            raw_window["normal_control_for_attack"]
+                            .astype(str)
+                            .str.strip()
+                            .str.lower()
+                        )
+                        controls = controls[~controls.isin(["", "nan", "none"])]
+                        control_counts = controls.value_counts(dropna=True)
+                        if len(control_counts.index) > 0:
+                            attack_ref = str(control_counts.index[0])
+                    duration_hours = float(
+                        pd.to_numeric(
+                            raw_window.get(
+                                "attack_duration_hours",
+                                pd.Series(0.0, index=raw_window.index),
+                            ),
+                            errors="coerce",
+                        ).fillna(0.0).median()
+                    )
+                    displacement_km = float(
+                        pd.to_numeric(
+                            raw_window.get(
+                                "attack_displacement_km",
+                                pd.Series(0.0, index=raw_window.index),
+                            ),
+                            errors="coerce",
+                        ).fillna(0.0).median()
+                    )
+                    raw_ts = raw_window["timestamp"].to_numpy(dtype=np.float64)
+                    cadence_seconds = float(
+                        np.median(np.diff(raw_ts)[np.diff(raw_ts) > 0])
+                    ) if len(raw_ts) > 1 and np.any(np.diff(raw_ts) > 0) else 0.0
+                    duration_bin = (
+                        "short" if duration_hours < 6.0
+                        else "medium" if duration_hours < 24.0
+                        else "long"
+                    )
+                    cadence_bin = (
+                        "dense" if cadence_seconds < 300.0
+                        else "medium" if cadence_seconds < 1800.0
+                        else "sparse"
+                    )
+                    magnitude_bin = (
+                        "small" if displacement_km < 10.0
+                        else "medium" if displacement_km < 100.0
+                        else "large"
+                    )
+                    balance_stratum_list.append(
+                        "::".join(
+                            [
+                                spoof_source_label,
+                                attack_ref or "normal_random",
+                                str(int(y_win)),
+                                duration_bin,
+                                cadence_bin,
+                                magnitude_bin,
+                            ]
+                        )
+                    )
                 else:
                     event_id_list.append(str(vessel_id))
                     kind_list.append(
                         "positive_event" if y_win else "normal_random"
                     )
-                source_list.append("unknown")
+                    balance_stratum_list.append("not_applicable")
+                source_list.append(
+                    spoof_source_label if cfg.task == "spoofing" else "unknown"
+                )
                 event_order_list.append(0)
                 position_stratum_list.append(-1)
                 win_count += 1
@@ -1356,6 +1626,7 @@ def build_sequences_from_df(
             np.zeros((0,), dtype=object),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=object),
         )
 
     return (
@@ -1368,6 +1639,7 @@ def build_sequences_from_df(
         np.array(source_list, dtype=object),
         np.array(event_order_list, dtype=np.int64),
         np.array(position_stratum_list, dtype=np.int64),
+        np.array(balance_stratum_list, dtype=object),
     )
 
 
@@ -1405,13 +1677,31 @@ def build_sequences_to_npz(
     if apply_jump_filter is None:
         apply_jump_filter = task not in ["spoofing", "godark", "transshipment"]
 
-    if str(task) == "spoofing" and bool(use_location_features):
+    allow_spoofing_location_features = (
+        os.environ.get("SPOOFING_ALLOW_LOCATION_FEATURES", "0") == "1"
+    )
+    if (
+        str(task) == "spoofing"
+        and bool(use_location_features)
+        and not allow_spoofing_location_features
+    ):
         print(
             "[preprocess] WARNING: disabling distance_from_shore and "
             "distance_from_port for spoofing. Synthetic coordinate attacks do "
             "not have recomputed geospatial distance rasters."
         )
         use_location_features = False
+    elif (
+        str(task) == "spoofing"
+        and bool(use_location_features)
+        and allow_spoofing_location_features
+    ):
+        print(
+            "[preprocess] WARNING: spoofing location features explicitly enabled "
+            "by SPOOFING_ALLOW_LOCATION_FEATURES=1. Use only for controlled "
+            "ablation because synthetic coordinate attacks may expose a "
+            "geospatial shortcut."
+        )
 
     if str(task) == "godark" and bool(use_location_features):
         print(
@@ -1493,6 +1783,7 @@ def build_sequences_to_npz(
     all_X, all_y, all_groups, all_coords = [], [], [], []
     all_window_event_ids, all_window_kinds, all_window_source_labels = [], [], []
     all_window_event_orders, all_window_position_strata = [], []
+    all_spoofing_balance_strata = []
     all_window_is_synthetic, all_window_mmsi_a, all_window_mmsi_b = [], [], []
     all_rule_features = []
     gear_to_id: Dict[str, int] = {}
@@ -1548,6 +1839,9 @@ def build_sequences_to_npz(
                 window_mmsi_b = trans_meta["window_mmsi_b"]
                 window_event_orders = np.zeros(len(y), dtype=np.int64)
                 window_position_strata = np.full(len(y), -1, dtype=np.int64)
+                spoofing_balance_strata = np.full(
+                    len(y), "not_applicable", dtype=object
+                )
             else:
                 (
                     X,
@@ -1559,6 +1853,7 @@ def build_sequences_to_npz(
                     window_source_labels,
                     window_event_orders,
                     window_position_strata,
+                    spoofing_balance_strata,
                 ) = build_sequences_from_df(df, cfg)
                 rule_features = None
                 window_is_synthetic = np.zeros(len(y), dtype=np.int8)
@@ -1606,6 +1901,7 @@ def build_sequences_to_npz(
             window_source_labels = window_source_labels[idx]
             window_event_orders = window_event_orders[idx]
             window_position_strata = window_position_strata[idx]
+            spoofing_balance_strata = spoofing_balance_strata[idx]
             window_is_synthetic = window_is_synthetic[idx]
             window_mmsi_a = window_mmsi_a[idx]
             window_mmsi_b = window_mmsi_b[idx]
@@ -1621,6 +1917,7 @@ def build_sequences_to_npz(
         all_window_source_labels.append(window_source_labels)
         all_window_event_orders.append(window_event_orders)
         all_window_position_strata.append(window_position_strata)
+        all_spoofing_balance_strata.append(spoofing_balance_strata)
         all_window_is_synthetic.append(window_is_synthetic)
         all_window_mmsi_a.append(window_mmsi_a)
         all_window_mmsi_b.append(window_mmsi_b)
@@ -1650,6 +1947,11 @@ def build_sequences_to_npz(
         np.concatenate(all_window_position_strata, axis=0)
         if all_window_position_strata
         else np.array([], dtype=np.int64)
+    )
+    spoofing_balance_strata = (
+        np.concatenate(all_spoofing_balance_strata, axis=0)
+        if all_spoofing_balance_strata
+        else np.full((len(X),), "not_applicable", dtype=object)
     )
     window_is_synthetic = (
         np.concatenate(all_window_is_synthetic, axis=0)
@@ -1693,6 +1995,7 @@ def build_sequences_to_npz(
             window_source_labels = window_source_labels[keep_mask]
             window_event_orders = window_event_orders[keep_mask]
             window_position_strata = window_position_strata[keep_mask]
+            spoofing_balance_strata = spoofing_balance_strata[keep_mask]
             window_is_synthetic = window_is_synthetic[keep_mask]
             window_mmsi_a = window_mmsi_a[keep_mask]
             window_mmsi_b = window_mmsi_b[keep_mask]
@@ -1727,6 +2030,7 @@ def build_sequences_to_npz(
                 window_source_labels = window_source_labels[keep_idx]
                 window_event_orders = window_event_orders[keep_idx]
                 window_position_strata = window_position_strata[keep_idx]
+                spoofing_balance_strata = spoofing_balance_strata[keep_idx]
                 window_is_synthetic = window_is_synthetic[keep_idx]
                 window_mmsi_a = window_mmsi_a[keep_idx]
                 window_mmsi_b = window_mmsi_b[keep_idx]
@@ -1815,6 +2119,37 @@ def build_sequences_to_npz(
                 ),
                 "godark_diversity_protocol": np.array(
                     "source_label_duration_cadence_distance_position_v2", dtype=object
+                ),
+            }
+        )
+    if task == "spoofing":
+        present_sources = sorted(set(window_source_labels.astype(str).tolist()))
+        invalid_sources = sorted(
+            set(present_sources) - set(DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS)
+        )
+        if invalid_sources:
+            raise RuntimeError(
+                "Spoofing source lock violated; invalid sources="
+                f"{invalid_sources}."
+            )
+        present_attacks = sorted(
+            set(window_kinds.astype(str).tolist()) - {"normal"}
+        )
+        save_payload.update(
+            {
+                "window_source_labels": window_source_labels.astype(object),
+                "spoofing_balance_strata": spoofing_balance_strata.astype(object),
+                "spoofing_attack_types": np.asarray(
+                    present_attacks, dtype=object
+                ),
+                "spoofing_source_labels": np.asarray(
+                    present_sources, dtype=object
+                ),
+                "spoofing_data_protocol": np.array(
+                    "four_gear_six_attack_context_hybrid_oof_v2", dtype=object
+                ),
+                "spoofing_context_feature_cols": np.asarray(
+                    SPOOFING_CONTEXT_FEATURE_COLS, dtype=object
                 ),
             }
         )

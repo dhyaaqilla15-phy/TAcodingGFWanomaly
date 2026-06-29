@@ -78,6 +78,16 @@ def _load_feature_cols(npz_path: Path) -> List[str]:
     return [str(x) for x in data["feature_cols"].tolist()]
 
 
+def _load_spoofing_balance_strata(npz_path: Path, n: int) -> np.ndarray:
+    with np.load(npz_path, allow_pickle=True) as data:
+        if "spoofing_balance_strata" not in data.files:
+            return np.array(["unknown"] * n, dtype=object)
+        values = data["spoofing_balance_strata"].astype(object)
+    if len(values) != n:
+        raise ValueError("Spoofing balance strata are not aligned with y.")
+    return values
+
+
 def _label_map_from_checkpoint(ckpt: dict) -> Dict[int, str] | None:
     raw = ckpt.get("label_map", None)
     if raw is None:
@@ -610,8 +620,13 @@ def evaluate(
     task_name = _task_name_from_label_map(label_map)
     window_source_labels = (
         _load_window_source_labels(Path(data_npz))
-        if task_name in {"godark", "transshipment"}
+        if task_name in {"spoofing", "godark", "transshipment"}
         else np.array(["unknown"] * len(y), dtype=object)
+    )
+    spoofing_balance_strata = (
+        _load_spoofing_balance_strata(Path(data_npz), len(y))
+        if task_name == "spoofing"
+        else np.array(["not_applicable"] * len(y), dtype=object)
     )
     transshipment_is_synthetic = np.zeros(len(y), dtype=np.int8)
     transshipment_mmsi_a = np.full(len(y), "", dtype=object)
@@ -666,6 +681,14 @@ def evaluate(
                 "Spoofing evaluation requires class 1 to be the anomaly; "
                 f"got {normalized_label_map}."
             )
+        checkpoint_feature_cols = [str(x) for x in ckpt.get("feature_cols", [])]
+        if checkpoint_feature_cols and data_feature_cols != checkpoint_feature_cols:
+            raise ValueError(
+                "Spoofing evaluation feature schema differs from training: "
+                f"train={checkpoint_feature_cols}, eval={data_feature_cols}"
+            )
+        if int(X.shape[-1]) != int(ckpt["input_size"]):
+            raise ValueError("Spoofing input width differs from the trained model.")
 
     dev = pick_device(device)
 
@@ -764,6 +787,7 @@ def evaluate(
         if len(window_source_labels) == len(y)
         else np.array(["unknown"] * len(test_idx), dtype=object)
     )
+    spoofing_strata_test = spoofing_balance_strata[test_idx]
 
     scaler, scaler_path = _load_eval_scaler(model_path, out_dir, ckpt)
     if scaler is None:
@@ -1109,6 +1133,7 @@ def evaluate(
     pd.DataFrame(per_class_rows).to_csv(per_class_path, index=False)
 
     spoofing_attack_path = None
+    spoofing_severity_path = None
     spoofing_sequence_path = None
     spoofing_scenario_path = None
     spoofing_scenario_metrics = None
@@ -1181,14 +1206,45 @@ def evaluate(
         pd.DataFrame(
             {
                 "source_group": g_np.astype(str),
+                "source_label": np.asarray(sources_test).astype(str),
                 "scenario_id": np.asarray(event_ids_test).astype(str),
                 "attack_type": kinds_str,
+                "balance_stratum": np.asarray(spoofing_strata_test).astype(str),
                 "true_id": y_np.astype(int),
                 "pred_id": pred_seq.astype(int),
                 "spoofing_probability": probs[:, 1].astype(float),
                 "correct": (y_np == pred_seq),
             }
         ).to_csv(spoofing_sequence_path, index=False)
+
+        severity_rows = []
+        strata_str = np.asarray(spoofing_strata_test).astype(str)
+        for stratum in sorted(set(strata_str.tolist())):
+            idx = np.where(strata_str == stratum)[0]
+            positive_idx = idx[y_np[idx] == 1]
+            if positive_idx.size == 0:
+                continue
+            parts = str(stratum).split("::")
+            while len(parts) < 6:
+                parts.append("unknown")
+            severity_rows.append(
+                {
+                    "source_label": parts[0],
+                    "attack_type": parts[1],
+                    "label_bin": parts[2],
+                    "duration_bin": parts[3],
+                    "cadence_bin": parts[4],
+                    "magnitude_bin": parts[5],
+                    "positive_windows": int(positive_idx.size),
+                    "true_positives": int((pred_seq[positive_idx] == 1).sum()),
+                    "recall": float((pred_seq[positive_idx] == 1).mean()),
+                    "mean_spoofing_probability": float(
+                        probs[positive_idx, 1].mean()
+                    ),
+                }
+            )
+        spoofing_severity_path = out_dir / "spoofing_severity_metrics.csv"
+        pd.DataFrame(severity_rows).to_csv(spoofing_severity_path, index=False)
 
         scenario_rows = []
         scenario_ids_str = np.asarray(event_ids_test).astype(str)
@@ -1443,6 +1499,11 @@ def evaluate(
         ),
         "spoofing_attack_metrics": (
             spoofing_attack_rows if task_name == "spoofing" else None
+        ),
+        "spoofing_severity_metrics_table": (
+            str(spoofing_severity_path)
+            if spoofing_severity_path is not None
+            else None
         ),
         "spoofing_sequence_predictions_table": (
             str(spoofing_sequence_path)

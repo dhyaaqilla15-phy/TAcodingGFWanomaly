@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from data_preparation import DEFAULT_SOURCE_EXCLUDE_LABELS, build_sequences_to_npz
+from data_preparation import (
+    DEFAULT_SOURCE_EXCLUDE_LABELS,
+    DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS,
+    build_sequences_to_npz,
+)
 from train import train_from_npz
 from eval import evaluate
 from plot_trajectory import (
@@ -418,6 +422,15 @@ def main():
     sp.add_argument("--chunksize", type=int, default=0)
     sp.add_argument("--sample_frac", type=float, default=0.0)
     sp.add_argument("--normal_keep_frac", type=float, default=1.0)
+    sp.add_argument(
+        "--include_labels",
+        nargs="*",
+        default=list(DEFAULT_SPOOFING_SOURCE_INCLUDE_LABELS),
+        help=(
+            "Label sumber CSV yang diizinkan untuk spoofing. Default dikunci "
+            "ke drifting_longlines fixed_gear purse_seines trawlers."
+        ),
+    )
     sp.add_argument(
         "--exclude_labels",
         nargs="*",
@@ -927,6 +940,7 @@ def main():
             chunksize=int(args.chunksize),
             sample_frac=float(args.sample_frac),
             normal_keep_frac=float(args.normal_keep_frac),
+            include_labels=list(args.include_labels),
             exclude_labels=list(args.exclude_labels),
             max_vessels_per_file=int(args.max_vessels_per_file),
             min_points_per_vessel=int(args.min_points_per_vessel),
